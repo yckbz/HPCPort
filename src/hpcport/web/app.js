@@ -2152,7 +2152,15 @@ function wireEvents() {
         credentials: "same-origin",
       });
       if (!resp.ok) {
-        errEl.textContent = i18n.t("unlockError");
+        let data = {};
+        try {
+          data = await resp.json();
+        } catch {
+          data = {};
+        }
+        errEl.textContent = resp.status === 429
+          ? i18n.t("unlockRateLimited", { s: data.retry_after || 60 })
+          : i18n.t("unlockError");
         errEl.classList.remove("hidden");
         return;
       }

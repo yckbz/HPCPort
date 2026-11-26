@@ -30,6 +30,7 @@ export const MESSAGES = {
     unlockPlaceholder: "6-digit PIN",
     unlockBtn: "Unlock Dashboard",
     unlockError: "Invalid pairing PIN. Please try again.",
+    unlockRateLimited: "Too many failed attempts. Try again in {s}s.",
     unlockTip: "On a local desktop, ask your agent to call open_dashboard or run `hpcport ui` for automatic one-click sign-in.",
 
     // Approvals
@@ -309,6 +310,7 @@ export const MESSAGES = {
     unlockPlaceholder: "6 位 PIN 码",
     unlockBtn: "解锁控制台",
     unlockError: "PIN 码无效，请重试。",
+    unlockRateLimited: "PIN 尝试次数过多，请 {s} 秒后再试。",
     unlockTip: "在本地桌面环境中，直接让 Agent 调用 open_dashboard 或运行 `hpcport ui` 即可自动免密打开。",
 
     // Approvals

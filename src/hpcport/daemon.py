@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
 import os
 import platform
 import secrets
@@ -36,6 +37,8 @@ log = logging.getLogger("hpcport.daemon")
 SYNC_BACKOFF_MAX = 600.0
 EXCHANGE_TTL_S = 60.0
 AUTO_OPEN_COOLDOWN_S = 30.0
+PIN_MAX_FAILURES = 5
+PIN_LOCKOUT_S = 60.0
 
 
 class Daemon:
@@ -55,6 +58,8 @@ class Daemon:
         self._web_secret = secrets.token_urlsafe(32)
         self._exchange_codes: dict[str, tuple[float, str]] = {}   # code -> (expires, tab)
         self._pairing_pin = "%06d" % secrets.randbelow(1_000_000)
+        self._pin_failures = 0
+        self._pin_locked_until = 0.0
         self.cli_token: str | None = None
 
         # SSE subscribers (asyncio.Queue per connected Web UI tab)
@@ -219,6 +224,23 @@ class Daemon:
         if pin and hmac.compare_digest(str(pin).strip(), self._pairing_pin):
             return self._cookie_value()
         return None
+
+    def attempt_pin(self, pin: str) -> tuple[str | None, int]:
+        """Verify pairing PIN with failure cooldown; returns (cookie_or_None, retry_after_s)."""
+        now = self.now()
+        with self.lock:
+            if now < self._pin_locked_until:
+                return None, max(1, int(math.ceil(self._pin_locked_until - now)))
+            if pin and hmac.compare_digest(str(pin).strip(), self._pairing_pin):
+                self._pin_failures = 0
+                self._pin_locked_until = 0.0
+                return self._cookie_value(), 0
+            self._pin_failures += 1
+            if self._pin_failures >= PIN_MAX_FAILURES:
+                self._pin_failures = 0
+                self._pin_locked_until = now + PIN_LOCKOUT_S
+                return None, int(PIN_LOCKOUT_S)
+            return None, 0
 
     def issue_exchange_code(self, tab: str = "approvals") -> str:
         code = secrets.token_urlsafe(24)

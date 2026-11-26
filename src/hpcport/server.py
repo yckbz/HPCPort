@@ -528,9 +528,20 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         return resp
 
     async def auth_pin_unlock(request):
+        if request.headers.get("x-hpcport-ui") != "1":
+            return fail(403, "missing X-HPCPort-UI header")
         d = await body(request)
-        cookie_val = daemon.verify_pin(str(d.get("pin", "")))
+        cookie_val, retry_after = daemon.attempt_pin(str(d.get("pin", "")))
         if cookie_val is None:
+            if retry_after > 0:
+                return JSONResponse(
+                    {
+                        "error": "too many failed PIN attempts; try again in %ds" % retry_after,
+                        "retry_after": retry_after,
+                    },
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
             return fail(401, "invalid pairing PIN")
         resp = JSONResponse({"authenticated": True})
         resp.set_cookie(COOKIE_NAME, cookie_val, httponly=True, samesite="strict", path="/")

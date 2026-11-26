@@ -576,3 +576,36 @@ def test_stdio_bridge_concurrent_ping_not_blocked_by_wait_for(hpc_home, tmp_path
     finally:
         server.should_exit = True
         t.join(timeout=5)
+
+
+def test_pin_auth_requires_ui_header_and_rate_limits(hpc_home, tmp_path):
+    now = [1000.0]
+    d = Daemon(clock=lambda: now[0], browser_opener=lambda url: True)
+    app = build_app(d, start_loop=False)
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        # PIN unlock without X-HPCPort-UI header is rejected (403)
+        r_no_hdr = client.post("/api/auth/pin", json={"pin": d.pairing_pin})
+        assert r_no_hdr.status_code == 403
+
+        # Five wrong PIN attempts trigger 429 cooldown that blocks even the real PIN
+        wrong = "000000" if d.pairing_pin != "000000" else "999999"
+        for _ in range(4):
+            assert client.post(
+                "/api/auth/pin", json={"pin": wrong}, headers={"X-HPCPort-UI": "1"},
+            ).status_code == 401
+        r_fifth = client.post(
+            "/api/auth/pin", json={"pin": wrong}, headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_fifth.status_code == 429
+        assert int(r_fifth.headers["retry-after"]) >= 1
+        assert client.post(
+            "/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"},
+        ).status_code == 429
+
+        # After cooldown elapses, valid PIN succeeds
+        now[0] += 61.0
+        r_ok = client.post(
+            "/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_ok.status_code == 200
