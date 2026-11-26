@@ -202,3 +202,23 @@ def test_unparseable_sbatch_directive_marks_unknown():
     r2 = slurm.resources(h2)
     assert "directive" in r2.unknown
     assert r2.gpu_hours is None
+
+
+def test_parse_header_skips_indented_comments_and_non_directives():
+    script = (
+        "#!/bin/bash\n"
+        "  # Indented comment before SBATCH\n"
+        "#SBATCH_NOTE: not an sbatch directive\n"
+        "#SBATCH -p gpu\n"
+        "#SBATCH\t--gres=gpu:4\n"
+        "#SBATCH -t 02:00:00\n"
+        "echo run\n"
+    )
+    h = slurm.parse_header(script)
+    assert h is not None
+    assert h.partitions == ("gpu",)
+    assert len(h.directives) == 3
+    res = slurm.resources(h)
+    assert res.unknown == ()
+    assert res.gpus == 4
+    assert res.gpu_hours == 8.0

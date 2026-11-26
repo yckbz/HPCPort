@@ -73,3 +73,45 @@ def test_cd_tracking_and_other_user_tilde():
     assert guard.check("pushd subdir && rm -rf tmp && popd && rm -rf tmp2", p) == []
     assert guard.check("rm -rf $BUILD_DIR", p) == []
     assert guard.check("cd $DIR && echo ok > out.log", p) == []
+
+
+def test_subshell_pipeline_cmdsubst_and_env_wrappers():
+    p = guard.place_for("/work/proj", "/work/proj", "/work/proj", "/home/alice")
+
+    # Subshells must not leak cwd outward or allow cd back inside to mask outer cwd
+    assert guard.check("(cd / && ls) && rm -rf ./tmp_out", p) == []
+    assert [(f.rule, f.what) for f in guard.check("cd / ; (cd /work/proj && true) ; rm -rf etc", p)] == [
+        ("outside", "etc")
+    ]
+    assert [(f.rule, f.what) for f in guard.check("(cd / && rm -rf etc)", p)] == [
+        ("outside", "etc")
+    ]
+    assert [(f.rule, f.what) for f in guard.check("if (cd / && rm -rf etc); then echo ok; fi", p)] == [
+        ("outside", "etc")
+    ]
+
+    # Pipeline and background subshells must not mutate outer cwd
+    assert [(f.rule, f.what) for f in guard.check("cd / ; echo hi | cd /work/proj ; rm -rf etc", p)] == [
+        ("outside", "etc")
+    ]
+    assert [(f.rule, f.what) for f in guard.check("cd / ; cd /work/proj & rm -rf etc", p)] == [
+        ("outside", "etc")
+    ]
+
+    # Command substitution evaluates at its lexical cwd without leaking outward
+    assert [(f.rule, f.what) for f in guard.check("cd / && echo $(rm -rf etc) && cd /work/proj", p)] == [
+        ("outside", "etc")
+    ]
+    assert guard.check("echo $(cd / && ls) && rm -rf ./tmp_out", p) == []
+
+    # env -C / --chdir and env -S / --split-string
+    assert [(f.rule, f.what) for f in guard.check("env -C / rm -rf etc", p)] == [("outside", "etc")]
+    assert [(f.rule, f.what) for f in guard.check("env --chdir=/ rm -rf etc", p)] == [("outside", "etc")]
+    assert [(f.rule, f.what) for f in guard.check("env -C/ rm -rf etc", p)] == [("outside", "etc")]
+    assert guard.check("env -C subdir rm -rf tmp && rm -rf ./local_tmp", p) == []
+    assert [(f.rule, f.what) for f in guard.check("env -S 'sbatch run.sh'", p)] == [
+        ("scheduler", "sbatch")
+    ]
+    assert [(f.rule, f.what) for f in guard.check("env -S '-C / rm -rf etc'", p)] == [
+        ("outside", "etc")
+    ]

@@ -142,11 +142,12 @@ def parse_header(text: str) -> Header | None:
         return None
     directives = []
     for line in lines[1:]:
-        if not line.strip():
+        stripped = line.lstrip()
+        if not stripped:
             continue
-        if not line.startswith("#"):
+        if not stripped.startswith("#"):
             break
-        if line.startswith("#SBATCH"):
+        if line.startswith("#SBATCH") and (len(line) == 7 or line[7] in " \t"):
             directives.append(line.rstrip())
     partitions = tuple(p for p in header_options(directives).get("partition", "").split(",")
                        if p)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shlex
 from dataclasses import dataclass, field
 
 ASK, REFUSE = "ask", "refuse"
@@ -61,6 +62,8 @@ class Word:
 class Command:
     words: list[Word] = field(default_factory=list)
     redirects: list[tuple[str, Word]] = field(default_factory=list)
+    subshells: list[str] = field(default_factory=list)
+    in_pipe: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,13 +111,19 @@ def _closing(src: str, i: int) -> int:
     return n
 
 
+def _extract_paren(src: str, start: int) -> tuple[str, int]:
+    j = _closing(src, start)
+    end = j - 1 if j > start and src[j - 1] == ")" else j
+    return src[start:end], j
+
+
 def parse(src: str, depth: int = 0) -> list[Command]:
     out: list[Command] = []
-    nested: list[Command] = []
     cur = Command()
     word: Word | None = None
     pending: str | None = None
     heredocs: list[tuple[str, bool]] = []
+    pipe_in = False
     i, n = 0, len(src)
 
     def w() -> Word:
@@ -137,17 +146,20 @@ def parse(src: str, depth: int = 0) -> list[Command]:
             cur.words.append(word)
         word = None
 
-    def end_command():
-        nonlocal cur, pending
+    def end_command(next_pipe: bool = False, cur_subshell: bool = False):
+        nonlocal cur, pending, pipe_in
         end_word()
         pending = None
-        if cur.words or cur.redirects:
+        if cur.words or cur.redirects or cur.subshells:
+            if pipe_in or next_pipe or cur_subshell:
+                cur.in_pipe = True
             out.append(cur)
         cur = Command()
+        pipe_in = next_pipe
 
     def substitution(inner: str):
-        if depth < MAX_DEPTH:
-            nested.extend(parse(inner, depth + 1))
+        if depth < MAX_DEPTH and inner.strip():
+            cur.subshells.append(inner)
         w().plain = False
 
     while i < n:
@@ -173,8 +185,8 @@ def parse(src: str, depth: int = 0) -> list[Command]:
                     w().text += src[i + 1] if src[i + 1] != "\n" else ""
                     i += 2
                 elif src[i] == "$" and src[i + 1:i + 2] == "(":
-                    j = _closing(src, i + 2)
-                    substitution(src[i + 2:j - 1])
+                    inner, j = _extract_paren(src, i + 2)
+                    substitution(inner)
                     w().text += src[i:j]
                     i = j
                 elif src[i] == "`":
@@ -197,9 +209,9 @@ def parse(src: str, depth: int = 0) -> list[Command]:
             w().quoted = True
             i = j + 1
         elif c == "$" and src[i + 1:i + 2] == "(":
-            j = _closing(src, i + 2)
+            inner, j = _extract_paren(src, i + 2)
             if src[i + 2:i + 3] != "(":
-                substitution(src[i + 2:j - 1])
+                substitution(inner)
             w().plain = False
             w().text += src[i:j]
             i = j
@@ -220,8 +232,8 @@ def parse(src: str, depth: int = 0) -> list[Command]:
             w().text += src[i:j + 1]
             i = j + 1
         elif c in "<>" and src[i + 1:i + 2] == "(":
-            j = _closing(src, i + 2)
-            substitution(src[i + 2:j - 1])
+            inner, j = _extract_paren(src, i + 2)
+            substitution(inner)
             w().text += src[i:j]
             i = j
         elif c in " \t":
@@ -261,24 +273,38 @@ def parse(src: str, depth: int = 0) -> list[Command]:
             end_word()
             i += 3 if src[i + 2:i + 3] == ">" else 2
             pending = ">"
+        elif c == "(" and word is None and (
+            not cur.words or all(not w0.quoted and w0.text in RESERVED for w0 in cur.words)
+        ):
+            inner, j = _extract_paren(src, i + 1)
+            if depth < MAX_DEPTH and inner.strip():
+                cur.subshells.append(inner)
+            i = j
         elif c in ";&|()":
-            end_command()
-            i += 2 if src[i:i + 2] in ("&&", "||", ";;", "|&") else 1
+            tok2 = src[i:i + 2]
+            is_pipe = c == "|" and tok2 != "||"
+            is_bg = c == "&" and tok2 != "&&"
+            end_command(next_pipe=is_pipe, cur_subshell=is_bg)
+            i += 2 if tok2 in ("&&", "||", ";;", "|&") else 1
         else:
             if c == "~" and word is None:
                 w().tilde = True
             w().text += c
             i += 1
     end_command()
-    return out + nested
+    return out
 
 
 def _name(word: Word) -> str:
     return posixpath.basename(word.text) if word.plain else ""
 
 
-def _strip(words: list[Word]) -> list[Word]:
+def _unwrap_wrappers(
+    words: list[Word], cur_cwd: str | None = None, place: Place | None = None,
+) -> tuple[list[Word], str | None, list[str]]:
     words = list(words)
+    cmd_cwd = cur_cwd
+    extra_src: list[str] = []
     while words:
         first = words[0]
         if not first.quoted and (first.text in RESERVED or ASSIGNMENT.match(first.text)):
@@ -292,11 +318,46 @@ def _strip(words: list[Word]) -> list[Word]:
         while words and (words[0].text.startswith("-") or
                          (name == "env" and ASSIGNMENT.match(words[0].text))):
             opt = words.pop(0).text
+            if opt == "--":
+                break
+            if name == "env":
+                if opt in ("-C", "--chdir"):
+                    if words:
+                        w_dir = words.pop(0)
+                        cmd_cwd = _resolve_dir(w_dir, cmd_cwd, place) if place is not None else None
+                    continue
+                if opt.startswith("--chdir="):
+                    cmd_cwd = (_resolve_dir(Word(opt[8:]), cmd_cwd, place)
+                               if place is not None else None)
+                    continue
+                if opt.startswith("-C") and len(opt) > 2:
+                    cmd_cwd = (_resolve_dir(Word(opt[2:]), cmd_cwd, place)
+                               if place is not None else None)
+                    continue
+                if (opt in ("-S", "--split-string")
+                        or opt.startswith("--split-string=")
+                        or (opt.startswith("-S") and len(opt) > 2)):
+                    if opt in ("-S", "--split-string"):
+                        s_val = words.pop(0).text if words else ""
+                    elif opt.startswith("--split-string="):
+                        s_val = opt[len("--split-string="):]
+                    else:
+                        s_val = opt[2:]
+                    rest_tail = " ".join(shlex.quote(w.text) for w in words)
+                    combined = ("env " + s_val + (" " + rest_tail if rest_tail else "")).strip()
+                    extra_src.append(combined)
+                    words = []
+                    break
             if opt in valued and words:
                 words.pop(0)
         if name == "timeout" and words:
             words.pop(0)
-    return words
+    return words, cmd_cwd, extra_src
+
+
+def _strip(words: list[Word]) -> list[Word]:
+    stripped, _, _ = _unwrap_wrappers(words)
+    return stripped
 
 
 def _operands(words: list[Word]) -> list[Word]:
@@ -312,8 +373,12 @@ def _operands(words: list[Word]) -> list[Word]:
 def commands(src: str, depth: int = 0) -> list[Command]:
     out = []
     for cmd in parse(src):
-        cmd.words = _strip(cmd.words)
+        subs = list(cmd.subshells)
+        cmd.words, _, extra_src = _unwrap_wrappers(cmd.words)
         out.append(cmd)
+        if depth < MAX_DEPTH:
+            for sub in subs + extra_src:
+                out += commands(sub, depth + 1)
         if not cmd.words or depth >= MAX_DEPTH:
             continue
         name, args = _name(cmd.words[0]), cmd.words[1:]
@@ -436,9 +501,10 @@ def check(command: str, place: Place, allow=(), scheduler: str = "slurm") -> lis
         prev_cwd: str | None = init_prev
         dir_stack: list[str | None] = list(init_stack)
 
-        def paths(words, startup_only=False):
+        def paths(words, startup_only=False, cwd_override=_UNSET):
+            eff_cwd = cur_cwd if cwd_override is _UNSET else cwd_override
             for a in words:
-                where, path = locate(a, place, cwd=cur_cwd)
+                where, path = locate(a, place, cwd=eff_cwd)
                 if where == "outside" and _startup(path):
                     add("startup", a.text)
                 elif startup_only:
@@ -448,59 +514,67 @@ def check(command: str, place: Place, allow=(), scheduler: str = "slurm") -> lis
                 elif where == "root":
                     add("root", a.text)
 
-        for cmd in parse(src):
-            cmd.words = _strip(cmd.words)
+        for cmd in parse(src, depth=depth):
+            cmd.words, cmd_cwd, extra_src = _unwrap_wrappers(cmd.words, cur_cwd, place)
             for op, target in cmd.redirects:
                 if op.startswith(">") or op == "<>":
                     paths([target], startup_only=True)
+            if depth < MAX_DEPTH:
+                for sub in cmd.subshells:
+                    scan_src(sub, cur_cwd, prev_cwd, dir_stack, depth + 1)
+                for ex_s in extra_src:
+                    scan_src(ex_s, cmd_cwd, prev_cwd, dir_stack, depth + 1)
             if not cmd.words:
                 continue
             name, args = _name(cmd.words[0]), cmd.words[1:]
             ops = _operands(cmd.words)
             texts = [a.text for a in args]
             if name == "cd":
-                if not ops:
-                    new_cwd = place.home
-                elif ops[0].text == "-":
-                    new_cwd = prev_cwd
-                else:
-                    new_cwd = _resolve_dir(ops[0], cur_cwd, place)
-                prev_cwd, cur_cwd = cur_cwd, new_cwd
+                if not cmd.in_pipe:
+                    if not ops:
+                        new_cwd = place.home
+                    elif ops[0].text == "-":
+                        new_cwd = prev_cwd
+                    else:
+                        new_cwd = _resolve_dir(ops[0], cur_cwd, place)
+                    prev_cwd, cur_cwd = cur_cwd, new_cwd
             elif name == "pushd":
-                if not ops:
-                    if dir_stack:
-                        top = dir_stack.pop()
+                if not cmd.in_pipe:
+                    if not ops:
+                        if dir_stack:
+                            top = dir_stack.pop()
+                            dir_stack.append(cur_cwd)
+                            prev_cwd, cur_cwd = cur_cwd, top
+                        else:
+                            prev_cwd, cur_cwd = cur_cwd, None
+                    elif _DIR_INDEX_RE.match(ops[0].text):
                         dir_stack.append(cur_cwd)
-                        prev_cwd, cur_cwd = cur_cwd, top
+                        prev_cwd, cur_cwd = cur_cwd, None
+                    else:
+                        new_cwd = _resolve_dir(ops[0], cur_cwd, place)
+                        dir_stack.append(cur_cwd)
+                        prev_cwd, cur_cwd = cur_cwd, new_cwd
+            elif name == "popd":
+                if not cmd.in_pipe:
+                    if ops and _DIR_INDEX_RE.match(ops[0].text):
+                        cur_cwd = None
+                    elif dir_stack:
+                        prev_cwd, cur_cwd = cur_cwd, dir_stack.pop()
                     else:
                         prev_cwd, cur_cwd = cur_cwd, None
-                elif _DIR_INDEX_RE.match(ops[0].text):
-                    dir_stack.append(cur_cwd)
-                    prev_cwd, cur_cwd = cur_cwd, None
-                else:
-                    new_cwd = _resolve_dir(ops[0], cur_cwd, place)
-                    dir_stack.append(cur_cwd)
-                    prev_cwd, cur_cwd = cur_cwd, new_cwd
-            elif name == "popd":
-                if ops and _DIR_INDEX_RE.match(ops[0].text):
-                    cur_cwd = None
-                elif dir_stack:
-                    prev_cwd, cur_cwd = cur_cwd, dir_stack.pop()
-                else:
-                    prev_cwd, cur_cwd = cur_cwd, None
             elif use_slurm and name in SCHEDULER:
                 add("scheduler", name)
             elif use_slurm and name == "scancel":
                 add("scancel", name)
             elif name in DESTRUCTIVE:
-                paths(ops)
+                paths(ops, cwd_override=cmd_cwd)
             elif name == "find":
                 k = next((k for k, t in enumerate(texts) if t.startswith("-") or t in ("(", "!")),
                          len(args))
                 acts = [posixpath.basename(texts[j + 1]) for j, t in enumerate(texts[:-1])
                         if t in ("-exec", "-execdir", "-ok")]
                 if "-delete" in texts or any(a in DESTRUCTIVE for a in acts):
-                    paths(args[:k] or [Word(".")])
+                    paths(args[:k] or [Word(".")], cwd_override=cmd_cwd)
             elif name == "crontab":
                 if not texts or any(t != "-l" for t in texts):
                     add("crontab", name)
@@ -512,21 +586,22 @@ def check(command: str, place: Place, allow=(), scheduler: str = "slurm") -> lis
             elif name in KILL_BY_NAME:
                 add("killall", name)
             elif name == "tee":
-                paths(ops, startup_only=True)
+                paths(ops, startup_only=True, cwd_override=cmd_cwd)
             elif name == "sed":
                 if any(re.match(r"^(-[a-zA-Z]*i|--in-place)", t) for t in texts):
-                    paths(ops, startup_only=True)
+                    paths(ops, startup_only=True, cwd_override=cmd_cwd)
             elif name in ("cp", "ln", "install", "chmod", "chown", "touch"):
-                paths(ops[-1:] if name in ("cp", "ln", "install") else ops, startup_only=True)
+                paths(ops[-1:] if name in ("cp", "ln", "install") else ops,
+                      startup_only=True, cwd_override=cmd_cwd)
 
             if depth < MAX_DEPTH:
                 if name in SHELLS:
                     for k, a in enumerate(args):
                         if re.match(r"^-[a-z]*c$", a.text) and k + 1 < len(args):
-                            scan_src(args[k + 1].text, cur_cwd, prev_cwd, dir_stack, depth + 1)
+                            scan_src(args[k + 1].text, cmd_cwd, prev_cwd, dir_stack, depth + 1)
                             break
                 elif name == "eval":
-                    scan_src(" ".join(a.text for a in args), cur_cwd, prev_cwd, dir_stack, depth + 1)
+                    scan_src(" ".join(a.text for a in args), cmd_cwd, prev_cwd, dir_stack, depth + 1)
 
     scan_src(command, place.cwd, None, [], 0)
     return found
