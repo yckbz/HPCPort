@@ -95,6 +95,9 @@ _OPTIONS = {
     "tres_per_node": (None, "--tres-per-node"),
     "tres_per_socket": (None, "--tres-per-socket"),
     "tres_per_task": (None, "--tres-per-task"),
+    "output": ("-o", "--output"),
+    "error": ("-e", "--error"),
+    "job_name": ("-J", "--job-name"),
 }
 _SHORT = {short: key for key, (short, _) in _OPTIONS.items() if short}
 _LONG = {long: key for key, (_, long) in _OPTIONS.items()}
@@ -262,8 +265,11 @@ def resources(header: Header, cores_per_node: int | None = None,
               gpus_per_node: int | None = None) -> Resources:
     o = header_options(header.directives)
     unknown: list[str] = []
+    cores_unknown = False
+    gpus_unknown = False
     if "__unparseable__" in o:
         unknown.append("directive")
+        cores_unknown = gpus_unknown = True
 
     def read(key, conv, default):
         if key not in o:
@@ -275,7 +281,11 @@ def resources(header: Header, cores_per_node: int | None = None,
             return default
 
     nodes = read("nodes", _count, 1)
+    if "nodes" in unknown:
+        cores_unknown = gpus_unknown = True
     cpus = read("cpus_per_task", _count, 1)
+    if "cpus_per_task" in unknown:
+        cores_unknown = True
     sockets: int | None = None
     if "sockets_per_node" in o:
         sockets = read("sockets_per_node", _count, None)
@@ -285,10 +295,13 @@ def resources(header: Header, cores_per_node: int | None = None,
         except ValueError:
             sockets = None
 
+    tasks_unknown = False
     if "ntasks" in o:
         tasks = read("ntasks", _count, 1)
+        tasks_unknown = "ntasks" in unknown
     elif "ntasks_per_node" in o:
         tasks = nodes * read("ntasks_per_node", _count, 1)
+        tasks_unknown = "ntasks_per_node" in unknown or "nodes" in unknown
     elif "ntasks_per_socket" in o:
         tps = read("ntasks_per_socket", _count, None)
         if tps is not None and sockets is not None:
@@ -296,13 +309,19 @@ def resources(header: Header, cores_per_node: int | None = None,
         else:
             unknown.append("ntasks_per_socket")
             tasks = 1
+            tasks_unknown = True
     elif "ntasks_per_core" in o:
         unknown.append("ntasks_per_core")
         tasks = 1
+        tasks_unknown = True
     else:
         tasks = nodes
+        tasks_unknown = "nodes" in unknown
+    if tasks_unknown:
+        cores_unknown = True
 
     # Collect GPU counts across every Slurm GPU / TRES directive
+    unknown_before_gpu = len(unknown)
     gpu_candidates = [
         nodes * read("gres", lambda v: _gpus(v, gres=True), 0),
         read("gpus", lambda v: _gpus(v), 0),
@@ -312,12 +331,17 @@ def resources(header: Header, cores_per_node: int | None = None,
         nodes * read("tres_per_node", lambda v: _gpus(v, tres=True), 0),
         tasks * read("tres_per_task", lambda v: _gpus(v, tres=True), 0),
     ]
+    if len(unknown) > unknown_before_gpu:
+        gpus_unknown = True
+    if tasks_unknown and ("gpus_per_task" in o or "tres_per_task" in o):
+        gpus_unknown = True
     if "gpus_per_socket" in o:
         gps = read("gpus_per_socket", lambda v: _gpus(v), None)
         if gps is not None and sockets is not None:
             gpu_candidates.append(nodes * sockets * gps)
         elif gps is None or gps > 0:
             unknown.append("gpus_per_socket")
+            gpus_unknown = True
     if "tres_per_socket" in o:
         tps_g = read("tres_per_socket", lambda v: _gpus(v, tres=True), None)
         if tps_g is not None and tps_g > 0:
@@ -325,31 +349,39 @@ def resources(header: Header, cores_per_node: int | None = None,
                 gpu_candidates.append(nodes * sockets * tps_g)
             else:
                 unknown.append("tres_per_socket")
+                gpus_unknown = True
 
     # Reject unknown CPU/TRES accounting if tres_per_* specifies cpu explicitly
     for tk in ("tres_per_job", "tres_per_node", "tres_per_socket", "tres_per_task"):
         if tk in o and any(p.strip().lower().startswith("cpu:") for p in o[tk].split(",")):
             unknown.append(tk)
+            cores_unknown = True
 
     gpus: int | None = max(gpu_candidates)
     cores: int | None = tasks * cpus
     if "cpus_per_gpu" in o:
         cpg = read("cpus_per_gpu", _count, None)
-        if cpg is not None and gpus and not unknown:
+        if cpg is not None and gpus and not gpus_unknown:
             cores = max(cores, gpus * cpg)
-        elif cpg is not None and not gpus:
-            unknown.append("cpus_per_gpu")
+        else:
+            if "cpus_per_gpu" not in unknown:
+                unknown.append("cpus_per_gpu")
+            cores_unknown = True
     if "exclusive" in o:
-        cores = nodes * cores_per_node if cores_per_node else None
+        cores = nodes * cores_per_node if (cores_per_node and "nodes" not in unknown) else None
         if cores is None:
             unknown.append("cores")
-        if gpus_per_node is not None:
+            cores_unknown = True
+        if gpus_per_node is not None and "nodes" not in unknown:
             gpus = max(gpus, nodes * gpus_per_node)
         else:
             gpus = None
             unknown.append("gpus")
-    if unknown:
-        cores = gpus = None
+            gpus_unknown = True
+    if cores_unknown:
+        cores = None
+    if gpus_unknown:
+        gpus = None
     hours = read("time", time_limit_hours, None)
     if hours is None and "time" not in unknown:
         unknown.append("time")

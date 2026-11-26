@@ -1220,6 +1220,42 @@ class JobService:
                                active=0)
 
     # ------------------------------------------------------------------ inspection for Web UI
+    @staticmethod
+    def _expand_log_pattern(spec: str, sid: str, job_name: str) -> str:
+        """Expand common Slurm filename pattern tokens (%j, %A, %a, %x, etc.) into a path/glob."""
+        out: list[str] = []
+        i = 0
+        n = len(spec)
+        while i < n:
+            ch = spec[i]
+            if ch == "%" and i + 1 < n:
+                # Skip optional numeric zero-padding width (e.g. %4a)
+                j = i + 1
+                while j < n and spec[j].isdigit():
+                    j += 1
+                if j < n:
+                    tok = spec[j]
+                    if tok == "%":
+                        out.append("%")
+                    elif tok in ("j", "A"):
+                        out.append(sid)
+                    elif tok == "x":
+                        out.append(job_name)
+                    elif tok in ("a", "u", "N", "n", "s", "t"):
+                        out.append("*")
+                    else:
+                        out.append("*")
+                    i = j + 1
+                    continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _safe_glob_expr(pattern: str) -> str:
+        """Quote all literal parts around '*' wildcards so shell metacharacters cannot execute."""
+        return "*".join(shlex.quote(seg) for seg in pattern.split("*"))
+
     def read_job_files(self, job_id: int, max_bytes: int = 32768) -> dict:
         """Read original script and Slurm stdout/stderr tail for a registered job."""
         with self.lock:
@@ -1239,21 +1275,29 @@ class JobService:
             "printf '\\n%s OUT\\n'" % mark,
         ]
         if sid:
-            # Resolve StdOut from scontrol if available, fallback to slurm-<id>.out
+            # Resolve StdOut from scontrol if available, fallback to slurm-<id>.out or array slurm-<id>_*.out
             cmd += [
                 "cd -- %s 2>/dev/null || true" % q(j["workdir"]),
                 "f=$(scontrol show job %s 2>/dev/null | tr ' ' '\\n' | "
                 "awk -F= '/^StdOut=/{print $2; exit}')" % q(sid),
-                "[ -n \"$f\" ] && [ -f \"$f\" ] || f=\"slurm-%s.out\"" % sid,
-                "[ -f \"$f\" ] && tail -c %d -- \"$f\" 2>/dev/null || true" % max_bytes,
-                "printf '\\n%s ERR\\n'" % mark,
+                "if [ -z \"$f\" ] || [ ! -f \"$f\" ]; then",
+                "  if [ -f %s ]; then f=%s;" % (q("slurm-%s.out" % sid), q("slurm-%s.out" % sid)),
+                "  else",
+                "    f=''",
+                "    for __c in %s; do [ -f \"$__c\" ] && f=\"$__c\" && break; done"
+                % self._safe_glob_expr("slurm-%s_*.out" % sid),
+                "  fi",
+                "fi",
+                "[ -n \"$f\" ] && [ -f \"$f\" ] && "
+                "{ tail -c %d -- \"$f\" 2>/dev/null || true; printf '\\n'; } || true" % max_bytes,
+                "printf '%s ERR\\n'" % mark,
                 "e=$(scontrol show job %s 2>/dev/null | tr ' ' '\\n' | "
                 "awk -F= '/^StdErr=/{print $2; exit}')" % q(sid),
                 "if [ -n \"$e\" ] && [ \"$e\" != \"$f\" ] && [ -f \"$e\" ]; then "
                 "tail -c %d -- \"$e\" 2>/dev/null || true; fi" % max_bytes,
             ]
         else:
-            cmd += ["printf '\\n%s ERR\\n'" % mark]
+            cmd += ["printf '%s ERR\\n'" % mark]
         try:
             r = ex.run("bash -s", input="\n".join(cmd) + "\n", timeout=30)
         except TransportError as e:
@@ -1266,6 +1310,56 @@ class JobService:
                 cur = line[len(mark) + 1:].strip()
             elif cur in parts:
                 parts[cur] += line
+
+        # Post-MinJobAge fallback: if scontrol & default slurm-<id>.out missed custom #SBATCH -o/-e
+        if sid and parts["SCRIPT"] and (not parts["OUT"].strip() or not parts["ERR"].strip()):
+            hdr = slurm.parse_header(parts["SCRIPT"])
+            opts = slurm.header_options(hdr.directives) if hdr else {}
+            job_name = opts.get("job_name") or posixpath.basename(j["script"])
+            raw_out = opts.get("output") or ""
+            raw_err = opts.get("error") or ""
+            want_out = (not parts["OUT"].strip() and raw_out
+                        and raw_out.lower() not in ("none", "/dev/null"))
+            want_err = (not parts["ERR"].strip() and raw_err
+                        and raw_err.lower() not in ("none", "/dev/null"))
+            if want_out or want_err:
+                mark2 = "@@HPCP_%s" % secrets.token_hex(6)
+                fb_cmd = ["cd -- %s 2>/dev/null || true" % q(j["workdir"]), "f=''"]
+                if want_out:
+                    pat_out = self._expand_log_pattern(raw_out, sid, job_name)
+                    fb_cmd += [
+                        "for __c in %s; do [ -f \"$__c\" ] && f=\"$__c\" && break; done"
+                        % self._safe_glob_expr(pat_out),
+                        "printf '%s OUT\\n'" % mark2,
+                        "[ -n \"$f\" ] && { tail -c %d -- \"$f\" 2>/dev/null || true; printf '\\n'; } || true"
+                        % max_bytes,
+                    ]
+                if want_err:
+                    pat_err = self._expand_log_pattern(raw_err, sid, job_name)
+                    fb_cmd += [
+                        "e=''",
+                        "for __c in %s; do [ -f \"$__c\" ] && e=\"$__c\" && break; done"
+                        % self._safe_glob_expr(pat_err),
+                        "printf '%s ERR\\n'" % mark2,
+                        "if [ -n \"$e\" ] && [ \"$e\" != \"$f\" ]; then "
+                        "tail -c %d -- \"$e\" 2>/dev/null || true; fi" % max_bytes,
+                    ]
+                try:
+                    r2 = ex.run("bash -s", input="\n".join(fb_cmd) + "\n", timeout=30)
+                    cur2 = None
+                    fb_parts = {"OUT": "", "ERR": ""}
+                    for line in r2.out.splitlines(keepends=True):
+                        if line.startswith(mark2 + " "):
+                            cur2 = line[len(mark2) + 1:].strip()
+                        elif cur2 in fb_parts:
+                            fb_parts[cur2] += line
+                    if want_out and fb_parts["OUT"].strip():
+                        parts["OUT"] = fb_parts["OUT"]
+                    if want_err and fb_parts["ERR"].strip():
+                        parts["ERR"] = fb_parts["ERR"]
+                except TransportError:
+                    pass
+
         return {"job": j, "script": parts["SCRIPT"], "stdout": parts["OUT"],
                 "stderr": parts["ERR"]}
 

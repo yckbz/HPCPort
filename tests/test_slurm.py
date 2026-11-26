@@ -32,9 +32,13 @@ def test_exclusive_and_missing_time():
     h = slurm.parse_header(script)
     assert slurm.resources(h).unknown == ("cores", "gpus")
     # cores_per_node alone still leaves exclusive GPU allocation unknown (never 0 GPU-h!)
+    # while preserving known cores for measured core-hour accounting after completion
     r_only_cores = slurm.resources(h, cores_per_node=64)
     assert r_only_cores.unknown == ("gpus",)
+    assert r_only_cores.core_hours is None
     assert r_only_cores.gpu_hours is None
+    assert r_only_cores.cores == 128
+    assert r_only_cores.gpus is None
     # CPU-only nodes declare gpus_per_node=0 -> 128 core-h, 0 GPU-h
     r_cpu = slurm.resources(h, cores_per_node=64, gpus_per_node=0)
     assert r_cpu.unknown == ()
@@ -115,13 +119,20 @@ def test_gpu_per_socket_tres_and_sub_hour_formatting():
     assert r1.gpus == 4
     assert r1.gpu_hours == 4.0
 
-    # --gpus-per-socket without known sockets -> MUST be unknown (never 0!)
+    # --gpus-per-socket without known sockets -> MUST be unknown (never 0!), while preserving known cores
     h2 = slurm.parse_header(
-        "#!/bin/bash\n#SBATCH -N 1\n#SBATCH --gpus-per-socket=2\n#SBATCH -t 01:00:00\n"
+        "#!/bin/bash\n#SBATCH -N 1 -n 4\n#SBATCH --gpus-per-socket=2\n#SBATCH -t 01:00:00\n"
     )
     r2 = slurm.resources(h2)
     assert "gpus_per_socket" in r2.unknown
-    assert r2.gpu_hours is None
+    assert r2.gpu_hours is None and r2.core_hours is None
+    assert r2.cores == 4 and r2.gpus is None
+
+    # Unparseable -N under --exclusive must invalidate both cores and gpus
+    h_bad_n = slurm.parse_header("#!/bin/bash\n#SBATCH -N bad --exclusive -t 01:00:00\n")
+    r_bad_n = slurm.resources(h_bad_n, cores_per_node=64, gpus_per_node=8)
+    assert "nodes" in r_bad_n.unknown
+    assert r_bad_n.cores is None and r_bad_n.gpus is None
 
     # -B 2:16:1 + --gpus-per-socket=2 -> 4 GPUs; --cpus-per-gpu=6 -> 24 cores
     h3 = slurm.parse_header(

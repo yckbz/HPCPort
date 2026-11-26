@@ -648,3 +648,85 @@ def test_submit_inline_race_wrapper_abort_cancel_wake_and_sid_write_fail(hpc_hom
         d.jobs._write_wrappers = orig_w
         if (wd_ro / ".hpcport").exists():
             (wd_ro / ".hpcport").chmod(0o755)
+
+
+def test_read_job_files_post_minjobage_log_fallbacks(hpc_home, tmp_path):
+    import os
+    import sys as _sys
+    from hpcport.executor import LocalExecutor
+
+    # Fake slurm bin where scontrol always returns empty (simulating post-MinJobAge expiry)
+    fakebin = tmp_path / "minjobage_bin"
+    fakebin.mkdir()
+    counter = tmp_path / "sid_counter"
+    counter.write_text("900", encoding="utf-8")
+    (fakebin / "sbatch").write_text(
+        "#!%s\n"
+        "from pathlib import Path\n"
+        "p = Path(%r)\n"
+        "n = int(p.read_text()) + 1\n"
+        "p.write_text(str(n))\n"
+        "print(n)\n" % (_sys.executable, str(counter)),
+        encoding="utf-8",
+    )
+    (fakebin / "sbatch").chmod(0o755)
+    for tool in ("squeue", "scontrol"):
+        (fakebin / tool).write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        (fakebin / tool).chmod(0o755)
+
+    ex = LocalExecutor(env=dict(os.environ, PATH="%s:%s" % (fakebin, os.environ.get("PATH", ""))))
+    remote = tmp_path / "remote_logs"
+    remote.mkdir()
+    d = Daemon(executors={"c1": ex}, browser_opener=lambda url: True)
+    d.settings.create_preset("c1", {
+        "connect": "local", "scheduler": "slurm", "partitions": ["a100"],
+        "max_jobs": 4, "projects_root": str(remote),
+    })
+    d.settings.create_project("p1", data={"submit": {"approval": False}})
+    d.attach_cluster("p1", "c1")
+
+    wd = remote / "p1" / "exp"
+    (wd / "logs").mkdir(parents=True)
+
+    # 1. Custom #SBATCH -o and -e with %j
+    (wd / "custom.sh").write_text(
+        "#!/bin/bash\n#SBATCH -p a100\n#SBATCH -t 01:00:00\n"
+        "#SBATCH -o logs/train_%j.out\n#SBATCH -e logs/train_%j.err\necho hi\n",
+        encoding="utf-8",
+    )
+    r1 = d.jobs.submit("p1", "c1", str(wd), ["custom.sh"], desc="custom logs", wait_s=0)
+    sid1 = r1["ids"][0]
+    (wd / "logs" / ("train_%s.out" % sid1)).write_text("CUSTOM_STDOUT\n", encoding="utf-8")
+    (wd / "logs" / ("train_%s.err" % sid1)).write_text("CUSTOM_STDERR\n", encoding="utf-8")
+    j1 = d.db.one("SELECT id FROM jobs WHERE slurm_id = ?", (sid1,))["id"]
+    f1 = d.jobs.read_job_files(j1)
+    assert "CUSTOM_STDOUT" in f1["stdout"]
+    assert "CUSTOM_STDERR" in f1["stderr"]
+
+    # 2. Default array log slurm-<id>_0.out fallback
+    (wd / "arr_def.sh").write_text(
+        "#!/bin/bash\n#SBATCH -p a100\n#SBATCH -t 01:00:00\n#SBATCH --array=0-2\necho arr\n",
+        encoding="utf-8",
+    )
+    r2 = d.jobs.submit("p1", "c1", str(wd), ["arr_def.sh"], desc="array default", wait_s=0)
+    sid2 = r2["ids"][0]
+    (wd / ("slurm-%s_0.out" % sid2)).write_text("ARRAY_DEFAULT_OUT\n", encoding="utf-8")
+    j2 = d.db.one("SELECT id FROM jobs WHERE slurm_id = ?", (sid2,))["id"]
+    f2 = d.jobs.read_job_files(j2)
+    assert "ARRAY_DEFAULT_OUT" in f2["stdout"]
+
+    # 3. Custom array pattern %A_%a + shell metacharacters are never executed
+    pwn_marker = tmp_path / "pwned_by_log_spec"
+    (wd / "arr_pat.sh").write_text(
+        "#!/bin/bash\n#SBATCH -p a100\n#SBATCH -t 01:00:00\n#SBATCH --array=0-1\n"
+        "#SBATCH --output=logs/arr_%A_%a.out\n"
+        + ('#SBATCH --error="logs/safe_$(touch %s)_%%j.err"\necho arr2\n' % pwn_marker),
+        encoding="utf-8",
+    )
+    r3 = d.jobs.submit("p1", "c1", str(wd), ["arr_pat.sh"], desc="array pat", wait_s=0)
+    sid3 = r3["ids"][0]
+    (wd / "logs" / ("arr_%s_1.out" % sid3)).write_text("ARRAY_PATTERN_OUT\n", encoding="utf-8")
+    j3 = d.db.one("SELECT id FROM jobs WHERE slurm_id = ?", (sid3,))["id"]
+    f3 = d.jobs.read_job_files(j3)
+    assert "ARRAY_PATTERN_OUT" in f3["stdout"]
+    assert not pwn_marker.exists()
