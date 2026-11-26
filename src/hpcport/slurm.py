@@ -107,6 +107,7 @@ def header_options(directives) -> dict[str, str]:
         try:
             toks = shlex.split(line[len("#SBATCH"):], comments=True)
         except ValueError:
+            opts["__unparseable__"] = line
             continue
         k = 0
         while k < len(toks):
@@ -261,6 +262,8 @@ def resources(header: Header, cores_per_node: int | None = None,
               gpus_per_node: int | None = None) -> Resources:
     o = header_options(header.directives)
     unknown: list[str] = []
+    if "__unparseable__" in o:
+        unknown.append("directive")
 
     def read(key, conv, default):
         if key not in o:

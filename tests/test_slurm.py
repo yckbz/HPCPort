@@ -170,3 +170,24 @@ def test_gpu_per_socket_tres_and_sub_hour_formatting():
     assert "0.05 core-h" in summ
     assert "0.013 GPU-h" in summ
     assert "0.0 GPU-h" not in summ
+
+
+def test_unparseable_sbatch_directive_marks_unknown():
+    # Unclosed quote or bare apostrophe must NOT silently drop GPU/node directives
+    h1 = slurm.parse_header(
+        "#!/bin/bash\n"
+        "#SBATCH -N 4 --gres=gpu:8 -J \"O'Connor\n"
+        "#SBATCH -t 01:00:00\n"
+    )
+    r1 = slurm.resources(h1)
+    assert "directive" in r1.unknown
+    assert r1.core_hours is None and r1.gpu_hours is None
+
+    h2 = slurm.parse_header(
+        "#!/bin/bash\n"
+        "#SBATCH -N 2 --gres=gpu:4 --comment=Bob's_run\n"
+        "#SBATCH -t 02:00:00\n"
+    )
+    r2 = slurm.resources(h2)
+    assert "directive" in r2.unknown
+    assert r2.gpu_hours is None
