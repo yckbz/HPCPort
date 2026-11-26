@@ -169,3 +169,54 @@ def test_wait_sync_no_abba_deadlock(hpc_home, tmp_path):
         assert result[0]["reason"] == "done"
     finally:
         waits_mod.TICK_S = old_tick
+
+
+def test_upload_and_transfer_block_symlink_escape_and_unsafe_cwd(hpc_home, tmp_path):
+    d, _, local_dir, remote = _setup_gateway(hpc_home, tmp_path)
+    (local_dir / "payload.txt").write_text("secret_payload", encoding="utf-8")
+
+    outside = tmp_path / "outside_target"
+    outside.mkdir()
+    (outside / "host_secret.txt").write_text("top_secret", encoding="utf-8")
+    root = remote / "p1_bare"
+    escape = root / "escape"
+    escape.symlink_to(outside)
+
+    # 1. remote_exec upload into symlink escaping root must fail BEFORE rsync writes anything
+    with pytest.raises(GatewayError) as exc:
+        d.gateway.exec("p1", "bare1", "ls", cwd="escape", upload=["payload.txt"])
+    assert exc.value.code == "bad_cwd"
+    assert not (outside / "payload.txt").exists()
+
+    # 2. remote_exec upload into non-existent cwd must fail with no_cwd without creating dir
+    missing = root / "does_not_exist"
+    with pytest.raises(GatewayError) as exc2:
+        d.gateway.exec("p1", "bare1", "ls", cwd="does_not_exist", upload=["payload.txt"])
+    assert exc2.value.code == "no_cwd"
+    assert not missing.exists()
+
+    # 3. remote_exec upload with shell metacharacters / spaces in cwd must be rejected
+    with pytest.raises(GatewayError) as exc3:
+        d.gateway.exec("p1", "bare1", "ls", cwd="sub$(touch /tmp/nope)", upload=["payload.txt"])
+    assert exc3.value.code == "bad_path"
+
+    # 4. transfer into or out of symlink escaping root must be blocked BEFORE rsync runs
+    with pytest.raises(GatewayError) as exc4:
+        d.gateway.transfer("p1", "payload.txt", "bare1:escape/payload.txt")
+    assert exc4.value.code == "remote_outside"
+    assert not (outside / "payload.txt").exists()
+
+    with pytest.raises(GatewayError) as exc5:
+        d.gateway.transfer("p1", "bare1:escape/host_secret.txt", "stolen.txt")
+    assert exc5.value.code == "remote_outside"
+    assert not (local_dir / "stolen.txt").exists()
+
+    # Chain of two file symlinks escaping root must also be blocked
+    link2 = root / "link_to_secret"
+    link2.symlink_to(outside / "host_secret.txt")
+    link1 = root / "link_chain"
+    link1.symlink_to("link_to_secret")
+    with pytest.raises(GatewayError) as exc6:
+        d.gateway.transfer("p1", "bare1:link_chain", "stolen2.txt")
+    assert exc6.value.code == "remote_outside"
+    assert not (local_dir / "stolen2.txt").exists()

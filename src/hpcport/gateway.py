@@ -282,6 +282,76 @@ class GatewayService:
             raise GatewayError(what, path=path, root=cl.root, cluster=cl.name)
         return full
 
+    def _verify_remote_path(self, cl, path: str, shown: str,
+                            must_exist: bool = False,
+                            missing_code: str = "no_cwd",
+                            outside_code: str = "bad_cwd") -> str:
+        """Verify on the remote host via `pwd -P` that `path` (or its deepest
+        existing ancestor when must_exist=False) stays inside `cl.root`."""
+        q = shlex.quote
+        if must_exist:
+            script = (
+                "root=$(cd -- %s 2>/dev/null && pwd -P)\n"
+                "if [ -z \"$root\" ]; then echo 'HPCP_ERR noroot'\n"
+                "elif ! cd -- %s 2>/dev/null; then echo 'HPCP_ERR missing'\n"
+                "else p=$(pwd -P); case \"$p/\" in \"$root\"/*) "
+                "printf 'HPCP_REAL %%s\\n' \"$p\";; *) echo 'HPCP_ERR outside';; esac\n"
+                "fi\n"
+                % (q(cl.root), q(path))
+            )
+        else:
+            script = (
+                "root=$(cd -- %s 2>/dev/null && pwd -P)\n"
+                "if [ -z \"$root\" ]; then echo 'HPCP_ERR noroot'; exit 0; fi\n"
+                "cur=%s\n"
+                "while [ ! -e \"$cur\" ] && [ ! -L \"$cur\" ]; do\n"
+                "  parent=$(dirname -- \"$cur\")\n"
+                "  [ \"$parent\" = \"$cur\" ] && break\n"
+                "  cur=$parent\n"
+                "done\n"
+                "hops=0\n"
+                "while [ -L \"$cur\" ] && [ \"$hops\" -lt 16 ]; do\n"
+                "  target=$(readlink -- \"$cur\" 2>/dev/null || true)\n"
+                "  [ -z \"$target\" ] && { p=''; break; }\n"
+                "  dir=$(cd -- \"$(dirname -- \"$cur\")\" 2>/dev/null && pwd -P)\n"
+                "  [ -z \"$dir\" ] && { p=''; break; }\n"
+                "  case \"$target\" in /*) cur=$target;; *) cur=\"$dir/$target\";; esac\n"
+                "  hops=$((hops+1))\n"
+                "done\n"
+                "if [ -L \"$cur\" ]; then\n"
+                "  p=''\n"
+                "elif [ -d \"$cur\" ]; then\n"
+                "  p=$(cd -- \"$cur\" 2>/dev/null && pwd -P)\n"
+                "else\n"
+                "  tdir=$(cd -- \"$(dirname -- \"$cur\")\" 2>/dev/null && pwd -P)\n"
+                "  p=\"${tdir:+$tdir/$(basename -- \"$cur\")}\"\n"
+                "fi\n"
+                "if [ -z \"$p\" ]; then echo 'HPCP_ERR outside'\n"
+                "else case \"$p/\" in \"$root\"/*) "
+                "printf 'HPCP_REAL %%s\\n' \"$p\";; *) echo 'HPCP_ERR outside';; esac\n"
+                "fi\n"
+                % (q(cl.root), q(path))
+            )
+        try:
+            r = self._run(cl.name, script, timeout=60)
+        except TransportError as e:
+            raise GatewayError("unreachable", cluster=cl.name, error=str(e))
+        err = None
+        real = None
+        for line in r.out.splitlines():
+            key, _, val = line.partition(" ")
+            if key == "HPCP_ERR":
+                err = val.strip()
+            elif key == "HPCP_REAL":
+                real = val
+        if err == "noroot":
+            raise GatewayError("no_root", cluster=cl.name, root=cl.root)
+        if err == "missing":
+            raise GatewayError(missing_code, path=shown, cluster=cl.name)
+        if err == "outside" or not real:
+            raise GatewayError(outside_code, path=shown, root=cl.root, cluster=cl.name)
+        return real
+
     def _local_path(self, p, path: str, dest: bool = False, name: str | None = None) -> Path:
         if p.local_dir is None:
             raise GatewayError("no_local_dir", project=p.name)
@@ -403,7 +473,15 @@ class GatewayService:
         with self.lock:
             self._room(p)
         if files:
-            argv = self._rsync(files, ex.rsync_spec(wd.rstrip("/") + "/"), ex.rsync_rsh())
+            if cwd and not SAFE_PATH.match(cwd):
+                raise GatewayError("bad_path", path=cwd)
+            real_wd = self._verify_remote_path(
+                cl, wd, cwd or cl.root,
+                must_exist=True, missing_code="no_cwd", outside_code="bad_cwd",
+            )
+            if ex.rsync_rsh() is not None and not SAFE_PATH.match(real_wd):
+                raise GatewayError("bad_path", path=cwd or cl.root)
+            argv = self._rsync(files, ex.rsync_spec(real_wd.rstrip("/") + "/"), ex.rsync_rsh())
             try:
                 proc = subprocess.run(argv, capture_output=True, text=True, errors="replace",
                                       stdin=subprocess.DEVNULL, timeout=UPLOAD_TIMEOUT_S)
@@ -637,6 +715,16 @@ class GatewayService:
         b = self._endpoint(p, dst, dest=True, name=base)
         if a["cluster"] is None and b["cluster"] is None:
             raise GatewayError("both_local")
+        if a["cluster"] is not None:
+            self._verify_remote_path(
+                p.clusters[a["cluster"]], a["path"].rstrip("/") or "/", src,
+                must_exist=False, outside_code="remote_outside",
+            )
+        if b["cluster"] is not None:
+            self._verify_remote_path(
+                p.clusters[b["cluster"]], b["path"].rstrip("/") or "/", dst,
+                must_exist=False, outside_code="remote_outside",
+            )
         size = self._size(a)
         args = dict(src=src, dst=dst, exclude=exclude, timeout_s=timeout_s,
                     background=bool(background))
