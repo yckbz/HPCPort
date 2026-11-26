@@ -32,6 +32,7 @@ const state = {
   openScripts: new Set(),   // approval ids showing scripts
   openStanding: new Set(),  // approval ids showing standing form
   openDiffs: new Set(),     // approval ids showing unified diff
+  expandedOps: new Set(),   // op ids showing full command/path inline
 
   // Live SSE
   sse: null,
@@ -1041,13 +1042,16 @@ function renderJobs() {
               ${ops.map((o) => {
                 const sp = o.spec || {};
                 const cmdText = o.kind === "exec" ? (sp.command || "") : `${sp.src || ""} -> ${sp.dst || ""}`;
+                const isExpanded = state.expandedOps.has(o.id);
                 return `
                   <tr>
                     <td class="mono"><strong>op:${o.id}</strong></td>
                     <td>${esc(o.project)}</td>
                     <td class="mono">${esc(o.cluster || "-")}</td>
                     <td><span class="pill pill-gray">${esc(o.kind)}</span></td>
-                    <td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(cmdText)}">${esc(cmdText)}</td>
+                    <td>
+                      <div class="cmd-expandable mono${isExpanded ? " expanded" : ""}" data-toggle-op-cmd="${o.id}" title="${esc(cmdText)}">${esc(cmdText)}</div>
+                    </td>
                     <td>${renderStatePill(o.state)}</td>
                     <td>
                       <div class="flex-row" style="gap:6px">
@@ -1129,6 +1133,31 @@ function renderJobs() {
 
   el.querySelectorAll("[data-inspect-job]").forEach((btn) => {
     btn.onclick = () => openJobDrawer(Number(btn.dataset.inspectJob));
+  });
+
+  el.querySelectorAll("[data-toggle-op-cmd]").forEach((node) => {
+    const id = Number(node.dataset.toggleOpCmd);
+    const isExpanded = state.expandedOps.has(id);
+    const hasNewline = (node.textContent || "").includes("\n");
+    const isTruncated = node.scrollWidth > node.clientWidth + 1;
+    if (isExpanded || isTruncated || hasNewline) {
+      node.classList.add("is-expandable");
+      node.setAttribute("role", "button");
+      node.setAttribute("tabindex", "0");
+      node.setAttribute("aria-expanded", isExpanded ? "true" : "false");
+      const toggle = () => {
+        if (state.expandedOps.has(id)) state.expandedOps.delete(id);
+        else state.expandedOps.add(id);
+        renderJobs();
+      };
+      node.onclick = toggle;
+      node.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggle();
+        }
+      };
+    }
   });
 
   el.querySelectorAll("[data-inspect-op]").forEach((btn) => {

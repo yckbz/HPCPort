@@ -39,9 +39,11 @@
 
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Helvetica Neue", sans-serif;
   --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.75 4.5L6 7.75L9.25 4.5' stroke='%236e6e73' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 [data-theme="dark"] {
+  --chevron-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.75 4.5L6 7.75L9.25 4.5' stroke='%23a1a1a6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --bg-canvas: #121214;
   --bg-card: #1c1c1f;
   --bg-subtle: #252529;
@@ -340,14 +342,60 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: var(--chevron-svg);
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 12px;
+  padding-right: 34px;
+  cursor: pointer;
+}
+
 .select-compact {
-  padding: 5px 10px;
+  padding: 5px 32px 5px 12px;
   font-size: 12.5px;
   font-weight: 550;
   border-radius: 8px;
+  background-color: var(--bg-subtle);
+  border-color: var(--border);
+  max-width: 185px;
+}
+
+.cmd-expandable {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 7px;
+  margin: -4px -7px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.cmd-expandable.is-expandable {
+  cursor: pointer;
+}
+
+.cmd-expandable.is-expandable:hover {
   background: var(--bg-subtle);
   border-color: var(--border);
-  max-width: 170px;
+}
+
+.cmd-expandable.expanded {
+  max-width: 540px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow: visible;
+  text-overflow: clip;
+  background: var(--bg-code);
+  border-color: var(--border);
+  padding: 8px 10px;
+  margin: 0;
+  cursor: pointer;
+  line-height: 1.5;
 }
 
 /* Main Content Layout */
