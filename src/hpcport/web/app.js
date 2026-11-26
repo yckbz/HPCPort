@@ -370,7 +370,10 @@ function renderReasonChip(r) {
     return `<span class="pill pill-blue">${esc(i18n.t("reason_no_standing"))}</span>`;
   }
   if (r.rule) {
-    return `<span class="pill pill-amber">${esc(r.rule)}${r.detail ? ": " + esc(r.detail) : ""}</span>`;
+    const key = "guardRule_" + r.rule;
+    const translated = i18n.t(key);
+    const desc = translated !== key ? translated : (r.detail || "");
+    return `<span class="pill pill-amber">${esc(r.rule)}${desc ? ": " + esc(desc) : ""}</span>`;
   }
   return `<span class="pill pill-gray">${esc(code || JSON.stringify(r))}</span>`;
 }
@@ -585,7 +588,7 @@ function renderApprovals() {
                   <th>#</th>
                   <th>${esc(i18n.t("colProject"))}</th>
                   <th>${esc(i18n.t("colKind"))}</th>
-                  <th>Summary</th>
+                  <th>${esc(i18n.t("colSummary"))}</th>
                   <th>${esc(i18n.t("colStatus"))}</th>
                   <th>${esc(i18n.t("colTime"))}</th>
                 </tr>
@@ -730,7 +733,7 @@ function renderStandingCard(standing) {
       <div class="card">
         <div class="card-header">
           <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
-          <span class="pill pill-gray">Off</span>
+          <span class="pill pill-gray">${esc(i18n.t("standingOff"))}</span>
         </div>
         <p class="muted text-sm" style="margin:0">${esc(i18n.t("standingNone"))}</p>
       </div>
@@ -971,12 +974,12 @@ function renderJobs() {
                         <table>
                           <thead>
                             <tr>
-                              <th>ID</th>
-                              <th>Slurm ID</th>
-                              <th>Script</th>
-                              <th>State</th>
-                              <th>Cores / GPUs</th>
-                              <th>Actions</th>
+                              <th>${esc(i18n.t("colJobId"))}</th>
+                              <th>${esc(i18n.t("colSlurmId"))}</th>
+                              <th>${esc(i18n.t("colScript"))}</th>
+                              <th>${esc(i18n.t("colState"))}</th>
+                              <th>${esc(i18n.t("colResources"))}</th>
+                              <th>${esc(i18n.t("colActions"))}</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -1752,7 +1755,7 @@ function openPresetModal(presetObj) {
           ${(presetObj.versions || []).slice().reverse().map((v) => `
             <div class="metric-chip flex-row" style="min-width:auto;padding:5px 10px">
               <span class="mono">v${v}</span>
-              ${v === presetObj.version ? `<span class="pill pill-green">Active</span>` :
+              ${v === presetObj.version ? `<span class="pill pill-green">${esc(i18n.t("versionActive"))}</span>` :
                 `<button type="button" class="btn btn-subtle btn-xs" data-restore-v="${v}">${esc(i18n.t("restoreBtn"))}</button>`}
             </div>
           `).join("")}

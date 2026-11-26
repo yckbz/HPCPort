@@ -91,7 +91,7 @@ html, body {
 .hidden { display: none !important; }
 .muted { color: var(--text-muted); }
 .secondary { color: var(--text-secondary); }
-.mono { font-family: var(--font-mono); font-size: 12.5px; }
+.mono { font-family: var(--font-mono); font-size: 12.5px; overflow-wrap: anywhere; }
 .tabular { font-variant-numeric: tabular-nums; }
 .text-xs { font-size: 12px; }
 .text-sm { font-size: 13px; }
@@ -499,6 +499,8 @@ input:focus, select:focus, textarea:focus {
   box-shadow: var(--shadow-card);
   padding: 20px 22px;
   margin-bottom: 14px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .approval-meta {
@@ -550,7 +552,8 @@ input:focus, select:focus, textarea:focus {
   font-size: 12px;
   line-height: 1.55;
   overflow-x: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
   max-height: 320px;
   margin: 10px 0 0;
 }
@@ -651,6 +654,8 @@ input:focus, select:focus, textarea:focus {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 14px 16px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .server-card-top {
@@ -720,6 +725,8 @@ tr:last-child td { border-bottom: none; }
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .project-card {
@@ -729,6 +736,8 @@ tr:last-child td { border-bottom: none; }
   box-shadow: var(--shadow-card);
   padding: 20px 22px;
   margin-top: 14px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .pref-row {

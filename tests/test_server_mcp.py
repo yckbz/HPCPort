@@ -340,6 +340,29 @@ def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):
         r_del = client.delete("/api/presets/lab4090", headers={"X-HPCPort-UI": "1"})
         assert r_del.status_code == 200
 
+        # Submit a job, approve it, write fake stdout, and verify /api/job/{id}/files
+        wd = remote / "demo_slurm" / "run1"
+        wd.mkdir(parents=True, exist_ok=True)
+        (wd / "job.sh").write_text(
+            "#!/bin/bash\n#SBATCH --partition=a100\n#SBATCH --cpus-per-task=4\n"
+            "#SBATCH --time=01:00:00\necho hi\n",
+            encoding="utf-8",
+        )
+        r_sub = d.jobs.submit("demo", "gpu01", str(wd), ["job.sh"], "test run", wait_s=0)
+        client.post(
+            "/api/approvals/%d/approve" % r_sub["approval"],
+            json={}, headers={"X-HPCPort-UI": "1"},
+        )
+        d.cycle(force=True)
+        jrow = d.db.one("SELECT * FROM jobs ORDER BY id DESC LIMIT 1")
+        assert jrow and jrow["slurm_id"]
+        (wd / ("slurm-%s.out" % jrow["slurm_id"])).write_text("hello from slurm\n", encoding="utf-8")
+        r_files = client.get("/api/job/%d/files" % jrow["id"])
+        assert r_files.status_code == 200
+        jf = r_files.json()
+        assert "#SBATCH --cpus-per-task=4" in jf["script"]
+        assert "hello from slurm" in jf["stdout"]
+
         # Jobs & Audit endpoints respond cleanly
         assert client.get("/api/jobs?project=demo").status_code == 200
         assert client.get("/api/audit?project=demo").status_code == 200

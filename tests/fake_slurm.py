@@ -110,8 +110,8 @@ class FakeSlurmExecutor(Executor):
                         )
             return Result(0, "\n".join(out_lines) + "\n", "")
 
-        # Intercept hook + scontrol fallback script
-        if input and "scontrol show job" in input:
+        # Intercept hook + scontrol fallback script (not read_job_files)
+        if input and "scontrol show job" in input and " J " in input:
             out_lines = []
             # Run hook cat commands locally, and synthesize scontrol lines
             for line in input.splitlines():
