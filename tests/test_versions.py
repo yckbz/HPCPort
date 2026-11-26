@@ -50,6 +50,21 @@ def test_apply_removal_and_nested():
     new = versions.apply(old, {"submit": {"core_hours": None}, "extra": None})
     assert new == {"submit": {"approval": True}}
 
+    # Explicit keep_none preserves None at selected paths while still popping other keys
+    kept = versions.apply(
+        old,
+        {"submit": {"core_hours": None}, "extra": None},
+        keep_none=lambda p: p == ("submit", "core_hours"),
+    )
+    assert kept == {"submit": {"approval": True, "core_hours": None}}
+    # Also consistent when parent dict does not exist yet
+    from_empty = versions.apply(
+        {},
+        {"submit": {"core_hours": None, "other": None}},
+        keep_none=lambda p: p == ("submit", "core_hours"),
+    )
+    assert from_empty == {"submit": {"core_hours": None}}
+
 
 def test_load_rejects_non_mapping():
     with pytest.raises(ValueError):

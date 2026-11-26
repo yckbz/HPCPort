@@ -212,3 +212,45 @@ def test_detach_cluster_does_not_treat_underscore_as_like_wildcard(hpc_home, tmp
         assert "gpu_1" not in d.projects["p1"].clusters
     finally:
         d.gateway.stop("p1", op["op"]["id"], by="user")
+
+
+def test_update_project_preserves_null_submit_limits_and_blocks_busy_cluster_patch(hpc_home, tmp_path):
+    import pytest
+    from hpcport.settings import SettingError
+
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    d = Daemon(browser_opener=lambda url: True)
+    d.settings.create_preset("bare1", {
+        "connect": "local", "scheduler": "none", "projects_root": str(remote),
+    })
+    d.settings.create_project("p1")
+    d.attach_cluster("p1", "bare1", root=str(remote / "p1_b"))
+
+    # 1. Patching submit limits to None persists unlimited (None), NOT default 5000.0
+    assert d.projects["p1"].submit.core_hours == 5000.0
+    d.settings.update_project("p1", {"submit": {"core_hours": None, "total_jobs": None}})
+    assert d.projects["p1"].submit.core_hours is None
+    assert d.projects["p1"].submit.total_jobs is None
+    reloaded = config.load_project("p1", presets=d.presets)
+    assert reloaded.submit.core_hours is None
+    assert reloaded.submit.total_jobs is None
+
+    # 2. Direct update_project cannot remove or re-root a cluster while an op is running
+    op = d.gateway.exec("p1", "bare1", "sleep 20", background=True)
+    try:
+        with pytest.raises(SettingError) as exc1:
+            d.settings.update_project("p1", {"clusters": {"bare1": None}})
+        assert exc1.value.code == "cluster_busy"
+        with pytest.raises(SettingError) as exc2:
+            d.settings.update_project(
+                "p1", {"clusters": {"bare1": {"root": str(remote / "other_root")}}},
+            )
+        assert exc2.value.code == "cluster_busy"
+    finally:
+        d.gateway.stop("p1", op["op"]["id"], by="user")
+    # Once op ended, removing cluster via update_project succeeds and clears stale root meta
+    d.jobs.note_root("p1", "bare1", str(remote / "p1_b"))
+    d.settings.update_project("p1", {"clusters": {"bare1": None}})
+    assert "bare1" not in d.projects["p1"].clusters
+    assert d.jobs._real_root("p1", "bare1") is None

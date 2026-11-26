@@ -142,14 +142,20 @@ def get(data, path: tuple):
     return data
 
 
-def apply(data: dict, patch: dict) -> dict:
-    """Return a copy of data with patch applied (None removes an entry)."""
+def apply(data: dict, patch: dict, keep_none=None, _prefix: tuple = ()) -> dict:
+    """Return a copy of data with patch applied (None removes an entry unless keep_none(path))."""
     out = dict(data)
     for k, v in patch.items():
+        p = _prefix + (k,)
         if v is None:
-            out.pop(k, None)
+            if keep_none is not None and keep_none(p):
+                out[k] = None
+            else:
+                out.pop(k, None)
         elif isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = apply(out[k], v)
+            out[k] = apply(out[k], v, keep_none=keep_none, _prefix=p)
+        elif isinstance(v, dict):
+            out[k] = apply({}, v, keep_none=keep_none, _prefix=p)
         else:
             out[k] = v
     return out

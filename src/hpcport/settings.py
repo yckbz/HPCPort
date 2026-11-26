@@ -24,7 +24,7 @@ from . import config, versions
 from .approvals import ApprovalError
 from .config import (
     PRESET_KEYS, PRESET_SAFETY, PROJECT_KEYS, PROJECT_PROPOSABLE, PROJECT_SAFETY,
-    Cluster, ClusterPreset, ConfigError, Project,
+    SUBMIT_LIMITS, Cluster, ClusterPreset, ConfigError, Project,
     list_preset_names, list_project_names, parse_preset, parse_project,
     preset_file, preset_to_dict, project_file, project_to_dict, validate_name,
 )
@@ -113,6 +113,32 @@ class SettingsService:
 
     def _deep(self, kind: str, path: tuple) -> bool:
         return kind == PROJECT
+
+    def _keep_none(self, kind: str, path: tuple) -> bool:
+        return kind == PROJECT and len(path) == 2 and path[0] == "submit" and path[1] in SUBMIT_LIMITS
+
+    def _check_project_cluster_changes(self, project: str, old_data: dict, new_data: dict) -> None:
+        old_clusters = old_data.get("clusters") or {}
+        new_clusters = new_data.get("clusters") or {}
+        if not isinstance(old_clusters, dict) or not isinstance(new_clusters, dict):
+            return
+        for cname, old_spec in old_clusters.items():
+            new_spec = new_clusters.get(cname)
+            old_root = (old_spec.get("root") or "").rstrip("/") if isinstance(old_spec, dict) else ""
+            new_root = (new_spec.get("root") or "").rstrip("/") if isinstance(new_spec, dict) else ""
+            if new_spec is None or old_root != new_root:
+                active_jobs = self.db.one(
+                    "SELECT 1 FROM jobs WHERE project = ? AND cluster = ? "
+                    "AND state IN ('unapproved', 'held', 'queued', 'running') LIMIT 1",
+                    (project, cname),
+                )
+                active_ops = self.db.one(
+                    "SELECT 1 FROM ops WHERE project = ? AND state = 'running' "
+                    "AND instr(',' || cluster || ',', ?) > 0 LIMIT 1",
+                    (project, "," + cname + ","),
+                )
+                if active_jobs or active_ops:
+                    raise SettingError("cluster_busy", cluster=cname, project=project)
 
     def _safety(self, kind: str, path: tuple) -> bool:
         if not path:
@@ -222,8 +248,12 @@ class SettingsService:
             if cur is None:
                 raise SettingError("unknown_setting", key=key)
             old_data = versions.load(cur[1])
-            new_data = versions.apply(old_data, patch)
+            new_data = versions.apply(
+                old_data, patch, keep_none=lambda p: self._keep_none(kind, p),
+            )
             parsed = self._parse(kind, name, new_data)
+            if kind == PROJECT:
+                self._check_project_cluster_changes(name, old_data, new_data)
             if new_data == old_data:
                 return {"key": key, "version": cur[0], "changed": False}
             new_text = versions.edit(cur[1], new_data)
@@ -539,7 +569,9 @@ class SettingsService:
                                 {"proposal": pid, "doc": key, "moved": moved})
                 raise ApprovalError("stale", id=approval["id"],
                                     msg="fields changed since proposal: " + ", ".join(moved))
-            new_data = versions.apply(cur_data, patch)
+            new_data = versions.apply(
+                cur_data, patch, keep_none=lambda p: self._keep_none(kind, p),
+            )
             try:
                 parsed = self._parse(kind, name, new_data)
             except ConfigError as e:

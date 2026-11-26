@@ -75,25 +75,34 @@ class ApprovalService:
             r = self.db.one("SELECT COUNT(*) AS n FROM approvals WHERE state = 'pending'")
         return r["n"] if r else 0
 
-    def decide(self, aid: int, approved: bool, comment: str = "", **options) -> dict:
+    def decide_with_options(self, aid: int, approved: bool, comment: str = "",
+                            options: dict | None = None) -> dict:
         row = self.get(aid)
         if row is None:
             raise ApprovalError("unknown_approval", id=aid)
         if row["state"] != "pending":
             raise ApprovalError("already_decided", id=aid, state=row["state"])
-        extra = sorted(set(options) - set(self.options.get(row["kind"], ())))
+        if comment is None:
+            comment = ""
+        elif not isinstance(comment, str):
+            raise ApprovalError("bad_option", id=aid, msg="comment must be a string")
+        opts = dict(options or {})
+        extra = sorted(set(opts) - set(self.options.get(row["kind"], ())))
         if extra:
             raise ApprovalError(
                 "bad_option",
                 id=aid,
                 msg="approval %d (%s) does not accept: %s" % (aid, row["kind"], ", ".join(extra)),
             )
-        result = self.handlers[row["kind"]](row, approved, comment.strip(), options)
+        result = self.handlers[row["kind"]](row, approved, comment.strip(), opts)
         state = "approved" if approved else "rejected"
         now = self.now()
         self.db.update("approvals", {"id": aid}, state=state, comment=comment.strip(), decided=now)
         self.on_change(aid)
         return dict(result or {}, id=aid, state=state)
+
+    def decide(self, aid: int, approved: bool, comment: str = "", **options) -> dict:
+        return self.decide_with_options(aid, approved, comment, options)
 
     def revise(self, aid: int, summary: str, detail: dict) -> None:
         self.db.run(

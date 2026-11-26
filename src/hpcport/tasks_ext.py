@@ -140,7 +140,11 @@ class TasksExtension(Extension):
         if params.name != "wait_for" or not client_supports_tasks(ctx):
             return await call_next(ctx)
 
-        session_key = _header(ctx, "mcp-session-id") or "default"
+        session_key = (
+            _header(ctx, "mcp-session-id")
+            or _header(ctx, "x-hpcport-client")
+            or "default"
+        )
         args = dict(params.arguments or {})
 
         def _register():

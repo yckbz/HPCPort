@@ -843,3 +843,85 @@ def test_cli_port_flag_consistency_and_zero_cores_per_node(monkeypatch):
     cli._cmd_cluster(args)
     assert captured["port"] == 9015
     assert captured["payload"]["data"]["cores_per_node"] == 0
+
+
+def test_approval_decide_hardening_and_client_header_notice_isolation(hpc_home, tmp_path):
+    from hpcport.stdio_bridge import build_forward_headers
+
+    d, ex, app, opened, remote, _ = _make_app(hpc_home, tmp_path)
+    hdrs, _ = build_forward_headers('{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                                    client_id="stdio-abc123")
+    assert hdrs["X-HPCPort-Client"] == "stdio-abc123"
+
+    with TestClient(app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"},
+        ).status_code == 200
+
+        # 1. Colliding parameter names or non-string comment return 400 (never 500)
+        aid = d.settings.propose_preset("demo", "gpu01", {"guide": "x"}, "note")["approval"]
+        r_col = client.post(
+            "/api/approvals/%d/approve" % aid,
+            json={"approved": False},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_col.status_code == 400
+        assert "approved" in r_col.json()["error"]
+
+        r_aid = client.post(
+            "/api/approvals/%d/approve" % aid,
+            json={"aid": 999},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_aid.status_code == 400
+
+        r_cmt = client.post(
+            "/api/approvals/%d/approve" % aid,
+            json={"comment": 12345},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_cmt.status_code == 400
+        assert "comment" in r_cmt.json()["error"]
+
+        # Dashboard open still succeeds cleanly via worker thread
+        r_open = client.post("/api/dashboard/open", json={"tab": "jobs"},
+                             headers={"X-HPCPort-UI": "1"})
+        assert r_open.status_code == 200
+        assert r_open.json()["opened"] is True
+
+        # 2. Modern 2026-07-28 clients without Mcp-Session-Id isolate notice cursors via X-HPCPort-Client
+        def call_with_client(cid: str, req_id: int, tool_name: str):
+            r = client.post(
+                "/p/demo/mcp",
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "MCP-Method": "tools/call",
+                    "MCP-Name": tool_name,
+                    "X-HPCPort-Client": cid,
+                },
+                json={
+                    "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+                    "params": {
+                        "name": tool_name, "arguments": {},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientInfo": {"name": "c", "version": "1"},
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                },
+            )
+            assert r.status_code == 200, r.text
+            return r.json()["result"]["content"][0]["text"]
+
+        # Initialize both clients' cursors
+        call_with_client("stdio-client-A", 1, "jobs")
+        call_with_client("stdio-client-B", 2, "jobs")
+
+        # Emit a project notice; BOTH client A and client B must receive it independently
+        d.waits.notify("demo", "preset_updated", "cluster:gpu01", {"cluster": "gpu01", "version": 2})
+        txt_a = call_with_client("stdio-client-A", 3, "jobs")
+        txt_b = call_with_client("stdio-client-B", 4, "jobs")
+        assert "[HPCPort notices]" in txt_a and "gpu01" in txt_a
+        assert "[HPCPort notices]" in txt_b and "gpu01" in txt_b

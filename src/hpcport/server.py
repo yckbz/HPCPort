@@ -77,7 +77,11 @@ def _project_and_session(ctx: Context, daemon=None) -> tuple[str | None, str]:
         if cwd:
             with daemon.lock:
                 project = config.resolve_project_by_cwd(cwd, daemon.projects)
-    session_key = _ctx_header(ctx, "mcp-session-id") or "default"
+    session_key = (
+        _ctx_header(ctx, "mcp-session-id")
+        or _ctx_header(ctx, "x-hpcport-client")
+        or "default"
+    )
     return project, session_key
 
 
@@ -574,7 +578,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
     async def dashboard_open_api(request):
         d = await body(request)
-        return JSONResponse(daemon.open_dashboard(tab=d.get("tab") or "approvals"))
+        tab = d.get("tab") or "approvals"
+        return JSONResponse(await asyncio.to_thread(daemon.open_dashboard, tab))
 
     # ---------------------------------------------------------------- SSE stream
     async def sse_events(request):
@@ -822,11 +827,17 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         action = request.path_params["action"]
         if action not in ("approve", "reject"):
             return fail(404, "unknown action")
+        raw_comment = d.get("comment")
+        if raw_comment is None:
+            comment = ""
+        elif isinstance(raw_comment, str):
+            comment = raw_comment
+        else:
+            return fail(400, "comment must be a string")
         options = {k: v for k, v in d.items() if k != "comment"}
         r = await locked(
-            lambda: daemon.approvals.decide(
-                request.path_params["id"], action == "approve",
-                d.get("comment") or "", **options,
+            lambda: daemon.approvals.decide_with_options(
+                request.path_params["id"], action == "approve", comment, options,
             )
         )
         return JSONResponse(r)

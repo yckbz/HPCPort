@@ -17,6 +17,7 @@ import asyncio
 import fcntl
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -102,6 +103,7 @@ def build_forward_headers(
     session_id: str | None = None,
     protocol_version: str | None = None,
     cwd: str | None = None,
+    client_id: str | None = None,
 ) -> tuple[dict[str, str], str | None]:
     """Build HTTP headers for forwarding a stdio JSON-RPC line to Streamable HTTP."""
     headers = {
@@ -112,6 +114,8 @@ def build_forward_headers(
         headers["Mcp-Session-Id"] = session_id
     if cwd:
         headers["X-HPCPort-Cwd"] = cwd
+    if client_id:
+        headers["X-HPCPort-Client"] = client_id
     detected_version = protocol_version
     method: str | None = None
     try:
@@ -149,6 +153,7 @@ def build_forward_headers(
 async def _run_bridge(url: str, cwd: str | None = None) -> None:
     session_id: str | None = None
     protocol_version: str | None = None
+    client_id = "stdio-" + secrets.token_hex(8)
     seen_any = False
     write_lock = asyncio.Lock()
     in_flight: set[asyncio.Task] = set()
@@ -172,7 +177,7 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
         )
 
     async def forward_one(client: httpx.AsyncClient, raw: str) -> None:
-        nonlocal session_id, protocol_version
+        nonlocal session_id, protocol_version, seen_any
         try:
             req_obj = json.loads(raw)
         except ValueError:
@@ -181,7 +186,8 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
         req_id = req_obj["id"] if has_id else None
 
         headers, det_ver = build_forward_headers(
-            raw, session_id=session_id, protocol_version=protocol_version, cwd=cwd,
+            raw, session_id=session_id, protocol_version=protocol_version,
+            cwd=cwd, client_id=client_id,
         )
         if det_ver:
             protocol_version = det_ver
@@ -190,6 +196,7 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
                                      headers=headers) as resp:
                 if resp.status_code == 404:
                     session_id = None
+                    seen_any = False
                 sid = resp.headers.get("mcp-session-id")
                 if sid:
                     session_id = sid
