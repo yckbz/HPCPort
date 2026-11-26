@@ -23,6 +23,7 @@ class FakeSlurmExecutor(Executor):
         self.jobs: dict[str, dict] = {}   # slurm_id -> {state, workdir, exit_code, start, end, script}
         self.squeue_calls = 0
         self.fail_transport = False
+        self.drop_after_sbatch = False
         self.disable_sacct = False
         self.reject_sbatch: str | None = None
         self._local = LocalExecutor()
@@ -63,12 +64,18 @@ class FakeSlurmExecutor(Executor):
                         ))
                 return Result(0, "\n".join(lines) + ("\n" if lines else ""), "")
 
-        # Intercept sbatch --parsable
+        # Intercept sbatch --parsable (including idempotent .sid wrapper)
         if "sbatch --parsable" in stripped:
-            if self.reject_sbatch:
-                return Result(1, "", self.reject_sbatch)
             m_cd = re.search(r"cd -- (\S+)", stripped)
             wd = m_cd.group(1).strip("'\"") if m_cd else "/tmp"
+            m_sid = re.search(r"\.hpcport/job\d+\.sid", stripped)
+            sid_path = Path(wd) / m_sid.group(0) if m_sid else None
+            if sid_path is not None and sid_path.is_file():
+                existing = sid_path.read_text(encoding="utf-8").strip()
+                if existing:
+                    return Result(0, existing + "\n", "")
+            if self.reject_sbatch:
+                return Result(1, "", self.reject_sbatch)
             with self._lock:
                 jid = str(self.next_id)
                 self.next_id += 1
@@ -79,6 +86,12 @@ class FakeSlurmExecutor(Executor):
                     "start": None,
                     "end": None,
                 }
+            if sid_path is not None:
+                sid_path.parent.mkdir(parents=True, exist_ok=True)
+                sid_path.write_text(jid + "\n", encoding="utf-8")
+            if self.drop_after_sbatch:
+                self.drop_after_sbatch = False
+                raise TransportError("connection reset after sbatch accepted job")
             return Result(0, jid + "\n", "")
 
         # Intercept scancel + scontrol batch script

@@ -151,3 +151,76 @@ def test_cancel_and_not_slurm_rejection(hpc_home, tmp_path):
     with d.lock:
         d.submits.sweep()
     assert d.approvals.get(aid)["state"] == "cancelled"
+
+
+def test_lost_sbatch_receipt_reconciles_without_duplicate(hpc_home, tmp_path):
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    from hpcport import slurm
+    # Turn off approval gate so submit dispatches immediately
+    d.settings.update_project("projA", {"submit": {"approval": False}})
+    wd = remote / "projA" / "drop_run"
+    _write_script(wd / "job.sh")
+
+    # Simulate Slurm accepting the job & writing .sid, then SSH dropping before receipt returns
+    ex.drop_after_sbatch = True
+    with pytest.raises(JobError) as exc:
+        d.jobs.submit("projA", "gpu01", str(wd), ["job.sh"], desc="flaky ssh", wait_s=0)
+    assert exc.value.code == "unreachable_dispatch"
+    assert len(ex.jobs) == 1
+    orig_sid = next(iter(ex.jobs))
+
+    # Row was kept as held -> immediate retry is blocked as duplicate (no 2nd Slurm job!)
+    with pytest.raises(JobError) as dup_exc:
+        d.jobs.submit("projA", "gpu01", str(wd), ["job.sh"], desc="retry", wait_s=0)
+    assert dup_exc.value.code == "duplicate"
+    assert len(ex.jobs) == 1
+
+    # Reconnect / cycle reconciles .hpcport/job<id>.sid without calling sbatch again!
+    d.cycle(force=True)
+    assert len(ex.jobs) == 1
+    rows = d.db.all("SELECT * FROM jobs WHERE project = 'projA'")
+    assert len(rows) == 1
+    assert rows[0]["slurm_id"] == orig_sid
+    assert rows[0]["state"] == slurm.QUEUED
+
+
+def test_multicluster_same_slurm_id_cancel_disambiguation(hpc_home, tmp_path):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    ex1 = FakeSlurmExecutor(tmp_path / "bin1")
+    ex2 = FakeSlurmExecutor(tmp_path / "bin2")
+    d = Daemon(executors={"c1": ex1, "c2": ex2}, browser_opener=lambda url: True)
+    for cname in ("c1", "c2"):
+        d.settings.create_preset(cname, {
+            "connect": "local", "scheduler": "slurm", "partitions": ["a100"],
+            "max_jobs": 4, "projects_root": str(remote),
+        })
+    d.settings.create_project("multi", data={"submit": {"approval": False}})
+    d.attach_cluster("multi", "c1", root=str(remote / "m_c1"))
+    d.attach_cluster("multi", "c2", root=str(remote / "m_c2"))
+
+    wd1 = remote / "m_c1" / "r1"
+    wd2 = remote / "m_c2" / "r1"
+    _write_script(wd1 / "j.sh")
+    _write_script(wd2 / "j.sh")
+    r1 = d.jobs.submit("multi", "c1", str(wd1), ["j.sh"], desc="on c1", wait_s=0)
+    r2 = d.jobs.submit("multi", "c2", str(wd2), ["j.sh"], desc="on c2", wait_s=0)
+    # Both fake Slurm clusters start at 1000 -> colliding Slurm ID!
+    assert r1["ids"] == ["1000"]
+    assert r2["ids"] == ["1000"]
+
+    # Unqualified cancel MUST be rejected as ambiguous and leave BOTH clusters intact
+    with pytest.raises(JobError) as exc:
+        d.jobs.cancel("multi", job_ids=["1000"])
+    assert exc.value.code == "ambiguous_job_id"
+    assert ex1.jobs["1000"]["state"] == "PENDING"
+    assert ex2.jobs["1000"]["state"] == "PENDING"
+
+    # Explicit cluster parameter cancels ONLY c1
+    d.jobs.cancel("multi", job_ids=["1000"], cluster="c1")
+    assert ex1.jobs["1000"]["state"] == "CANCELLED"
+    assert ex2.jobs["1000"]["state"] == "PENDING"
+
+    # cluster:id syntax cancels c2
+    d.jobs.cancel("multi", job_ids=["c2:1000"])
+    assert ex2.jobs["1000"]["state"] == "CANCELLED"

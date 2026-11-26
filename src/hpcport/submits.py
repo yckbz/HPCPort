@@ -143,20 +143,23 @@ class SubmitApprovals:
                 return self._waiting.pop(aid, None)
         t0 = time.monotonic()
         deadline = t0 + limit
-        with self._cond:
-            while aid in self._waiting and self._waiting[aid] is None:
+        while True:
+            with self._cond:
+                if aid not in self._waiting or self._waiting[aid] is not None:
+                    return self._waiting.pop(aid, None)
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    break
+                    return self._waiting.pop(aid, None)
                 self._cond.wait(min(left, TICK_S))
-                if aid in self._waiting and self._waiting[aid] is None and on_tick is not None:
-                    try:
-                        on_tick(time.monotonic() - t0, limit,
-                                "Waiting for job submission approval #%d on the HPCPort dashboard"
-                                % aid)
-                    except Exception:
-                        pass
-            return self._waiting.pop(aid, None)
+                if aid not in self._waiting or self._waiting[aid] is not None:
+                    return self._waiting.pop(aid, None)
+            if on_tick is not None and time.monotonic() < deadline:
+                try:
+                    on_tick(time.monotonic() - t0, limit,
+                            "Waiting for job submission approval #%d on the HPCPort dashboard"
+                            % aid)
+                except Exception:
+                    pass
 
     def drop_waiter(self, aid: int) -> None:
         with self._cond:

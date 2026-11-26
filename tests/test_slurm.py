@@ -75,3 +75,76 @@ def test_wrapper_script_contents():
     assert "HPCPORT_BATCH=b001" in text
     assert "hpcport wrapper" in text
     assert "trap " in text
+
+
+def test_gpu_per_socket_tres_and_sub_hour_formatting():
+    from hpcport import messages
+
+    # 1 node, 2 sockets, 2 GPUs/socket, 1 hour -> 4.0 GPU-h (NEVER 0!)
+    h1 = slurm.parse_header(
+        "#!/bin/bash\n"
+        "#SBATCH -N 1\n"
+        "#SBATCH --sockets-per-node=2\n"
+        "#SBATCH --gpus-per-socket=2\n"
+        "#SBATCH -t 01:00:00\n"
+    )
+    r1 = slurm.resources(h1)
+    assert r1.unknown == ()
+    assert r1.gpus == 4
+    assert r1.gpu_hours == 4.0
+
+    # --gpus-per-socket without known sockets -> MUST be unknown (never 0!)
+    h2 = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 1\n#SBATCH --gpus-per-socket=2\n#SBATCH -t 01:00:00\n"
+    )
+    r2 = slurm.resources(h2)
+    assert "gpus_per_socket" in r2.unknown
+    assert r2.gpu_hours is None
+
+    # -B 2:16:1 + --gpus-per-socket=2 -> 4 GPUs; --cpus-per-gpu=6 -> 24 cores
+    h3 = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 1 -B 2:16:1 --gpus-per-socket=2 --cpus-per-gpu=6 -t 01:00:00\n"
+    )
+    r3 = slurm.resources(h3)
+    assert r3.unknown == ()
+    assert r3.gpus == 4
+    assert r3.cores == 24
+
+    # --tres-per-node & socket affinity suffix & shard safety
+    h4 = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 2 --tres-per-node=gres/gpu:a100:2 -t 00:30:00\n"
+    )
+    r4 = slurm.resources(h4)
+    assert r4.unknown == ()
+    assert r4.gpus == 4
+    assert r4.gpu_hours == 2.0
+
+    h5 = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 1 --gres=gpu:a100:2(S:0-1) -t 00:00:45\n"
+    )
+    r5 = slurm.resources(h5)
+    assert r5.unknown == ()
+    assert r5.gpus == 2
+    assert abs(r5.gpu_hours - (2 * 45 / 3600.0)) < 1e-9
+
+    # GPU shard cannot be accounted as 0 GPUs -> must mark unknown
+    h6 = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 1 --gres=shard:a100:4 -t 01:00:00\n"
+    )
+    assert "gres" in slurm.resources(h6).unknown
+
+    # Sub-hour / small quantities must NEVER display as '0' or '0.0'
+    assert messages.fmt_qty(45 / 3600.0) == "0.013"
+    assert messages.fmt_qty(10 / 3600.0) == "0.0028"
+    assert messages.fmt_qty(0.1 / 3600.0) == "<0.0001"
+    assert messages.fmt_qty(0.0) == "0"
+    assert messages._fmt_dur(0.35) == "<1s"
+    summ = messages.submit_approval_summary(
+        "demo",
+        {"batch": "b001", "cluster": "gpu01", "jobs": 1, "desc": "45s demo",
+         "core_hours": 0.05, "gpu_hours": 45 / 3600.0},
+        [{"code": "no_standing"}],
+    )
+    assert "0.05 core-h" in summ
+    assert "0.013 GPU-h" in summ
+    assert "0.0 GPU-h" not in summ

@@ -51,7 +51,8 @@ def ensure_daemon(port: int | None = None, wait_s: float = 10.0) -> int:
         log_path = config.run_dir() / "daemon.log"
         env = dict(os.environ)
         env.pop("HPCPORT_AGENT", None)
-        with open(log_path, "ab") as logf:
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(log_fd, "ab") as logf:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "hpcport.cli", "--port", str(port), "daemon"],
                 stdin=subprocess.DEVNULL,

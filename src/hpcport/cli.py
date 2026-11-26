@@ -110,9 +110,12 @@ def _cmd_daemon(args) -> None:
         f.write(token)
     config.daemon_pid_file().write_text(str(os.getpid()))
     logging.getLogger("hpcport").info(
-        "HPCPort daemon listening on http://127.0.0.1:%d  (headless unlock PIN: %s)",
-        port, daemon.pairing_pin,
+        "HPCPort daemon listening on http://127.0.0.1:%d", port,
     )
+    # Never write the pairing PIN to daemon.log; print only to an interactive terminal.
+    if sys.stderr.isatty():
+        sys.stderr.write("Headless unlock PIN: %s\n" % daemon.pairing_pin)
+        sys.stderr.flush()
     if getattr(args, "open", False):
         tab = getattr(args, "tab", None) or "approvals"
 
@@ -277,6 +280,7 @@ def _cmd_jobs(args) -> None:
 def _cmd_cancel(args) -> None:
     port = _port(args)
     payload = {"project": args.project, "batch": args.batch,
+               "cluster": getattr(args, "cluster", None),
                "job_ids": args.job_ids or None, "comment": args.comment or ""}
     r = _api(port, "POST", "/api/cancel", payload)
     print(r["text"])
@@ -435,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     px = sub.add_parser("cancel", help="Cancel Slurm jobs")
     px.add_argument("--project", "-p", default=None)
+    px.add_argument("--cluster", "-c", default=None, help="Disambiguate Slurm IDs by cluster")
     px.add_argument("--batch", default=None)
     px.add_argument("job_ids", nargs="*")
     px.add_argument("-m", "--comment", default="")

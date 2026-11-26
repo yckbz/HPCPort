@@ -269,15 +269,18 @@ def build_mcp(daemon) -> MCPServer:
         batch: Annotated[str | None, arg(P.ARG_CANCEL_BATCH)] = None,
         job_ids: Annotated[list[str] | None, arg(P.ARG_CANCEL_IDS)] = None,
         approval: Annotated[int | None, arg(P.ARG_CANCEL_APPROVAL)] = None,
+        cluster: Annotated[str | None, arg(P.ARG_CANCEL_CLUSTER)] = None,
     ) -> CallToolResult:
         def then(r):
             daemon.submits.sweep()
             return messages.cancel_ok(r)
 
         return await run_tool(
-            ctx, "cancel", {"batch": batch, "job_ids": job_ids, "approval": approval},
+            ctx, "cancel", {"batch": batch, "job_ids": job_ids, "approval": approval,
+                            "cluster": cluster},
             lambda p, s, tick: daemon.jobs.cancel(p, batch=batch, job_ids=job_ids,
-                                                  approval=approval, by="agent", then=then),
+                                                  approval=approval, by="agent", then=then,
+                                                  cluster=cluster),
         )
 
     @tool("wait_for", P.TOOL_WAIT_FOR)
@@ -328,10 +331,10 @@ def build_mcp(daemon) -> MCPServer:
                     used = st["used"] or {}
                     text += (
                         "\n## Standing budget\n"
-                        "- Used: %s jobs, %.1f core-h, %.1f GPU-h\n"
+                        "- Used: %s jobs, %s core-h, %s GPU-h\n"
                         "- Limits: %s\n"
-                        % (used.get("jobs", 0), used.get("core_hours", 0.0),
-                           used.get("gpu_hours", 0.0), json.dumps(lims))
+                        % (used.get("jobs", 0), messages.fmt_qty(used.get("core_hours", 0.0)),
+                           messages.fmt_qty(used.get("gpu_hours", 0.0)), json.dumps(lims))
                     )
                 else:
                     text += "\n## Compute budget\n- No standing budget active (Slurm submissions require approval).\n"
@@ -529,6 +532,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
     async def auth_pin_get(request):
         if auth_kind(request) != "cli":
             return fail(403, "CLI authentication required")
+        if daemon.global_cfg.web_only_approval:
+            return fail(403, "PIN retrieval via CLI is disabled while web_only_approval is enabled")
         return JSONResponse({"pin": daemon.pairing_pin})
 
     async def dashboard_open_api(request):
@@ -717,6 +722,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         r = await asyncio.to_thread(
             daemon.jobs.cancel, d.get("project"), d.get("batch"), d.get("job_ids"),
             d.get("approval"), by="user", note=d.get("comment") or "", then=then,
+            cluster=d.get("cluster"),
         )
         return JSONResponse({"text": messages.cancel_ok(r), "result": r})
 

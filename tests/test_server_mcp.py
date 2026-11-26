@@ -266,11 +266,16 @@ def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):
         for key in ("codex", "opencode", "antigravity", "dsh", "claude_code"):
             assert key in snips
 
-        # Enable web_only_approval -> CLI token cannot approve, Web cookie can!
+        # Enable web_only_approval -> CLI token cannot approve AND cannot read pairing PIN!
         client.patch("/api/config", json={"web_only_approval": True},
                      headers={"X-HPCPort-UI": "1"})
         aid = d.settings.propose_preset("demo", "gpu01", {"guide": "new"}, "add note")["approval"]
         cli_client = TestClient(app)
+        r_cli_pin = cli_client.get(
+            "/api/auth/pin",
+            headers={"Authorization": "Bearer secret-cli-token"},
+        )
+        assert r_cli_pin.status_code == 403
         r_cli = cli_client.post(
             "/api/approvals/%d/approve" % aid,
             json={},

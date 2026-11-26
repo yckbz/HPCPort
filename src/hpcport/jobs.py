@@ -236,6 +236,7 @@ class JobService:
         refused_inline = False
         refuse_comment = ""
         pending_approval = False
+        dispatch_transport_err: str | None = None
 
         if approval is not None:
             eff_wait = p.submit.wait_s if wait_s is None else max(0.0, min(float(wait_s), 180.0))
@@ -251,14 +252,32 @@ class JobService:
                 try:
                     failure = self._dispatch(project, cluster, only=ids, stop_on_error=True)
                 except TransportError as e:
-                    failure = {"script": None, "error": str(e)}
+                    dispatch_transport_err = str(e)
         else:
             try:
                 failure = self._dispatch(project, cluster, only=ids, stop_on_error=True)
             except TransportError as e:
-                failure = {"script": None, "error": str(e)}
+                dispatch_transport_err = str(e)
 
         with self.lock:
+            if dispatch_transport_err is not None:
+                # SSH dropped during sbatch; do NOT delete held rows because Slurm
+                # may have accepted the job and written .hpcport/job<id>.sid.
+                # Keep rows as held so duplicates are blocked and reconnect reconciles .sid.
+                jobs = self.db.all("SELECT * FROM jobs WHERE submit_no = ? ORDER BY id", (submit_no,))
+                n_sent = sum(1 for j in jobs if j["slurm_id"])
+                n_held = sum(1 for j in jobs if j["state"] == slurm.HELD)
+                if n_held:
+                    self._want.add(cluster)
+                self.on_change(project)
+                raise JobError(
+                    "unreachable_dispatch",
+                    cluster=cluster,
+                    batch=batch,
+                    error=dispatch_transport_err,
+                    n_sent=n_sent,
+                    n_held=n_held,
+                )
             if failure:
                 self._drop_unsent(submit_no, project, batch, row, cluster, failure)
             jobs = self.db.all("SELECT * FROM jobs WHERE submit_no = ? ORDER BY id", (submit_no,))
@@ -430,8 +449,16 @@ class JobService:
                         return None
                     sent = self._sending[j["id"]] = threading.Event()
                 try:
-                    r = ex.run("cd -- %s && sbatch --parsable %s/job%d.sh"
-                               % (q(j["workdir"]), HOOK_DIR, j["id"]))
+                    sid_file = "%s/job%d.sid" % (HOOK_DIR, j["id"])
+                    cmd = (
+                        "cd -- %s && if [ -s %s ]; then cat %s; "
+                        "else trap '' HUP; sid=$(sbatch --parsable %s/job%d.sh) || exit $?; "
+                        "printf '%%s\\n' \"$sid\" > %s.tmp && mv %s.tmp %s "
+                        "&& printf '%%s\\n' \"$sid\"; fi"
+                        % (q(j["workdir"]), sid_file, sid_file, HOOK_DIR, j["id"],
+                           sid_file, sid_file, sid_file)
+                    )
+                    r = ex.run(cmd)
                     sid = slurm.parse_sbatch(r.out) if r.rc == 0 else None
                     with self.lock:
                         now = self.now()
@@ -518,19 +545,23 @@ class JobService:
     def used_after(self, project: str, job_id: int, apart: tuple[int, ...] = (),
                    also: tuple[int, ...] = ()) -> dict:
         cond, args = counted()
-        ended = "state NOT IN (%s) AND run_s IS NOT NULL" % ", ".join(
-            "'%s'" % st for st in slurm.ACTIVE)
+        ended_state = "state NOT IN (%s)" % ", ".join("'%s'" % st for st in slurm.ACTIVE)
+        ended = "%s AND run_s IS NOT NULL" % ended_state
+        running_state = "state IN ('%s', '%s', '%s')" % (slurm.HELD, slurm.QUEUED, slurm.RUNNING)
         cols = [
             "COUNT(*) AS jobs",
-            "COALESCE(SUM(CASE WHEN %s AND cores IS NOT NULL THEN 1 ELSE 0 END), 0) AS m_jobs"
-            % ended,
+            "COALESCE(SUM(CASE WHEN %s THEN 1 ELSE 0 END), 0) AS m_jobs" % ended_state,
+            "COALESCE(SUM(CASE WHEN %s THEN 1 ELSE 0 END), 0) AS a_jobs" % running_state,
         ]
         for name, held in (("core_hours", "cores"), ("gpu_hours", "gpus")):
             known, used = "%s AND %s IS NOT NULL" % (ended, held), "%s * run_s / 3600.0" % held
             cols += [
                 "COALESCE(SUM(CASE WHEN %s THEN %s ELSE %s END), 0) AS %s"
                 % (known, used, name, name),
-                "COALESCE(SUM(CASE WHEN %s THEN %s END), 0) AS m_%s" % (known, used, name),
+                "COALESCE(SUM(CASE WHEN %s THEN %s WHEN %s THEN %s END), 0) AS m_%s"
+                % (known, used, ended_state, name, name),
+                "COALESCE(SUM(CASE WHEN %s THEN %s END), 0) AS a_%s"
+                % (running_state, name, name),
                 "COALESCE(SUM(CASE WHEN state = '%s' THEN %s END), 0) AS w_%s"
                 % (slurm.UNAPPROVED, name, name),
             ]
@@ -551,6 +582,8 @@ class JobService:
             "gpu_hours": r["gpu_hours"],
             "measured": {"jobs": r["m_jobs"], "core_hours": r["m_core_hours"],
                          "gpu_hours": r["m_gpu_hours"]},
+            "active": {"jobs": r["a_jobs"], "core_hours": r["a_core_hours"],
+                       "gpu_hours": r["a_gpu_hours"]},
             "waiting": {"jobs": r["w_jobs"], "core_hours": r["w_core_hours"],
                         "gpu_hours": r["w_gpu_hours"]},
         }
@@ -558,16 +591,19 @@ class JobService:
     # ------------------------------------------------------------------ cancel
     def cancel(self, project: str | None, batch: str | None = None,
                job_ids: list[str] | None = None, approval: int | None = None,
-               by: str = AGENT, note: str = "", then=None):
-        """Cancel jobs by batch, Slurm IDs (or element IDs), or pending approval ID."""
+               by: str = AGENT, note: str = "", then=None,
+               cluster: str | None = None):
+        """Cancel jobs by batch, Slurm IDs (optionally cluster:id or #internal_id),
+        or pending approval ID."""
         if sum((bool(batch), bool(job_ids), approval is not None)) != 1:
             raise JobError("cancel_args")
         while True:
             with self.lock:
-                jobs, elements = self._cancel_targets(project, batch, job_ids, approval)
+                jobs, elements = self._cancel_targets(project, batch, job_ids, approval,
+                                                      cluster=cluster)
                 waiting = [self._sending[j["id"]] for j in jobs if j["id"] in self._sending]
                 if not waiting:
-                    whole = [j for j in jobs if j["slurm_id"] not in elements]
+                    whole = [j for j in jobs if (j["cluster"], j["slurm_id"]) not in elements]
                     active = [j for j in whole if j["state"] in slurm.ACTIVE]
                     unsent = [j["id"] for j in active if j["state"] in slurm.NOT_SENT]
                     for i in unsent:
@@ -585,12 +621,14 @@ class JobService:
                         del self._frozen[i]
         return r
 
-    def _cancel_targets(self, project, batch, job_ids, approval):
-        elements: dict[str, list[str]] = {}
+    def _cancel_targets(self, project, batch, job_ids, approval, cluster: str | None = None):
+        elements: dict[tuple[str, str], list[str]] = {}
         if approval is not None:
             jobs = self.unapproved(approval)
             if project is not None:
                 jobs = [j for j in jobs if j["project"] == project]
+            if cluster is not None:
+                jobs = [j for j in jobs if j["cluster"] == cluster]
             if not jobs:
                 raise JobError("no_unapproved", approval=approval)
         elif batch:
@@ -607,8 +645,10 @@ class JobService:
                 raise JobError("unknown_batch", batch=batch)
             jobs = self.db.all("SELECT * FROM jobs WHERE project = ? AND batch = ? ORDER BY id",
                                (project, batch))
+            if cluster is not None:
+                jobs = [j for j in jobs if j["cluster"] == cluster]
         else:
-            jobs, elements = self._named(project, job_ids)
+            jobs, elements = self._named(project, job_ids, cluster=cluster)
         return jobs, elements
 
     def _cancel(self, jobs, elements, active, unsent, approval, by, note, then):
@@ -616,7 +656,8 @@ class JobService:
         for j in jobs:
             if j["state"] in slurm.IN_SLURM:
                 sent, parts = ask.setdefault(j["cluster"], ([], []))
-                parts.extend(elements[j["slurm_id"]]) if j["slurm_id"] in elements else sent.append(j)
+                ckey = (j["cluster"], j["slurm_id"])
+                parts.extend(elements[ckey]) if ckey in elements else sent.append(j)
         note_clean = (note or "").strip() or None
         errors: dict[str, str] = {}
         answers = []
@@ -683,53 +724,106 @@ class JobService:
                     self._finish(cur, ctl["state"], ctl["raw"], ctl["exit_code"],
                                  "scontrol", ctl["start"], ctl["end"], ctl["elapsed"])
 
-    def _named(self, project: str | None, job_ids):
-        whole, internal, elements, unknown = [], [], {}, []
-        for i in dict.fromkeys(str(i).strip() for i in job_ids):
-            m = ELEMENT_RE.match(i)
-            if i.startswith("#") and i[1:].isdigit():
-                internal.append(int(i[1:]))
-            elif i.isdigit():
-                whole.append(i)
+    def _named(self, project: str | None, job_ids, cluster: str | None = None):
+        """Resolve job_ids into (jobs, elements) with cluster disambiguation.
+
+        Accepts:
+          - `#<internal_id>` (globally unique DB job ID; works for held/unapproved too)
+          - `<cluster>:<slurm_id>` or `<cluster>:<slurm_id>_<elem>`
+          - `<slurm_id>` or `<slurm_id>_<elem>` (filtered by optional `cluster`;
+            raises `ambiguous_job_id` if an unqualified Slurm ID exists on multiple clusters).
+        """
+        whole: list[tuple[str | None, str, str]] = []       # (cluster, slurm_id, raw)
+        elem_reqs: list[tuple[str | None, str, str, str]] = []  # (cluster, parent_id, elem, raw)
+        internal: list[int] = []
+        unknown: list[str] = []
+
+        for raw in dict.fromkeys(str(i).strip() for i in job_ids):
+            if raw.startswith("#") and raw[1:].isdigit():
+                internal.append(int(raw[1:]))
+                continue
+            cl_spec = cluster
+            tok = raw
+            if ":" in raw:
+                head, _, tail = raw.partition(":")
+                if head and tail and "/" not in head:
+                    cl_spec = head
+                    tok = tail
+            m = ELEMENT_RE.match(tok)
+            if tok.isdigit():
+                whole.append((cl_spec, tok, raw))
             elif m:
-                elements.setdefault(m.group(1), []).append(i)
+                elem_reqs.append((cl_spec, m.group(1), tok, raw))
             else:
-                unknown.append(i)
-        for i in whole:
-            elements.pop(i, None)
-        ids = whole + list(elements)
+                unknown.append(raw)
+
+        def query_slurm(cl_spec: str | None, sid: str) -> list[dict]:
+            conds = ["slurm_id = ?"]
+            args: list = [sid]
+            if project is not None:
+                conds.append("project = ?")
+                args.append(project)
+            if cl_spec is not None:
+                conds.append("cluster = ?")
+                args.append(cl_spec)
+            return self.db.all(
+                "SELECT * FROM jobs WHERE %s ORDER BY id" % " AND ".join(conds),
+                tuple(args),
+            )
+
         jobs_by_id: dict[int, dict] = {}
-        if ids:
-            if project is not None:
-                found = self.db.all(
-                    "SELECT * FROM jobs WHERE project = ? AND slurm_id IN (%s) ORDER BY id"
-                    % slurm.marks(ids), (project,) + tuple(ids))
-            else:
-                found = self.db.all(
-                    "SELECT * FROM jobs WHERE slurm_id IN (%s) ORDER BY id" % slurm.marks(ids),
-                    tuple(ids))
-            for j in found:
-                jobs_by_id[j["id"]] = j
+        whole_keys: set[tuple[str, str]] = set()
+        elements: dict[tuple[str, str], list[str]] = {}
+
+        for cl_spec, sid, raw in whole:
+            rows = query_slurm(cl_spec, sid)
+            if not rows:
+                unknown.append(raw)
+                continue
+            clusters_hit = sorted({r["cluster"] for r in rows})
+            if cl_spec is None and len(clusters_hit) > 1:
+                raise JobError("ambiguous_job_id", id=sid, clusters=", ".join(clusters_hit))
+            for r in rows:
+                jobs_by_id[r["id"]] = r
+                whole_keys.add((r["cluster"], r["slurm_id"]))
+
+        for cl_spec, parent_sid, elem_tok, raw in elem_reqs:
+            rows = query_slurm(cl_spec, parent_sid)
+            if not rows:
+                unknown.append(raw)
+                continue
+            clusters_hit = sorted({r["cluster"] for r in rows})
+            if cl_spec is None and len(clusters_hit) > 1:
+                raise JobError("ambiguous_job_id", id=raw, clusters=", ".join(clusters_hit))
+            for r in rows:
+                jobs_by_id[r["id"]] = r
+                ckey = (r["cluster"], r["slurm_id"])
+                if ckey not in whole_keys:
+                    lst = elements.setdefault(ckey, [])
+                    if elem_tok not in lst:
+                        lst.append(elem_tok)
+
         if internal:
+            conds = ["id IN (%s)" % slurm.marks(internal)]
+            args = list(internal)
             if project is not None:
-                found_i = self.db.all(
-                    "SELECT * FROM jobs WHERE project = ? AND id IN (%s) ORDER BY id"
-                    % slurm.marks(internal), (project,) + tuple(internal))
-            else:
-                found_i = self.db.all(
-                    "SELECT * FROM jobs WHERE id IN (%s) ORDER BY id" % slurm.marks(internal),
-                    tuple(internal))
+                conds.append("project = ?")
+                args.append(project)
+            if cluster is not None:
+                conds.append("cluster = ?")
+                args.append(cluster)
+            found_i = self.db.all(
+                "SELECT * FROM jobs WHERE %s ORDER BY id" % " AND ".join(conds),
+                tuple(args),
+            )
             for j in found_i:
                 jobs_by_id[j["id"]] = j
-        jobs = [jobs_by_id[k] for k in sorted(jobs_by_id)]
-        known_slurm = {j["slurm_id"] for j in jobs if j["slurm_id"]}
-        known_int = {j["id"] for j in jobs}
-        unknown += [i for i in whole if i not in known_slurm]
-        unknown += ["#%d" % i for i in internal if i not in known_int]
-        unknown += [e for i, es in elements.items() if i not in known_slurm for e in es]
+            known_int = {j["id"] for j in found_i}
+            unknown += ["#%d" % i for i in internal if i not in known_int]
+
         if unknown:
             raise JobError("unknown_jobs", ids=", ".join(unknown))
-        return jobs, elements
+        return [jobs_by_id[k] for k in sorted(jobs_by_id)], elements
 
     def _scancel(self, cluster: str, ids: list[str], elements: list[str]):
         mark = "@@HPCP_%s" % secrets.token_hex(6)

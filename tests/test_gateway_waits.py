@@ -125,3 +125,47 @@ def test_mcp_task_lifecycle_and_cancel(hpc_home, tmp_path):
     assert cancelled["status"] == "cancelled"
     # Stop the background sleep cleanly
     d.gateway.stop("p1", oid)
+
+
+def test_wait_sync_no_abba_deadlock(hpc_home, tmp_path):
+    """Stress-test wait_sync() vs concurrent evaluate() under daemon.lock (no AB-BA deadlock)."""
+    d, _, _, _ = _setup_gateway(hpc_home, tmp_path)
+    r = d.gateway.exec("p1", "bare1", "sleep 20", background=True)
+    oid = r["op"]["id"]
+    with d.lock:
+        w = d.waits.register("p1", "s_dl", groups=[{"items": ["op:%d" % oid], "priority": 1}])
+        d.waits.arm_sync_wait(w["id"])
+
+    # Force very short TICK_S so wait_sync loops & acquires self.lock repeatedly while
+    # a second thread holds self.lock and calls evaluate() -> self._cond.
+    import hpcport.waits as waits_mod
+    old_tick = waits_mod.TICK_S
+    waits_mod.TICK_S = 0.005
+    stop_ev = threading.Event()
+    ticks = []
+    try:
+        def evaluator():
+            while not stop_ev.is_set():
+                with d.lock:
+                    d.waits.evaluate()
+                time.sleep(0.002)
+
+        t_eval = threading.Thread(target=evaluator, daemon=True)
+        t_eval.start()
+        result = []
+
+        def waiter():
+            result.append(d.waits.wait_sync(w["id"], 2.0, on_tick=lambda e, tot, m: ticks.append(m)))
+
+        t_wait = threading.Thread(target=waiter, daemon=True)
+        t_wait.start()
+        time.sleep(0.06)
+        d.gateway.stop("p1", oid, by="user")
+        t_wait.join(timeout=3.0)
+        stop_ev.set()
+        t_eval.join(timeout=2.0)
+        assert not t_wait.is_alive(), "wait_sync deadlocked with evaluate()!"
+        assert len(result) == 1 and result[0] is not None
+        assert result[0]["reason"] == "done"
+    finally:
+        waits_mod.TICK_S = old_tick

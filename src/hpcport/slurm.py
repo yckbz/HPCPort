@@ -74,11 +74,27 @@ class Header:
 
 
 _OPTIONS = {
-    "partition": ("-p", "--partition"), "nodes": ("-N", "--nodes"),
-    "ntasks": ("-n", "--ntasks"), "ntasks_per_node": (None, "--ntasks-per-node"),
-    "cpus_per_task": ("-c", "--cpus-per-task"), "time": ("-t", "--time"),
-    "array": ("-a", "--array"), "gres": (None, "--gres"), "gpus": ("-G", "--gpus"),
-    "gpus_per_node": (None, "--gpus-per-node"), "gpus_per_task": (None, "--gpus-per-task"),
+    "partition": ("-p", "--partition"),
+    "nodes": ("-N", "--nodes"),
+    "ntasks": ("-n", "--ntasks"),
+    "ntasks_per_node": (None, "--ntasks-per-node"),
+    "ntasks_per_socket": (None, "--ntasks-per-socket"),
+    "ntasks_per_core": (None, "--ntasks-per-core"),
+    "sockets_per_node": (None, "--sockets-per-node"),
+    "extra_node_info": ("-B", "--extra-node-info"),
+    "cpus_per_task": ("-c", "--cpus-per-task"),
+    "cpus_per_gpu": (None, "--cpus-per-gpu"),
+    "time": ("-t", "--time"),
+    "array": ("-a", "--array"),
+    "gres": (None, "--gres"),
+    "gpus": ("-G", "--gpus"),
+    "gpus_per_node": (None, "--gpus-per-node"),
+    "gpus_per_socket": (None, "--gpus-per-socket"),
+    "gpus_per_task": (None, "--gpus-per-task"),
+    "tres_per_job": (None, "--tres-per-job"),
+    "tres_per_node": (None, "--tres-per-node"),
+    "tres_per_socket": (None, "--tres-per-socket"),
+    "tres_per_task": (None, "--tres-per-task"),
 }
 _SHORT = {short: key for key, (short, _) in _OPTIONS.items() if short}
 _LONG = {long: key for key, (_, long) in _OPTIONS.items()}
@@ -158,8 +174,11 @@ def time_limit_hours(text: str) -> float | None:
     if any(x < 0 for x in parts) or len(parts) > 3:
         raise ValueError(text)
     if dash:
+        d = int(days)
+        if d < 0:
+            raise ValueError(text)
         h, m, sec = (parts + [0, 0])[:3]
-        seconds = int(days) * 86400 + h * 3600 + m * 60 + sec
+        seconds = d * 86400 + h * 3600 + m * 60 + sec
     elif len(parts) == 3:
         seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
     else:
@@ -179,16 +198,63 @@ def array_size(text: str) -> int:
     return n
 
 
-def _gpus(text: str, gres: bool) -> int:
+def _strip_affinity(tok: str) -> str:
+    """Strip optional Slurm socket/core binding suffix such as '2(S:0-1)' -> '2'."""
+    if "(" in tok:
+        head, _, tail = tok.partition("(")
+        if not tail.endswith(")"):
+            raise ValueError(tok)
+        return head
+    return tok
+
+
+def _gpus(text: str, gres: bool = False, tres: bool = False) -> int:
+    """Parse GPU counts from --gres, --gpus*, or --tres-per-* specs.
+
+    Raises ValueError on ambiguous/unaccountable GPU specs (such as GPU shards
+    or malformed counts) so callers mark them unknown rather than counting 0.
+    """
     n = 0
-    for item in text.split(","):
-        parts = item.strip().split(":")
-        if gres:
-            if parts[0] != "gpu":
+    for raw in text.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        item = _strip_affinity(item)
+        parts = item.split(":")
+        if tres:
+            head = parts[0].lower()
+            if head in ("gres/shard", "shard"):
+                raise ValueError(item)
+            if head not in ("gpu", "gres/gpu"):
                 continue
             parts = parts[1:]
-        n += int(parts[-1]) if parts and parts[-1].isdigit() else 1
+        elif gres:
+            head = parts[0].lower()
+            if head == "shard":
+                raise ValueError(item)
+            if head != "gpu":
+                continue
+            parts = parts[1:]
+        if not parts:
+            n += 1
+            continue
+        last = parts[-1]
+        if last.isdigit():
+            n += int(last)
+        elif len(parts) == 1:
+            # e.g. --gres=gpu:a100 or --gpus=a100 means 1 GPU of that type
+            n += 1
+        else:
+            raise ValueError(item)
     return n
+
+
+def _sockets_from_extra_node_info(text: str) -> int:
+    # -B sockets[:cores[:threads]] (may have min-max ranges; take upper bound)
+    sock = text.split(":")[0].strip()
+    if not sock or sock == "*":
+        raise ValueError(text)
+    return _count(sock)
 
 
 def resources(header: Header, cores_per_node: int | None = None) -> Resources:
@@ -206,19 +272,73 @@ def resources(header: Header, cores_per_node: int | None = None) -> Resources:
 
     nodes = read("nodes", _count, 1)
     cpus = read("cpus_per_task", _count, 1)
-    tasks = (read("ntasks", _count, 1) if "ntasks" in o
-             else nodes * read("ntasks_per_node", _count, 1))
+    sockets: int | None = None
+    if "sockets_per_node" in o:
+        sockets = read("sockets_per_node", _count, None)
+    elif "extra_node_info" in o:
+        try:
+            sockets = _sockets_from_extra_node_info(o["extra_node_info"])
+        except ValueError:
+            sockets = None
+
+    if "ntasks" in o:
+        tasks = read("ntasks", _count, 1)
+    elif "ntasks_per_node" in o:
+        tasks = nodes * read("ntasks_per_node", _count, 1)
+    elif "ntasks_per_socket" in o:
+        tps = read("ntasks_per_socket", _count, None)
+        if tps is not None and sockets is not None:
+            tasks = nodes * sockets * tps
+        else:
+            unknown.append("ntasks_per_socket")
+            tasks = 1
+    elif "ntasks_per_core" in o:
+        unknown.append("ntasks_per_core")
+        tasks = 1
+    else:
+        tasks = nodes
+
+    # Collect GPU counts across every Slurm GPU / TRES directive
+    gpu_candidates = [
+        nodes * read("gres", lambda v: _gpus(v, gres=True), 0),
+        read("gpus", lambda v: _gpus(v), 0),
+        nodes * read("gpus_per_node", lambda v: _gpus(v), 0),
+        tasks * read("gpus_per_task", lambda v: _gpus(v), 0),
+        read("tres_per_job", lambda v: _gpus(v, tres=True), 0),
+        nodes * read("tres_per_node", lambda v: _gpus(v, tres=True), 0),
+        tasks * read("tres_per_task", lambda v: _gpus(v, tres=True), 0),
+    ]
+    if "gpus_per_socket" in o:
+        gps = read("gpus_per_socket", lambda v: _gpus(v), None)
+        if gps is not None and sockets is not None:
+            gpu_candidates.append(nodes * sockets * gps)
+        elif gps is None or gps > 0:
+            unknown.append("gpus_per_socket")
+    if "tres_per_socket" in o:
+        tps_g = read("tres_per_socket", lambda v: _gpus(v, tres=True), None)
+        if tps_g is not None and tps_g > 0:
+            if sockets is not None:
+                gpu_candidates.append(nodes * sockets * tps_g)
+            else:
+                unknown.append("tres_per_socket")
+
+    # Reject unknown CPU/TRES accounting if tres_per_* specifies cpu explicitly
+    for tk in ("tres_per_job", "tres_per_node", "tres_per_socket", "tres_per_task"):
+        if tk in o and any(p.strip().lower().startswith("cpu:") for p in o[tk].split(",")):
+            unknown.append(tk)
+
+    gpus: int | None = max(gpu_candidates)
     cores: int | None = tasks * cpus
+    if "cpus_per_gpu" in o:
+        cpg = read("cpus_per_gpu", _count, None)
+        if cpg is not None and gpus and not unknown:
+            cores = max(cores, gpus * cpg)
+        elif cpg is not None and not gpus:
+            unknown.append("cpus_per_gpu")
     if "exclusive" in o:
         cores = nodes * cores_per_node if cores_per_node else None
         if cores is None:
             unknown.append("cores")
-    gpus = max(
-        nodes * read("gres", lambda v: _gpus(v, True), 0),
-        read("gpus", lambda v: _gpus(v, False), 0),
-        nodes * read("gpus_per_node", lambda v: _gpus(v, False), 0),
-        tasks * read("gpus_per_task", lambda v: _gpus(v, False), 0),
-    )
     if unknown:
         cores = gpus = None
     hours = read("time", time_limit_hours, None)

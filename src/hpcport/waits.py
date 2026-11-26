@@ -334,33 +334,56 @@ class WaitService:
             self._sync_waiters[wait_id] = None
 
     def wait_sync(self, wait_id: int, wait_s: float, on_tick=None) -> dict | None:
-        """Wait outside state lock up to min(wait_s, 180)s for wait_id to fire."""
+        """Wait outside state lock up to min(wait_s, 180)s for wait_id to fire.
+
+        Lock order invariant: NEVER acquire `self.lock` while holding `self._cond`
+        (evaluate() acquires `self.lock` -> `self._cond`), and NEVER invoke
+        external `on_tick` callbacks while holding any lock.
+        """
         limit = max(0.0, min(float(wait_s), 180.0))
         t0 = time.monotonic()
         deadline = t0 + limit
         with self._cond:
             if wait_id not in self._sync_waiters:
                 self._sync_waiters[wait_id] = None
-            while self._sync_waiters.get(wait_id) is None:
-                # Re-check DB in case evaluate() fired before arm_sync_wait
-                with self.lock:
-                    w = self.db.one("SELECT state, result FROM waits WHERE id = ?", (wait_id,))
-                    if w and w["state"] == "fired" and w["result"]:
+
+        while True:
+            # 1. Check in-memory wakeup first without acquiring self.lock
+            with self._cond:
+                val = self._sync_waiters.get(wait_id)
+                if val is not None:
+                    self._sync_waiters.pop(wait_id, None)
+                    return val
+
+            # 2. Check DB outside self._cond in case evaluate() fired before arm_sync_wait
+            with self.lock:
+                w = self.db.one("SELECT state, result FROM waits WHERE id = ?", (wait_id,))
+                if w and w["state"] == "fired" and w["result"]:
+                    with self._cond:
                         self._sync_waiters.pop(wait_id, None)
-                        return json.loads(w["result"])
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                self._cond.wait(min(left, TICK_S))
-                if self._sync_waiters.get(wait_id) is None and on_tick is not None:
-                    try:
-                        with self.lock:
-                            w = self.db.one("SELECT * FROM waits WHERE id = ?", (wait_id,))
-                            msg = self.progress_message(w) if w else "waiting"
-                        on_tick(time.monotonic() - t0, limit, msg)
-                    except Exception:
-                        pass
-            return self._sync_waiters.pop(wait_id, None)
+                    return json.loads(w["result"])
+
+            left = deadline - time.monotonic()
+            if left <= 0:
+                with self._cond:
+                    return self._sync_waiters.pop(wait_id, None)
+
+            with self._cond:
+                if self._sync_waiters.get(wait_id) is None:
+                    self._cond.wait(min(left, TICK_S))
+                val = self._sync_waiters.get(wait_id)
+                if val is not None:
+                    self._sync_waiters.pop(wait_id, None)
+                    return val
+
+            if on_tick is not None and time.monotonic() < deadline:
+                try:
+                    with self.lock:
+                        w = self.db.one("SELECT * FROM waits WHERE id = ?", (wait_id,))
+                        msg = self.progress_message(w) if w else "waiting"
+                    on_tick(time.monotonic() - t0, limit, msg)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ MCP Tasks store
     def create_task(self, project: str, wait_id: int,

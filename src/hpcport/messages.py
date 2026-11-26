@@ -8,9 +8,33 @@ import time
 from . import prompts as P
 
 
+def fmt_qty(v: float | int | None) -> str:
+    """Format a resource quantity (core-h, GPU-h, GB) without ever rounding
+    a non-zero positive value down to '0' or '0.0'."""
+    if v is None:
+        return "-"
+    n = float(v)
+    if n == 0.0:
+        return "0"
+    a = abs(n)
+    if a < 0.0001:
+        return "<0.0001" if n > 0 else ">-0.0001"
+    if a >= 100.0:
+        s = "%.1f" % n
+    elif a >= 1.0:
+        s = "%.2f" % n
+    elif a >= 0.01:
+        s = "%.3f" % n
+    else:
+        s = "%.4f" % n
+    return s.rstrip("0").rstrip(".")
+
+
 def _fmt_dur(seconds: float | None) -> str:
     if seconds is None:
         return "-"
+    if 0.0 < seconds < 1.0:
+        return "<1s"
     s = int(round(max(0.0, seconds)))
     if s < 60:
         return "%ds" % s
@@ -89,6 +113,9 @@ def why_text(items: list[dict], table: dict) -> str:
             p = dict(w)
             if isinstance(p.get("scripts"), list):
                 p["scripts"] = ", ".join(p["scripts"])
+            for k in ("asked", "reached", "limit"):
+                if isinstance(p.get(k), (int, float)):
+                    p[k] = fmt_qty(p[k])
             out.append(tmpl.format(**p))
         else:
             out.append(code)
@@ -112,9 +139,9 @@ def permission_summary(project: str, tool: str, tool_input: dict, why: list[dict
 def submit_approval_summary(project: str, sub: dict, why: list[dict]) -> str:
     res_bits = []
     if sub.get("core_hours") is not None:
-        res_bits.append("%.1f core-h" % sub["core_hours"])
+        res_bits.append("%s core-h" % fmt_qty(sub["core_hours"]))
     if sub.get("gpu_hours"):
-        res_bits.append("%.1f GPU-h" % sub["gpu_hours"])
+        res_bits.append("%s GPU-h" % fmt_qty(sub["gpu_hours"]))
     res_s = (", " + " / ".join(res_bits)) if res_bits else ""
     reasons = why_text(why, P.SUBMIT_WHY)
     return "[%s] Submit %s on %s (%d job(s)%s): %s — %s" % (
@@ -125,9 +152,9 @@ def submit_approval_summary(project: str, sub: dict, why: list[dict]) -> str:
 def submit_ok(r: dict) -> str:
     res_bits = []
     if r.get("core_hours") is not None:
-        res_bits.append("%.1f core-h" % r["core_hours"])
+        res_bits.append("%s core-h" % fmt_qty(r["core_hours"]))
     if r.get("gpu_hours"):
-        res_bits.append("%.1f GPU-h" % r["gpu_hours"])
+        res_bits.append("%s GPU-h" % fmt_qty(r["gpu_hours"]))
     res_part = ("; est. " + ", ".join(res_bits)) if res_bits else ""
 
     if r.get("refused_inline"):

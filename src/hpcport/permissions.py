@@ -66,19 +66,28 @@ class PermissionService:
 
         t0 = time.monotonic()
         deadline = t0 + limit
-        with self._cond:
-            while self._waiting.get(aid) is None:
+        decision = None
+        while True:
+            with self._cond:
+                val = self._waiting.get(aid)
+                if val is not None:
+                    decision = self._waiting.pop(aid, None)
+                    break
                 left = deadline - time.monotonic()
                 if left <= 0:
+                    decision = self._waiting.pop(aid, None)
                     break
                 self._cond.wait(min(left, TICK_S))
-                if self._waiting.get(aid) is None and on_tick is not None:
-                    try:
-                        on_tick(time.monotonic() - t0, limit,
-                                "Waiting for approval #%d on the HPCPort dashboard" % aid)
-                    except Exception:
-                        pass
-            decision = self._waiting.pop(aid, None)
+                val = self._waiting.get(aid)
+                if val is not None:
+                    decision = self._waiting.pop(aid, None)
+                    break
+            if on_tick is not None and time.monotonic() < deadline:
+                try:
+                    on_tick(time.monotonic() - t0, limit,
+                            "Waiting for approval #%d on the HPCPort dashboard" % aid)
+                except Exception:
+                    pass
 
         if decision is None:
             return {"allow": False, "approval": aid, "pending": True, "comment": ""}

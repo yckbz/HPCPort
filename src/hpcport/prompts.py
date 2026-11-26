@@ -96,8 +96,9 @@ Cancel Slurm jobs in this project. Specify exactly one of `batch`, `job_ids`, or
 Queued jobs are confirmed cancelled immediately via `scontrol` so scripts can be edited and resubmitted right away."""
 
 ARG_CANCEL_BATCH = "Batch label: cancel all unfinished jobs in that batch."
-ARG_CANCEL_IDS = "List of Slurm job IDs (or array elements like `12345_0`) to cancel."
+ARG_CANCEL_IDS = "List of Slurm job IDs (optionally `cluster:slurm_id`, array elements like `12345_0`, or internal `#id`) to cancel."
 ARG_CANCEL_APPROVAL = "Pending submission approval ID to withdraw without submitting."
+ARG_CANCEL_CLUSTER = "Optional cluster name to disambiguate Slurm job IDs when a project uses multiple Slurm clusters."
 
 TOOL_WAIT_FOR = """\
 Wait for Slurm batches (`b001`, ...) and/or background gateway operations (`op:12`, ...) until a condition triggers.
@@ -191,8 +192,8 @@ GATE_WHY = {
 SUBMIT_WHY = {
     "no_standing": "no standing budget approval for this project",
     "unknown": "missing resource/time directives in: {scripts}",
-    "over": "requested {what} ({asked:.2f}) exceeds single-submission limit ({limit:g})",
-    "total": "cumulative {what} ({reached:.2f}) exceeds standing limit ({limit:g})",
+    "over": "requested {what} ({asked}) exceeds single-submission limit ({limit})",
+    "total": "cumulative {what} ({reached}) exceeds standing limit ({limit})",
 }
 
 DASHBOARD_OPENED = "Opened the HPCPort Web dashboard in the user's browser ({url})."
@@ -222,11 +223,17 @@ ERRORS = {
     "missing_scripts": "Script(s) not found in `{workdir}`: {scripts}.",
     "duplicate": "Script `{script}` already has an active job ({jobid}, state `{state}`).",
     "unreachable": "Server `{cluster}` could not be reached: {error}. State was left unchanged.",
+    "unreachable_dispatch": (
+        "Connection to `{cluster}` dropped during submission of batch `{batch}`: {error} "
+        "({n_sent} confirmed sent, {n_held} kept as `held` to prevent duplicates and will "
+        "auto-reconcile once reachable; check `jobs` before retrying)."
+    ),
     "sbatch_rejected": "sbatch rejected `{script}` on `{cluster}`: {error} ({n_sent} submitted: {ids}; {n_unsent} dropped).",
     "cancel_args": "Provide exactly one of `batch`, `job_ids`, or `approval`.",
     "no_unapproved": "No unapproved jobs found for approval #{approval}.",
     "unknown_batch": "Unknown batch `{batch}` in this project.",
     "unknown_jobs": "Unknown Slurm job ID(s): {ids}.",
+    "ambiguous_job_id": "Slurm job ID `{id}` exists on multiple clusters ({clusters}); specify `cluster` or `{id}` prefixed as `<cluster>:{id}`.",
     "unknown_op": "Unknown background operation `op:{id}`.",
     "op_ended": "Operation `op:{id}` ({kind}) has already ended.",
     "bad_timeout_s": "`timeout_s` must be between 1 and {max} on `{cluster}`.",

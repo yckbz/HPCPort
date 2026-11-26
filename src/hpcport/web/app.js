@@ -72,11 +72,48 @@ function fmtRel(ts) {
   return `${Math.floor(diff / 86400)}d`;
 }
 
-function fmtNum(v, digits = 1) {
+function fmtNum(v) {
   if (v === null || v === undefined) return "-";
   const n = Number(v);
   if (Number.isNaN(n)) return String(v);
-  return Number.isInteger(n) ? String(n) : n.toFixed(digits);
+  if (n === 0) return "0";
+  const a = Math.abs(n);
+  if (a < 0.0001) return n > 0 ? "<0.0001" : ">-0.0001";
+  let s;
+  if (a >= 100) s = n.toFixed(1);
+  else if (a >= 1) s = n.toFixed(2);
+  else if (a >= 0.01) s = n.toFixed(3);
+  else s = n.toFixed(4);
+  return s.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+}
+
+function fmtDur(seconds) {
+  if (seconds === null || seconds === undefined) return "-";
+  const s = Number(seconds);
+  if (Number.isNaN(s) || s < 0) return "-";
+  if (s > 0 && s < 1) return "<1s";
+  const total = Math.round(s);
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const remS = total % 60;
+  if (m < 60) return remS ? `${m}m ${String(remS).padStart(2, "0")}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM ? `${h}h ${String(remM).padStart(2, "0")}m` : `${h}h`;
+}
+
+function fmtHoursHint(v) {
+  if (v === null || v === undefined) return "";
+  const n = Number(v);
+  if (Number.isNaN(n) || n <= 0 || n >= 1) return "";
+  return `${n.toFixed(4)} h (${fmtDur(n * 3600)})`;
+}
+
+function fmtFailRate(rate) {
+  if (!rate || rate <= 0) return "0%";
+  const pct = rate * 100;
+  if (pct < 1) return "<1%";
+  return `${Math.round(pct)}%`;
 }
 
 function toast(msg, isError = false) {
@@ -373,7 +410,7 @@ function renderReasonChip(r) {
     return `<span class="pill pill-blue">${esc(i18n.t("reason_no_standing"))}</span>`;
   }
   if (code === "size") {
-    return `<span class="pill pill-amber">${esc(i18n.t("guardRule_size"))}: ${fmtNum(r.size, 2)} GB &gt; ${fmtNum(r.limit)} GB</span>`;
+    return `<span class="pill pill-amber">${esc(i18n.t("guardRule_size"))}: ${fmtNum(r.size)} GB &gt; ${fmtNum(r.limit)} GB</span>`;
   }
   if (code) {
     const key = "guardRule_" + code;
@@ -426,8 +463,8 @@ function renderApprovalCard(a) {
       </div>
       <div class="metrics-strip">
         <div class="metric-chip"><span class="k">${esc(i18n.t("metricJobs"))}</span><span class="v">${esc(sub.jobs ?? 0)}</span></div>
-        <div class="metric-chip"><span class="k">${esc(i18n.t("metricCoreH"))}</span><span class="v">${fmtNum(sub.core_hours)}</span></div>
-        <div class="metric-chip"><span class="k">${esc(i18n.t("metricGpuH"))}</span><span class="v">${fmtNum(sub.gpu_hours)}</span></div>
+        <div class="metric-chip" title="${esc(fmtHoursHint(sub.core_hours))}"><span class="k">${esc(i18n.t("metricCoreH"))}</span><span class="v">${fmtNum(sub.core_hours)}</span></div>
+        <div class="metric-chip" title="${esc(fmtHoursHint(sub.gpu_hours))}"><span class="k">${esc(i18n.t("metricGpuH"))}</span><span class="v">${fmtNum(sub.gpu_hours)}</span></div>
       </div>
       ${why.length ? `<div class="reason-row">${why.map(renderReasonChip).join("")}</div>` : ""}
       ${scriptNames.length ? `
@@ -773,21 +810,27 @@ function renderStandingCard(standing) {
           const total = used ? (used[b.key] || 0) : 0;
           const done = (used && used.measured && used.measured[b.key]) || 0;
           const wait = (used && used.waiting && used.waiting[b.key]) || 0;
-          const active = Math.max(0, total - done - wait);
+          const active = (used && used.active && used.active[b.key] !== undefined)
+            ? used.active[b.key]
+            : Math.max(0, total - done - wait);
           const denom = b.limit && b.limit > 0 ? b.limit : Math.max(total, 1);
           const pDone = Math.min(100, (done / denom) * 100);
           const pAct = Math.min(100 - pDone, (active / denom) * 100);
           const pWait = Math.min(100 - pDone - pAct, (wait / denom) * 100);
+          const sDone = done > 0 ? `width:${pDone}%;min-width:4px` : "width:0%";
+          const sAct = active > 0 ? `width:${pAct}%;min-width:4px` : "width:0%";
+          const sWait = wait > 0 ? `width:${pWait}%;min-width:4px` : "width:0%";
+          const hint = b.key === "jobs" ? "" : fmtHoursHint(total);
           return `
-            <div class="budget-item">
+            <div class="budget-item" title="${esc(hint)}">
               <div class="budget-item-top tabular">
                 <span>${esc(b.label)}</span>
                 <span>${fmtNum(total)} / ${b.limit == null ? esc(i18n.t("unlimited")) : fmtNum(b.limit)}</span>
               </div>
               <div class="progress-track">
-                <div class="progress-seg-done" style="width:${pDone}%"></div>
-                <div class="progress-seg-active" style="width:${pAct}%"></div>
-                <div class="progress-seg-wait" style="width:${pWait}%"></div>
+                <div class="progress-seg-done" style="${sDone}"></div>
+                <div class="progress-seg-active" style="${sAct}"></div>
+                <div class="progress-seg-wait" style="${sWait}"></div>
               </div>
               <div class="muted text-xs tabular" style="margin-top:6px">
                 ${esc(i18n.t("budgetMeasured"))} ${fmtNum(done)} &middot;
@@ -965,7 +1008,7 @@ function renderJobs() {
                       </div>
                       <div class="muted text-xs tabular" style="margin-top:4px">${esc(summaryChips)}</div>
                     </td>
-                    <td class="tabular">${b.fail_rate ? Math.round(b.fail_rate * 100) + "%" : "0%"}</td>
+                    <td class="tabular">${fmtFailRate(b.fail_rate)}</td>
                     <td class="muted text-xs tabular">${esc(fmtTime(b.changed))}</td>
                     <td>
                       <div class="flex-row" style="gap:6px">
@@ -985,25 +1028,32 @@ function renderJobs() {
                               <th>${esc(i18n.t("colScript"))}</th>
                               <th>${esc(i18n.t("colState"))}</th>
                               <th>${esc(i18n.t("colResources"))}</th>
+                              <th>${esc(i18n.t("colElapsed"))}</th>
                               <th>${esc(i18n.t("colActions"))}</th>
                             </tr>
                           </thead>
                           <tbody>
-                            ${rows.map((j) => `
+                            ${rows.map((j) => {
+                              const liveRun = j.run_s != null
+                                ? j.run_s
+                                : (j.state === "running" && j.t_start ? Math.max(0, Date.now() / 1000 - j.t_start) : null);
+                              return `
                               <tr>
                                 <td class="mono muted">#${j.id}</td>
                                 <td class="mono">${esc(j.slurm_id || "-")}</td>
                                 <td class="mono">${esc(j.script)}</td>
                                 <td>${renderStatePill(j.state)}${j.slurm_state ? ` <span class="muted text-xs">${esc(j.slurm_state)}</span>` : ""}</td>
-                                <td class="tabular text-xs">${esc(j.cores ?? "-")}c / ${esc(j.gpus ?? 0)}g</td>
+                                <td class="tabular text-xs">${esc(j.cores ?? "-")}c / ${esc(j.gpus ?? "-")}g</td>
+                                <td class="tabular text-xs muted">${esc(fmtDur(liveRun))}</td>
                                 <td>
                                   <div class="flex-row" style="gap:6px">
                                     <button type="button" class="btn btn-subtle btn-xs" data-inspect-job="${j.id}">${esc(i18n.t("inspectFiles"))}</button>
-                                    ${["unapproved", "held", "queued", "running"].includes(j.state) ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-job="${esc(j.slurm_id || ("#" + j.id))}" data-job-project="${esc(j.project)}">${esc(i18n.t("cancelJob"))}</button>` : ""}
+                                    ${["unapproved", "held", "queued", "running"].includes(j.state) ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-job="${esc(j.slurm_id || ("#" + j.id))}" data-job-project="${esc(j.project)}" data-job-cluster="${esc(j.cluster)}">${esc(i18n.t("cancelJob"))}</button>` : ""}
                                   </div>
                                 </td>
                               </tr>
-                            `).join("")}
+                            `;
+                            }).join("")}
                           </tbody>
                         </table>
                       </td>
@@ -1034,6 +1084,7 @@ function renderJobs() {
                 <th>${esc(i18n.t("colServer"))}</th>
                 <th>${esc(i18n.t("colKind"))}</th>
                 <th>${esc(i18n.t("colCommand"))}</th>
+                <th>${esc(i18n.t("colElapsed"))}</th>
                 <th>${esc(i18n.t("colStatus"))}</th>
                 <th>${esc(i18n.t("colActions"))}</th>
               </tr>
@@ -1043,6 +1094,10 @@ function renderJobs() {
                 const sp = o.spec || {};
                 const cmdText = o.kind === "exec" ? (sp.command || "") : `${sp.src || ""} -> ${sp.dst || ""}`;
                 const isExpanded = state.expandedOps.has(o.id);
+                const elapsed = o.result && o.result.elapsed != null
+                  ? o.result.elapsed
+                  : (o.state === "running" && o.started ? Math.max(0, Date.now() / 1000 - o.started)
+                    : (o.ended && o.started ? Math.max(0, o.ended - o.started) : null));
                 return `
                   <tr>
                     <td class="mono"><strong>op:${o.id}</strong></td>
@@ -1052,6 +1107,7 @@ function renderJobs() {
                     <td>
                       <div class="cmd-expandable mono${isExpanded ? " expanded" : ""}" data-toggle-op-cmd="${o.id}" title="${esc(cmdText)}">${esc(cmdText)}</div>
                     </td>
+                    <td class="tabular text-xs muted">${esc(fmtDur(elapsed))}</td>
                     <td>${renderStatePill(o.state)}</td>
                     <td>
                       <div class="flex-row" style="gap:6px">
@@ -1127,7 +1183,11 @@ function renderJobs() {
 
   el.querySelectorAll("[data-cancel-job]").forEach((btn) => {
     btn.onclick = () => {
-      openCancelModal({ project: btn.dataset.jobProject, job_ids: [String(btn.dataset.cancelJob)] });
+      openCancelModal({
+        project: btn.dataset.jobProject,
+        cluster: btn.dataset.jobCluster || undefined,
+        job_ids: [String(btn.dataset.cancelJob)],
+      });
     };
   });
 
@@ -1682,7 +1742,7 @@ function renderProjectCard(p) {
             <input type="number" step="0.05" min="0" max="1" name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.1)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTimeoutH"))}
-            <input type="number" step="1" min="1" name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
+            <input type="number" step="any" min="0.1" name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTransferGb"))}
             <input type="number" step="0.5" min="0" name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 5)}" />
