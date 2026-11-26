@@ -158,6 +158,7 @@ SUBMIT_PENDING = (
     "if the user has not opened it yet; jobs will submit automatically once approved."
 )
 SUBMIT_REFUSED_INLINE = "Submission for batch `{batch}` was rejected by the user.{comment}"
+SUBMIT_CANCELLED_INLINE = "Submission for batch `{batch}` was cancelled while waiting for approval.{comment}"
 SUBMIT_APPROVED_INLINE = "User approved submission (#{approval}); submitted batch `{batch}` on `{cluster}` ({n} job(s): {sent_part}{held_part})."
 
 WAIT_STILL_RUNNING = (

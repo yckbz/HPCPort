@@ -95,6 +95,7 @@ class JobService:
         self._sending: dict[int, threading.Event] = {}
         self._want: set[str] = set()    # clusters with newly released held jobs
         self.gate = None                # fn(project, sub) -> approval_id | None
+        self.abort_approval = None      # fn(aid, reason) -> None
         self.wait_approval = None       # fn(aid, wait_s, on_tick) -> decision | None
         self.on_change = lambda project=None: None
 
@@ -242,48 +243,55 @@ class JobService:
                     sid_file="%s/%s/%s.sid" % (real, HOOK_DIR, stem),
                 )
 
-        # Step 2: write wrappers outside lock
+        # Step 2 & 3: write wrappers and handle inline approval wait / dispatch while keeping
+        # ids in `_preparing` so background dispatchers cannot steal inline-dispatched jobs.
         failure = None
-        try:
-            self._write_wrappers(ex, real, wrappers)
-        except TransportError as e:
-            failure = {"script": None, "error": str(e)}
-        finally:
-            with self.lock:
-                for jid in ids:
-                    self._preparing.pop(jid, None)
-
-        if failure:
-            with self.lock:
-                self._drop_unsent(submit_no, project, batch, row, cluster, failure)
-
-        # Step 3: handle approval wait (up to submit.wait_s, default 180s) or immediate dispatch
         approved_inline = False
         refused_inline = False
+        cancelled_inline = False
         refuse_comment = ""
         pending_approval = False
         dispatch_transport_err: str | None = None
 
-        if approval is not None:
-            eff_wait = p.submit.wait_s if wait_s is None else max(0.0, min(float(wait_s), 180.0))
-            decision = (self.wait_approval(approval, eff_wait, on_tick)
-                        if self.wait_approval is not None else None)
-            if decision is None:
-                pending_approval = True
-            elif not decision["approved"]:
-                refused_inline = True
-                refuse_comment = decision.get("comment") or ""
+        try:
+            try:
+                self._write_wrappers(ex, real, wrappers)
+            except TransportError as e:
+                failure = {"script": None, "error": str(e)}
+
+            if failure:
+                with self.lock:
+                    if approval is not None and self.abort_approval is not None:
+                        self.abort_approval(approval, "failed to write job wrappers")
+                    self._drop_unsent(submit_no, project, batch, row, cluster, failure)
+
+            if approval is not None:
+                eff_wait = p.submit.wait_s if wait_s is None else max(0.0, min(float(wait_s), 180.0))
+                decision = (self.wait_approval(approval, eff_wait, on_tick)
+                            if self.wait_approval is not None else None)
+                if decision is None:
+                    pending_approval = True
+                elif decision.get("cancelled"):
+                    cancelled_inline = True
+                    refuse_comment = decision.get("comment") or ""
+                elif not decision["approved"]:
+                    refused_inline = True
+                    refuse_comment = decision.get("comment") or ""
+                else:
+                    approved_inline = True
+                    try:
+                        failure = self._dispatch(project, cluster, only=ids, stop_on_error=True)
+                    except TransportError as e:
+                        dispatch_transport_err = str(e)
             else:
-                approved_inline = True
                 try:
                     failure = self._dispatch(project, cluster, only=ids, stop_on_error=True)
                 except TransportError as e:
                     dispatch_transport_err = str(e)
-        else:
-            try:
-                failure = self._dispatch(project, cluster, only=ids, stop_on_error=True)
-            except TransportError as e:
-                dispatch_transport_err = str(e)
+        finally:
+            with self.lock:
+                for jid in ids:
+                    self._preparing.pop(jid, None)
 
         with self.lock:
             if dispatch_transport_err is not None:
@@ -307,6 +315,14 @@ class JobService:
             if failure:
                 self._drop_unsent(submit_no, project, batch, row, cluster, failure)
             jobs = self.db.all("SELECT * FROM jobs WHERE submit_no = ? ORDER BY id", (submit_no,))
+            if not pending_approval and not refused_inline and not cancelled_inline:
+                failed_job = next((j for j in jobs if j["state"] == slurm.SUBMIT_FAILED), None)
+                if failed_job is not None:
+                    self._drop_unsent(
+                        submit_no, project, batch, row, cluster,
+                        {"script": failed_job["script"],
+                         "error": failed_job["error"] or "sbatch rejected"},
+                    )
             if self.db.one("SELECT 1 FROM jobs WHERE submit_no = ? AND state = ?",
                            (submit_no, slurm.HELD)):
                 self._want.add(cluster)
@@ -327,6 +343,7 @@ class JobService:
             "approval_id": approval,
             "approved_inline": approved_inline,
             "refused_inline": refused_inline,
+            "cancelled_inline": cancelled_inline,
             "refuse_comment": refuse_comment,
             "conditions": sub["conditions"] if pending_approval else [],
             "core_hours": _total(a.core_hours for a in asked.values()),
@@ -489,7 +506,7 @@ class JobService:
                             "__sq=$(squeue -h -u \"$USER\" -o \"%%F|%%o\" 2>/dev/null "
                             "| awk -F'|' -v pat=%s 'index($2, pat) > 0 {print $1; exit}'); "
                             "if [ -n \"$__sq\" ]; then "
-                            "printf '%%s\\n' \"$__sq\" > %s.tmp && mv %s.tmp %s && "
+                            "( printf '%%s\\n' \"$__sq\" > %s.tmp && mv %s.tmp %s ) 2>/dev/null || true; "
                             "printf '%%s\\n' \"$__sq\"; return 0; fi; "
                             % (q(stem + ".sh"), q(sid_rel), q(sid_rel), q(sid_rel))
                         )
@@ -501,7 +518,7 @@ class JobService:
                         "%s"
                         "__sid=$(sbatch --parsable %s); __rc=$?; "
                         "if [ \"$__rc\" -eq 0 ]; then "
-                        "printf '%%s\\n' \"$__sid\" > %s.tmp && mv %s.tmp %s && "
+                        "( printf '%%s\\n' \"$__sid\" > %s.tmp && mv %s.tmp %s ) 2>/dev/null || true; "
                         "printf '%%s\\n' \"$__sid\"; return 0; fi; "
                         "return \"$__rc\"; "
                         "}; "
@@ -574,13 +591,29 @@ class JobService:
         return self.db.all("SELECT * FROM jobs WHERE approval = ? AND state = ? ORDER BY id",
                            (approval, slurm.UNAPPROVED))
 
-    def release(self, approval: int) -> list[str]:
+    def release(self, approval: int, want: bool = True) -> list[str]:
         jobs = self.unapproved(approval)
         now = self.now()
         for j in jobs:
             self.db.update("jobs", {"id": j["id"]}, state=slurm.HELD, changed=now)
-        self._want.update(j["cluster"] for j in jobs)
+        if want:
+            self._want.update(j["cluster"] for j in jobs)
         return sorted({j["batch"] for j in jobs})
+
+    def want_approval(self, approval: int) -> None:
+        rows = self.db.all(
+            "SELECT DISTINCT cluster FROM jobs WHERE approval = ? AND state = ?",
+            (approval, slurm.HELD),
+        )
+        self._want.update(r["cluster"] for r in rows)
+
+    def cancel_note_for_approval(self, approval: int) -> str:
+        row = self.db.one(
+            "SELECT cancel_note FROM jobs WHERE approval = ? AND cancel_note IS NOT NULL "
+            "AND cancel_note != '' ORDER BY id LIMIT 1",
+            (approval,),
+        )
+        return row["cancel_note"] if row else ""
 
     def refuse(self, approval: int, comment: str = "") -> list[str]:
         jobs = self.unapproved(approval)

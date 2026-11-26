@@ -523,3 +523,128 @@ def test_db_migration_v1_to_v2(tmp_path):
         assert j["dispatch_token"] is None and j["dispatch_attempted"] == 0
     finally:
         db.close()
+
+
+def test_submit_inline_race_wrapper_abort_cancel_wake_and_sid_write_fail(hpc_home, tmp_path):
+    import os
+    import sys as _sys
+    from hpcport import messages, slurm
+    from hpcport.executor import LocalExecutor, TransportError
+
+    # 1. approved_inline + concurrent dispatch_wanted must NOT swallow sbatch rejection
+    fakebin = tmp_path / "rej_bin"
+    fakebin.mkdir()
+    (fakebin / "sbatch").write_text(
+        "#!/bin/bash\necho 'sbatch: error: Invalid QoS specified' >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    (fakebin / "sbatch").chmod(0o755)
+    (fakebin / "squeue").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (fakebin / "squeue").chmod(0o755)
+
+    env = dict(os.environ, PATH="%s:%s" % (fakebin, os.environ.get("PATH", "")))
+    ex_rej = LocalExecutor(env=env)
+    remote = tmp_path / "remote_r"
+    remote.mkdir()
+    d = Daemon(executors={"c1": ex_rej}, browser_opener=lambda url: True)
+    d.settings.create_preset("c1", {
+        "connect": "local", "scheduler": "slurm", "partitions": ["a100"],
+        "max_jobs": 4, "projects_root": str(remote),
+    })
+    d.settings.create_project("p1")
+    d.attach_cluster("p1", "c1")
+    wd = remote / "p1" / "run1"
+    _write_script(wd / "bad.sh")
+
+    def approve_and_race():
+        for _ in range(100):
+            pending = d.approvals.list(pending_only=True, project="p1")
+            if pending:
+                with d.lock:
+                    d.approvals.decide(pending[0]["id"], True, "go")
+                d.jobs.dispatch_wanted()
+                return
+            time.sleep(0.01)
+
+    t = threading.Thread(target=approve_and_race, daemon=True)
+    t.start()
+    with pytest.raises(JobError) as exc:
+        d.jobs.submit("p1", "c1", str(wd), ["bad.sh"], desc="bad qos", wait_s=5.0)
+    t.join(timeout=2)
+    assert exc.value.code == "sbatch_rejected"
+    assert "Invalid QoS" in exc.value.params["error"]
+
+    # 2. _write_wrappers failure must immediately cancel approval & clean _waiting
+    orig_write = d.jobs._write_wrappers
+
+    def fail_wrappers(*args, **kwargs):
+        raise TransportError("disk full while writing wrapper")
+
+    d.jobs._write_wrappers = fail_wrappers
+    try:
+        with pytest.raises(JobError) as exc_w:
+            d.jobs.submit("p1", "c1", str(wd), ["bad.sh"], desc="wrapper fail", wait_s=0)
+        assert exc_w.value.code == "unreachable"
+        assert d.approvals.pending_count() == 0
+        assert d.submits._waiting == {}
+    finally:
+        d.jobs._write_wrappers = orig_write
+
+    # 3. Cancelling unapproved job while submit() waits wakes immediately & reports cancelled
+    _write_script(wd / "wait_cancel.sh")
+
+    def cancel_while_waiting():
+        for _ in range(100):
+            pending = d.approvals.list(pending_only=True, project="p1")
+            if pending:
+                d.jobs.cancel("p1", approval=pending[0]["id"], by="user", note="wrong lr")
+                with d.lock:
+                    d.submits.sweep()
+                return
+            time.sleep(0.01)
+
+    t2 = threading.Thread(target=cancel_while_waiting, daemon=True)
+    t0 = time.monotonic()
+    t2.start()
+    res_c = d.jobs.submit("p1", "c1", str(wd), ["wait_cancel.sh"], desc="cancel me", wait_s=10.0)
+    dt_c = time.monotonic() - t0
+    t2.join(timeout=2)
+    assert dt_c < 2.0, "submit() was not woken promptly on cancel (took %.2fs)" % dt_c
+    assert res_c["cancelled_inline"] is True
+    assert res_c["approval"] is None
+    txt = messages.submit_ok(res_c)
+    assert "cancelled while waiting for approval" in txt
+    assert "wrong lr" in txt
+
+    # 4. _dispatch where .sid write fails (read-only .hpcport dir) still records slurm_id as QUEUED
+    okbin = tmp_path / "ok_bin"
+    okbin.mkdir()
+    (okbin / "sbatch").write_text(
+        "#!%s\nprint('5566')\n" % _sys.executable, encoding="utf-8",
+    )
+    (okbin / "sbatch").chmod(0o755)
+    (okbin / "squeue").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (okbin / "squeue").chmod(0o755)
+    ex_ok = LocalExecutor(env=dict(os.environ, PATH="%s:%s" % (okbin, os.environ.get("PATH", ""))))
+    d.ex["c1"] = ex_ok
+    d.settings.update_project("p1", {"submit": {"approval": False}})
+    wd_ro = remote / "p1" / "ro_sid"
+    _write_script(wd_ro / "ok.sh")
+
+    orig_w = d.jobs._write_wrappers
+
+    def write_then_chmod(*args, **kwargs):
+        orig_w(*args, **kwargs)
+        (wd_ro / ".hpcport").chmod(0o555)
+
+    d.jobs._write_wrappers = write_then_chmod
+    try:
+        res_ro = d.jobs.submit("p1", "c1", str(wd_ro), ["ok.sh"], desc="ro sid", wait_s=0)
+        assert res_ro["ids"] == ["5566"]
+        assert res_ro["n_sent"] == 1
+        jrow = d.db.one("SELECT * FROM jobs WHERE slurm_id = '5566'")
+        assert jrow is not None and jrow["state"] == slurm.QUEUED
+    finally:
+        d.jobs._write_wrappers = orig_w
+        if (wd_ro / ".hpcport").exists():
+            (wd_ro / ".hpcport").chmod(0o755)

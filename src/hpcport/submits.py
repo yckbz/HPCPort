@@ -55,6 +55,7 @@ class SubmitApprovals:
         approvals.handlers[APPROVAL_KIND] = self.on_decision
         approvals.options[APPROVAL_KIND] = ("always",) + SUBMIT_LIMITS
         jobs.gate = self.gate
+        jobs.abort_approval = self.abort_approval
 
     @staticmethod
     def _meta_key(project: str) -> str:
@@ -161,9 +162,22 @@ class SubmitApprovals:
                 except Exception:
                     pass
 
-    def drop_waiter(self, aid: int) -> None:
+    def drop_waiter(self, aid: int, reason: str = "") -> None:
+        with self._cond:
+            if aid in self._waiting:
+                self._waiting[aid] = {
+                    "approved": False,
+                    "cancelled": True,
+                    "comment": reason,
+                    "auto_released": False,
+                }
+                self._cond.notify_all()
+
+    def abort_approval(self, aid: int, reason: str) -> None:
+        self.approvals.cancel(aid, reason)
         with self._cond:
             self._waiting.pop(aid, None)
+            self._cond.notify_all()
 
     # ------------------------------------------------------------------ recheck
     def recheck(self, project: str | None = None) -> list[tuple[str, str]]:
@@ -193,14 +207,13 @@ class SubmitApprovals:
                     apart = tuple(r["id"] for r in rows[n:])
                     now = self.reasons(pname, sub, apart) + now
                 if not now:
-                    batches = self.jobs.release(aid)
+                    batches = self.jobs.release(aid, want=False)
                     released += [(pname, b) for b in batches]
                     self.approvals.cancel(aid, RELEASED)
-                    with self._cond:
-                        if aid in self._waiting:
-                            self._waiting[aid] = {"approved": True, "comment": RELEASED,
-                                                  "auto_released": True}
-                            self._cond.notify_all()
+                    inline = self._wake_waiter(aid, approved=True, comment=RELEASED,
+                                               auto_released=True)
+                    if not inline:
+                        self.jobs.want_approval(aid)
                     log.info("submission approval %d (%s) auto-released", aid, pname)
                     continue
                 summary = self.describe(pname, sub, now)
@@ -250,26 +263,29 @@ class SubmitApprovals:
             self.db.set_meta(self._meta_key(project), json.dumps(st))
             result["standing"] = st["limits"]
 
-        batches = self.jobs.release(aid)
+        batches = self.jobs.release(aid, want=False)
         result["batches"] = batches
         inline = self._wake_waiter(aid, approved=True, comment=comment)
-        if not inline and project:
-            self.notify(
-                project,
-                "submit_approved",
-                "approval:%d" % aid,
-                {"approval": aid, "batches": batches, "comment": comment,
-                 "standing": bool(always)},
-            )
+        if not inline:
+            self.jobs.want_approval(aid)
+            if project:
+                self.notify(
+                    project,
+                    "submit_approved",
+                    "approval:%d" % aid,
+                    {"approval": aid, "batches": batches, "comment": comment,
+                     "standing": bool(always)},
+                )
         if always and project:
             result["also_released"] = [b for _, b in self.recheck(project)]
         return result
 
-    def _wake_waiter(self, aid: int, approved: bool, comment: str) -> bool:
+    def _wake_waiter(self, aid: int, approved: bool, comment: str,
+                     auto_released: bool = False) -> bool:
         with self._cond:
             if aid in self._waiting:
                 self._waiting[aid] = {"approved": approved, "comment": comment,
-                                      "auto_released": False}
+                                      "auto_released": auto_released}
                 self._cond.notify_all()
                 return True
         return False
@@ -277,5 +293,6 @@ class SubmitApprovals:
     def sweep(self) -> None:
         for a in self.approvals.list(pending_only=True):
             if a["kind"] == APPROVAL_KIND and not self.jobs.unapproved(a["id"]):
+                note = self.jobs.cancel_note_for_approval(a["id"])
                 self.approvals.cancel(a["id"], "its jobs no longer wait for approval")
-                self.drop_waiter(a["id"])
+                self.drop_waiter(a["id"], reason=note)

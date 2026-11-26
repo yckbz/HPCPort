@@ -157,6 +157,9 @@ def submit_ok(r: dict) -> str:
         res_bits.append("%s GPU-h" % fmt_qty(r["gpu_hours"]))
     res_part = ("; est. " + ", ".join(res_bits)) if res_bits else ""
 
+    if r.get("cancelled_inline"):
+        c = (" Reason: " + r["refuse_comment"]) if r.get("refuse_comment") else ""
+        return P.SUBMIT_CANCELLED_INLINE.format(batch=r["batch"], comment=c)
     if r.get("refused_inline"):
         c = (" Reason: " + r["refuse_comment"]) if r.get("refuse_comment") else ""
         return P.SUBMIT_REFUSED_INLINE.format(batch=r["batch"], comment=c)
