@@ -10,7 +10,7 @@
 
 ---
 
-HPCPort sits safely between your AI coding agents (**Codex**, **OpenCode**, **Antigravity**, **DeepSeek Harness / DSH**, **Claude Code**, or any MCP client) and your remote **Slurm clusters** or **bare SSH GPU/CPU servers**.
+HPCPort sits safely between your MCP-compatible AI coding agents and your remote **Slurm clusters** or **bare SSH GPU/CPU servers**.
 
 Instead of giving an agent raw, unguarded SSH access or polling loops, HPCPort provides:
 
@@ -27,7 +27,7 @@ Instead of giving an agent raw, unguarded SSH access or polling loops, HPCPort p
 
 ## Zero-Code Setup: Let Your AI Agent Install It
 
-If you prefer not to run terminal commands manually, simply share this repository URL (or the downloaded local folder path) with your AI agent (**Codex**, **OpenCode**, **Antigravity**, **DSH**, or **Claude Code**) and send:
+If you prefer not to run terminal commands manually, simply share this repository URL (or the downloaded local folder path) with your AI agent and send:
 
 > Install HPCPort from `<repo-url-or-local-path>` following its README "Agent Self-Install Protocol", connect it to your MCP config, and open the Settings Web dashboard for me.
 
@@ -50,10 +50,10 @@ When a user asks you to install HPCPort from a local path or Git URL, perform th
      python3 -m venv ~/.hpcport/venv
      ~/.hpcport/venv/bin/pip install "<repo-path-or-git+https-url>"
      ```
-2. **Resolve the absolute executable path and verify it runs**:
+2. **Resolve the absolute executable path and verify the environment**:
    ```bash
    HPCPORT_BIN="$(command -v hpcport || echo "$HOME/.hpcport/venv/bin/hpcport")"
-   "$HPCPORT_BIN" --help
+   "$HPCPORT_BIN" doctor
    ```
 3. **Register `hpcport` in your own MCP configuration** using the **absolute path** `$HPCPORT_BIN` (important for GUI clients whose default `PATH` omits `~/.local/bin`):
    - Generic stdio MCP config (auto-starts the global daemon and automatically matches the active project by working directory `cwd`):
@@ -104,21 +104,24 @@ python3 -m venv ~/.hpcport/venv
 
 ```bash
 # Auto-starts the background daemon and opens the authenticated Web UI in your browser
-hpcport web --tab settings
+hpcport ui --tab settings
 
-# Or run the daemon in the foreground
-hpcport daemon
+# Or run the daemon in the foreground and auto-open the dashboard
+hpcport daemon --open
+
+# Check environment, binary path, ssh/rsync, and daemon status
+hpcport doctor
 ```
 
 On a headless remote machine over SSH port forwarding (`ssh -L 8765:127.0.0.1:8765 ...`), print the 6-digit pairing PIN:
 
 ```bash
-hpcport web --pin
+hpcport pin
 ```
 
 ### 3. Add a Server & Project (Web UI or CLI)
 
-You can configure everything visually in the **Settings** tab, or from the CLI (while the daemon is running):
+You can configure everything visually in the **Settings** tab, or from the CLI (all setup commands auto-start the daemon if needed):
 
 ```bash
 # Add a Slurm cluster preset
@@ -137,9 +140,12 @@ hpcport cluster add lab-4090 \
 # Test SSH connectivity and Slurm detection
 hpcport cluster test gpu01
 
-# Register a project bound to your local folder and attach servers
+# Register a project bound to your local folder and attach/detach servers
 hpcport project init my-research --dir /path/to/my-research
 hpcport cluster attach my-research gpu01
+
+# Print ready-to-copy MCP configs for supported clients
+hpcport snippets my-research
 ```
 
 ---
@@ -177,6 +183,7 @@ Example stdio config (works across projects automatically via `cwd`):
 
 | Tool | Purpose |
 |---|---|
+| `info` | Inspect the current project's attached compute servers, remote roots, partitions, usage guides, and standing budget |
 | `remote_exec` | Run shell commands inside a project's remote `root` (with guard checks & `background=True` support for bare SSH tasks) |
 | `transfer` | Transfer files/directories between local workspace and remote server via `rsync` (size-gated) |
 | `remote_stop` | Stop a running background exec or transfer operation (`op:<id>`) |

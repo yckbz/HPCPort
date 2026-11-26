@@ -10,7 +10,7 @@
 
 ---
 
-HPCPort 运行在你的 AI 编程 Agent（**Codex**、**OpenCode**、**Antigravity**、**DeepSeek Harness / DSH**、**Claude Code** 或任意 MCP 客户端）与远端 **Slurm 超算集群** / **普通 SSH GPU·CPU 服务器**之间。
+HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算集群** / **普通 SSH GPU·CPU 服务器**之间。
 
 你无需把裸 SSH 权限直接交给 Agent，也不必忍受脆弱的轮询脚本；HPCPort 提供：
 
@@ -27,7 +27,7 @@ HPCPort 运行在你的 AI 编程 Agent（**Codex**、**OpenCode**、**Antigravi
 
 ## 零代码安装：直接交给 AI Agent 自动装好
 
-如果你不想手动敲命令，直接把本仓库的 GitHub 链接（或下载后的本地文件夹路径）发给你的 AI Agent（**Codex**、**OpenCode**、**Antigravity**、**DSH** 或 **Claude Code**），告诉它：
+如果你不想手动敲命令，直接把本仓库的 GitHub 链接（或下载后的本地文件夹路径）发给你的 AI Agent，告诉它：
 
 > 请根据 `<仓库链接或本地路径>` 中 README 的「Agent 自动安装协议」帮我安装并配置 HPCPort，接入你的 MCP 配置，然后帮我在浏览器里打开设置页面。
 
@@ -50,10 +50,10 @@ HPCPort 运行在你的 AI 编程 Agent（**Codex**、**OpenCode**、**Antigravi
      python3 -m venv ~/.hpcport/venv
      ~/.hpcport/venv/bin/pip install "<仓库路径或 git+https 链接>"
      ```
-2. **获取绝对可执行路径并确认可正常运行**：
+2. **获取绝对可执行路径并自检环境**：
    ```bash
    HPCPORT_BIN="$(command -v hpcport || echo "$HOME/.hpcport/venv/bin/hpcport")"
-   "$HPCPORT_BIN" --help
+   "$HPCPORT_BIN" doctor
    ```
 3. **将 HPCPort 写入你自己的 MCP 配置文件**，请务必使用上面的**绝对路径** `$HPCPORT_BIN`（避免图形界面客户端因 `PATH` 不含 `~/.local/bin` 而找不到命令）：
    - 通用 stdio 配置（自动拉起全局守护进程，并按当前工作目录 `cwd` 自动匹配项目）：
@@ -104,21 +104,24 @@ python3 -m venv ~/.hpcport/venv
 
 ```bash
 # 自动在后台拉起守护进程，并免密打开浏览器中的设置页
-hpcport web --tab settings
+hpcport ui --tab settings
 
-# 或在前台运行守护进程
-hpcport daemon
+# 或在前台运行守护进程并自动打开页面
+hpcport daemon --open
+
+# 一键自检 Python、命令路径、ssh/rsync 与守护进程状态
+hpcport doctor
 ```
 
 如果你通过无桌面环境的 SSH 端口转发（`ssh -L 8765:127.0.0.1:8765 ...`）访问，可打印 6 位配对 PIN 码用于网页解锁：
 
 ```bash
-hpcport web --pin
+hpcport pin
 ```
 
 ### 3. 添加服务器预设与项目（网页或命令行均可）
 
-推荐直接在浏览器的 **设置（Settings）** 页面图形化操作，也支持 CLI（需先通过 `hpcport web` 或 `hpcport daemon` 启动守护进程）：
+推荐直接在浏览器的 **设置（Settings）** 页面图形化操作，也支持 CLI（配置命令会自动拉起守护进程）：
 
 ```bash
 # 添加 Slurm 集群预设
@@ -137,9 +140,12 @@ hpcport cluster add lab-4090 \
 # 测试 SSH 连通性与 Slurm 检测
 hpcport cluster test gpu01
 
-# 注册项目（绑定本地目录）并挂载服务器
+# 注册项目（绑定本地目录）并挂载/解绑服务器
 hpcport project init my-research --dir /path/to/my-research
 hpcport cluster attach my-research gpu01
+
+# 打印各大客户端的 MCP 接入配置片段
+hpcport snippets my-research
 ```
 
 ---
@@ -177,6 +183,7 @@ HPCPort 同时支持**自动拉起守护进程的 stdio 桥接器**（`hpcport m
 
 | 工具名 | 功能说明 |
 |---|---|
+| `info` | 查看当前项目挂载的服务器清单、远端 `root`、分区、集群指南与常设预算状态 |
 | `remote_exec` | 在项目远端 `root` 内执行 Shell 命令（经过守卫检查，支持 `background=True` 运行无 Slurm 后台长任务） |
 | `transfer` | 通过 `rsync` 在本地工作区与远端服务器之间双向传输文件（大文件需审批） |
 | `remote_stop` | 终止正在运行的后台命令或文件传输（`op:<id>`） |
