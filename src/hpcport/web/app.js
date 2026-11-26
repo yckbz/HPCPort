@@ -5,7 +5,7 @@ import { createI18n } from "/static/i18n.js";
 const ALLOWABLE_RULES = ["scancel", "outside", "root", "startup", "crontab", "remote", "killall"];
 const VALID_TABS = new Set(["approvals", "jobs", "audit", "settings"]);
 
-const i18n = createI18n(localStorage.getItem("hpcport_lang") || "en");
+const i18n = createI18n(localStorage.getItem("hpcport_lang") || "auto");
 
 const state = {
   authenticated: false,
@@ -33,11 +33,16 @@ const state = {
   openStanding: new Set(),  // approval ids showing standing form
   openDiffs: new Set(),     // approval ids showing unified diff
   expandedOps: new Set(),   // op ids showing full command/path inline
+  openPolicies: new Set(),  // project names with Policies <details> open
+  commentDrafts: {},        // approval id -> draft comment text
+  standingDrafts: {},       // approval id -> { field: draft string }
 
   // Live SSE
   sse: null,
   sseConnected: false,
   lastPendingIds: new Set(),
+  pendingIdsReady: false,
+  pendingEvents: new Set(),
   refreshTimer: null,
 
   // Drawer state
@@ -263,13 +268,10 @@ function connectSSE() {
     document.getElementById("sse-label").textContent = i18n.t("liveConnected");
   });
 
-  const onUpdate = () => scheduleRefresh(false);
-  es.addEventListener("settings_changed", onUpdate);
-  es.addEventListener("jobs_changed", onUpdate);
-  es.addEventListener("ops_changed", onUpdate);
-  es.addEventListener("approvals_changed", () => {
-    scheduleRefresh(true);
-  });
+  es.addEventListener("settings_changed", () => scheduleRefresh("settings_changed"));
+  es.addEventListener("jobs_changed", () => scheduleRefresh("jobs_changed"));
+  es.addEventListener("ops_changed", () => scheduleRefresh("ops_changed"));
+  es.addEventListener("approvals_changed", () => scheduleRefresh("approvals_changed"));
 
   es.onerror = () => {
     state.sseConnected = false;
@@ -278,18 +280,51 @@ function connectSSE() {
   };
 }
 
-function scheduleRefresh(fromApprovalEvent = false) {
+function scheduleRefresh(eventName = "all") {
+  state.pendingEvents.add(eventName);
   if (state.refreshTimer) clearTimeout(state.refreshTimer);
   state.refreshTimer = setTimeout(async () => {
     state.refreshTimer = null;
-    await refreshAll(fromApprovalEvent);
+    const events = new Set(state.pendingEvents);
+    state.pendingEvents.clear();
+    await refreshAll(events);
   }, 180);
 }
 
 // ------------------------------------------------------------------ Data Fetching
-async function refreshAll(notifyNewApproval = false) {
+async function syncGlobalPendingAlerts(notifyNew) {
+  const globalPending = await api("/api/approvals");
+  const allList = globalPending.approvals || [];
+  if (notifyNew && state.pendingIdsReady && state.alertsEnabled
+      && "Notification" in window && Notification.permission === "granted") {
+    for (const a of allList) {
+      if (!state.lastPendingIds.has(a.id)) {
+        new Notification(`HPCPort: ${a.summary}`, { body: `${a.project || "global"} (#${a.id})` });
+      }
+    }
+  }
+  state.lastPendingIds = new Set(allList.map((a) => a.id));
+  state.pendingIdsReady = true;
+  return allList;
+}
+
+function isEditingInside(el) {
+  const active = document.activeElement;
+  if (!el || !active || !el.contains(active)) return false;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName);
+}
+
+async function refreshAll(eventsOrFlag = null) {
   if (!state.authenticated) return;
+  const events = eventsOrFlag instanceof Set
+    ? eventsOrFlag
+    : new Set(eventsOrFlag === true ? ["all", "approvals_changed"] : ["all"]);
+  const wantAll = events.has("all");
+  const hasApprovals = events.has("approvals_changed");
+  const hasJobs = events.has("jobs_changed") || events.has("ops_changed");
+  const hasSettings = events.has("settings_changed");
   try {
+    const prevNames = ((state.snapshot && state.snapshot.projects) || []).map((p) => p.name).join("\0");
     const snap = await api("/api/state");
     state.snapshot = snap;
     // Validate selected project still exists
@@ -298,42 +333,66 @@ async function refreshAll(notifyNewApproval = false) {
       state.project = "";
       localStorage.setItem("hpcport_project", "");
     }
-    renderProjectSelect();
+    if (wantAll || names.join("\0") !== prevNames) {
+      renderProjectSelect();
+    }
     updateApprovalsBadge(snap.pending_approvals || 0);
-    await refreshActiveTab(notifyNewApproval);
+    if (!state.pendingIdsReady || hasApprovals) {
+      await syncGlobalPendingAlerts(hasApprovals);
+    }
+    // Scope tab re-renders to relevant events so background job ticks do not wipe forms
+    if (state.tab === "approvals" && !(wantAll || hasApprovals || hasSettings)) {
+      return;
+    }
+    if (state.tab === "jobs" && !(wantAll || hasJobs || hasApprovals || hasSettings)) {
+      return;
+    }
+    if (state.tab === "settings") {
+      if (!(wantAll || hasSettings)) return;
+      if (!wantAll && isEditingInside(document.getElementById("view-settings"))) return;
+    }
+    await refreshActiveTab();
   } catch (e) {
     if (state.authenticated) toast(e.message, true);
   }
 }
 
-async function refreshActiveTab(notifyNewApproval = false) {
+async function refreshActiveTab() {
   if (!state.authenticated) return;
   try {
     const qProj = state.project ? `project=${encodeURIComponent(state.project)}` : "";
-    if (state.tab === "approvals" || notifyNewApproval) {
+    if (state.tab === "approvals") {
       const pending = await api(`/api/approvals${qProj ? "?" + qProj : ""}`);
       const list = pending.approvals || [];
-      if (notifyNewApproval && state.alertsEnabled && "Notification" in window && Notification.permission === "granted") {
-        for (const a of list) {
-          if (!state.lastPendingIds.has(a.id)) {
-            new Notification(`HPCPort: ${a.summary}`, { body: `${a.project || "global"} (#${a.id})` });
-          }
-        }
-      }
-      state.lastPendingIds = new Set(list.map((a) => a.id));
       state.approvals = list;
       updateApprovalsBadge(state.snapshot ? state.snapshot.pending_approvals : list.length);
       if (state.showHistory) {
         const all = await api(`/api/approvals?all=1${qProj ? "&" + qProj : ""}`);
         state.approvalsHistory = (all.approvals || []).filter((a) => a.state !== "pending");
       }
-      if (state.tab === "approvals") renderApprovals();
+      renderApprovals();
     }
     if (state.tab === "jobs") {
       const qs = [];
       if (state.project) qs.push(`project=${encodeURIComponent(state.project)}`);
       if (state.batchFilterCluster) qs.push(`cluster=${encodeURIComponent(state.batchFilterCluster)}`);
       state.jobsData = await api(`/api/jobs${qs.length ? "?" + qs.join("&") : ""}`);
+      const visibleKeys = new Set((state.jobsData.batches || []).map((b) => `${b.project}::${b.batch}`));
+      for (const k of Object.keys(state.expandedBatches)) {
+        if (!visibleKeys.has(k)) delete state.expandedBatches[k];
+      }
+      const openKeys = Object.keys(state.expandedBatches);
+      if (openKeys.length) {
+        await Promise.all(openKeys.map(async (k) => {
+          const [proj, batch] = k.split("::");
+          try {
+            const res = await api(`/api/jobs/${encodeURIComponent(proj)}/${encodeURIComponent(batch)}`);
+            state.expandedBatches[k] = res.jobs || [];
+          } catch {
+            delete state.expandedBatches[k];
+          }
+        }));
+      }
       renderJobs();
     }
     if (state.tab === "audit") {
@@ -453,6 +512,8 @@ function renderApprovalCard(a) {
     const standingOpen = state.openStanding.has(a.id);
     const projInfo = ((state.snapshot && state.snapshot.projects) || []).find((p) => p.name === a.project);
     const defaults = (projInfo && projInfo.data && projInfo.data.submit) || {};
+    const sd = state.standingDrafts[a.id] || {};
+    const limVal = (k) => (Object.prototype.hasOwnProperty.call(sd, k) ? sd[k] : (defaults[k] ?? ""));
 
     bodyHtml = `
       <div class="muted text-sm">
@@ -485,19 +546,19 @@ function renderApprovalCard(a) {
           <div class="text-sm" style="font-weight:600">${esc(i18n.t("standingFormTitle"))}</div>
           <div class="standing-grid">
             <label class="field-label">${esc(i18n.t("limCoreH"))}
-              <input type="number" step="any" min="0" name="core_hours" value="${defaults.core_hours ?? ""}" />
+              <input type="number" step="any" min="0" name="core_hours" value="${esc(limVal("core_hours"))}" />
             </label>
             <label class="field-label">${esc(i18n.t("limGpuH"))}
-              <input type="number" step="any" min="0" name="gpu_hours" value="${defaults.gpu_hours ?? ""}" />
+              <input type="number" step="any" min="0" name="gpu_hours" value="${esc(limVal("gpu_hours"))}" />
             </label>
             <label class="field-label">${esc(i18n.t("limTotalJobs"))}
-              <input type="number" step="1" min="0" name="total_jobs" value="${defaults.total_jobs ?? ""}" />
+              <input type="number" step="1" min="0" name="total_jobs" value="${esc(limVal("total_jobs"))}" />
             </label>
             <label class="field-label">${esc(i18n.t("limTotalCoreH"))}
-              <input type="number" step="any" min="0" name="total_core_hours" value="${defaults.total_core_hours ?? ""}" />
+              <input type="number" step="any" min="0" name="total_core_hours" value="${esc(limVal("total_core_hours"))}" />
             </label>
             <label class="field-label">${esc(i18n.t("limTotalGpuH"))}
-              <input type="number" step="any" min="0" name="total_gpu_hours" value="${defaults.total_gpu_hours ?? ""}" />
+              <input type="number" step="any" min="0" name="total_gpu_hours" value="${esc(limVal("total_gpu_hours"))}" />
             </label>
           </div>
           <div class="flex-row">
@@ -581,16 +642,55 @@ function renderApprovalCard(a) {
       <h3 class="approval-summary">${esc(a.summary)}</h3>
       ${bodyHtml}
       <div class="approval-actions">
-        <input type="text" data-comment-for="${a.id}" placeholder="${esc(i18n.t("commentPlaceholder"))}" />
+        <input type="text" data-comment-for="${a.id}" value="${esc(state.commentDrafts[a.id] || "")}" placeholder="${esc(i18n.t("commentPlaceholder"))}" />
         ${actionButtons}
       </div>
     </article>
   `;
 }
 
+function captureApprovalDrafts(el) {
+  let focusInfo = null;
+  const active = document.activeElement;
+  el.querySelectorAll("[data-comment-for]").forEach((inp) => {
+    const id = inp.dataset.commentFor;
+    state.commentDrafts[id] = inp.value;
+    if (active === inp) {
+      focusInfo = {
+        selector: `[data-comment-for="${id}"]`,
+        start: inp.selectionStart,
+        end: inp.selectionEnd,
+      };
+    }
+  });
+  el.querySelectorAll("[data-standing-box]").forEach((box) => {
+    const id = box.dataset.standingBox;
+    const bag = state.standingDrafts[id] || (state.standingDrafts[id] = {});
+    box.querySelectorAll("input[name]").forEach((inp) => {
+      bag[inp.name] = inp.value;
+      if (active === inp) {
+        focusInfo = {
+          selector: `[data-standing-box="${id}"] input[name="${inp.name}"]`,
+          start: null,
+          end: null,
+        };
+      }
+    });
+  });
+  return focusInfo;
+}
+
 function renderApprovals() {
   const el = document.getElementById("view-approvals");
+  const focusInfo = captureApprovalDrafts(el);
   const pending = state.approvals || [];
+  const liveIds = new Set(pending.map((a) => String(a.id)));
+  for (const k of Object.keys(state.commentDrafts)) {
+    if (!liveIds.has(k)) delete state.commentDrafts[k];
+  }
+  for (const k of Object.keys(state.standingDrafts)) {
+    if (!liveIds.has(k)) delete state.standingDrafts[k];
+  }
   let html = `
     <div class="page-header">
       <div>
@@ -661,6 +761,34 @@ function renderApprovals() {
 
   el.innerHTML = html;
 
+  el.querySelectorAll("[data-comment-for]").forEach((inp) => {
+    inp.oninput = () => {
+      state.commentDrafts[inp.dataset.commentFor] = inp.value;
+    };
+  });
+  el.querySelectorAll("[data-standing-box]").forEach((box) => {
+    const id = box.dataset.standingBox;
+    box.querySelectorAll("input[name]").forEach((inp) => {
+      inp.oninput = () => {
+        const bag = state.standingDrafts[id] || (state.standingDrafts[id] = {});
+        bag[inp.name] = inp.value;
+      };
+    });
+  });
+  if (focusInfo) {
+    const target = el.querySelector(focusInfo.selector);
+    if (target) {
+      target.focus();
+      if (focusInfo.start !== null && typeof target.setSelectionRange === "function") {
+        try {
+          target.setSelectionRange(focusInfo.start, focusInfo.end);
+        } catch {
+          // Number inputs do not support selection ranges
+        }
+      }
+    }
+  }
+
   document.getElementById("toggle-history-btn").onclick = async () => {
     state.showHistory = !state.showHistory;
     await refreshActiveTab();
@@ -701,6 +829,8 @@ function renderApprovals() {
       btn.disabled = true;
       try {
         await api(`/api/approvals/${id}/${action}`, { method: "POST", body: { comment } });
+        delete state.commentDrafts[String(id)];
+        delete state.standingDrafts[String(id)];
         toast(i18n.t(action === "approve" ? "approvedToast" : "rejectedToast", { id }));
         await refreshAll();
       } catch (e) {
@@ -728,6 +858,8 @@ function renderApprovals() {
       try {
         await api(`/api/approvals/${id}/approve`, { method: "POST", body: payload });
         state.openStanding.delete(id);
+        delete state.commentDrafts[String(id)];
+        delete state.standingDrafts[String(id)];
         toast(i18n.t("approvedToast", { id }));
         await refreshAll();
       } catch (e) {
@@ -863,7 +995,9 @@ function renderJobs() {
   const filteredBatches = batches.filter((b) => {
     if (state.batchFilterStatus === "active") return !b.finished;
     if (state.batchFilterStatus === "finished") return b.finished;
-    if (state.batchFilterStatus === "failed") return (b.jobs.failed || 0) + (b.jobs.submit_failed || 0) > 0;
+    if (state.batchFilterStatus === "failed") {
+      return (b.jobs.failed || 0) + (b.jobs.timeout || 0) + (b.jobs.lost || 0) + (b.jobs.submit_failed || 0) > 0;
+    }
     return true;
   });
 
@@ -986,7 +1120,8 @@ function renderJobs() {
                 const pDone = ((c.done || 0) / tot) * 100;
                 const pAct = (((c.running || 0) + (c.queued || 0)) / tot) * 100;
                 const pWait = (((c.held || 0) + (c.unapproved || 0)) / tot) * 100;
-                const pFail = (((c.failed || 0) + (c.submit_failed || 0)) / tot) * 100;
+                const pFail = (((c.failed || 0) + (c.timeout || 0) + (c.lost || 0) + (c.submit_failed || 0)) / tot) * 100;
+                const pCancel = ((c.cancelled || 0) / tot) * 100;
                 const summaryChips = Object.entries(c).map(([k, v]) => `${k}:${v}`).join(" ");
                 return `
                   <tr>
@@ -1005,6 +1140,7 @@ function renderJobs() {
                         <div class="progress-seg-active" style="width:${pAct}%"></div>
                         <div class="progress-seg-wait" style="width:${pWait}%"></div>
                         <div class="progress-seg-fail" style="width:${pFail}%"></div>
+                        <div class="progress-seg-cancel" style="width:${pCancel}%"></div>
                       </div>
                       <div class="muted text-xs tabular" style="margin-top:4px">${esc(summaryChips)}</div>
                     </td>
@@ -1616,6 +1752,14 @@ function renderSettings() {
     };
   });
 
+  el.querySelectorAll("[data-policy-details]").forEach((det) => {
+    det.ontoggle = () => {
+      const proj = det.dataset.policyDetails;
+      if (det.open) state.openPolicies.add(proj);
+      else state.openPolicies.delete(proj);
+    };
+  });
+
   el.querySelectorAll("[data-policy-form]").forEach((form) => {
     form.onsubmit = async (e) => {
       e.preventDefault();
@@ -1720,7 +1864,7 @@ function renderProjectCard(p) {
         </div>
       ` : ""}
 
-      <details style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <details data-policy-details="${esc(p.name)}"${state.openPolicies.has(p.name) ? " open" : ""} style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
         <summary class="text-sm" style="cursor:pointer;font-weight:580;color:var(--text-secondary)">
           ${esc(i18n.t("policiesTitle"))}
         </summary>

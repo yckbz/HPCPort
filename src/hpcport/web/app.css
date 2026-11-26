@@ -668,6 +668,7 @@ select {
 .progress-seg-active { background: var(--accent); }
 .progress-seg-wait { background: var(--amber); }
 .progress-seg-fail { background: var(--red); }
+.progress-seg-cancel { background: var(--text-tertiary); opacity: 0.45; }
 
 .budget-grid {
   display: grid;

@@ -563,14 +563,22 @@ export const MESSAGES = {
   },
 };
 
-export function createI18n(initialLang = "en") {
-  let lang = initialLang === "zh" ? "zh" : "en";
+function resolveLang(next) {
+  if (next === "zh") return "zh";
+  if (next === "en") return "en";
+  const nav = (typeof navigator !== "undefined"
+    && (navigator.language || (navigator.languages && navigator.languages[0]))) || "";
+  return String(nav).toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+export function createI18n(initialLang = "auto") {
+  let lang = resolveLang(initialLang);
   return {
     get lang() {
       return lang;
     },
     setLang(next) {
-      lang = next === "zh" ? "zh" : "en";
+      lang = resolveLang(next);
       document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
     },
     t(key, params = {}) {
