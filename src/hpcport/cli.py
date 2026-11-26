@@ -29,11 +29,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import secrets
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -85,6 +87,22 @@ def _api(port: int, method: str, path: str, data: dict | None = None,
                  % (port, e.reason))
 
 
+def _write_atomic(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.%d.%s.tmp" % (path.name, os.getpid(), secrets.token_hex(4)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _cmd_daemon(args) -> None:
     import uvicorn
     from .daemon import Daemon
@@ -93,42 +111,72 @@ def _cmd_daemon(args) -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     port = _port(args)
-    daemon = Daemon()
-    if args.port:
-        daemon.global_cfg = config.GlobalConfig(
-            port=port,
-            auto_open_dashboard=daemon.global_cfg.auto_open_dashboard,
-            web_only_approval=daemon.global_cfg.web_only_approval,
-            language=daemon.global_cfg.language,
+
+    # Guard against duplicate daemons BEFORE instantiating Daemon() or overwriting
+    # cli.token / daemon.pid. Uses a dedicated instance lock (distinct from
+    # daemon.lock held by stdio_bridge.ensure_daemon while spawning).
+    inst_lock = config.daemon_instance_lock_file()
+    inst_lock.parent.mkdir(parents=True, exist_ok=True)
+    lock_f = open(inst_lock, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_f.close()
+        try:
+            pid_txt = config.daemon_pid_file().read_text(encoding="utf-8").strip()
+        except OSError:
+            pid_txt = ""
+        hint = (" (pid %s)" % pid_txt) if pid_txt else ""
+        sys.exit("HPCPort daemon is already running%s." % hint)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(2048)
+    except OSError as e:
+        sock.close()
+        lock_f.close()
+        sys.exit("cannot bind HPCPort daemon on 127.0.0.1:%d (%s)" % (port, e))
+
+    try:
+        daemon = Daemon()
+        if args.port:
+            daemon.global_cfg = config.GlobalConfig(
+                port=port,
+                auto_open_dashboard=daemon.global_cfg.auto_open_dashboard,
+                web_only_approval=daemon.global_cfg.web_only_approval,
+                language=daemon.global_cfg.language,
+            )
+        token = secrets.token_urlsafe(32)
+        daemon.cli_token = token
+        _write_atomic(cli_token_file(), token, mode=0o600)
+        _write_atomic(config.daemon_pid_file(), str(os.getpid()), mode=0o644)
+        logging.getLogger("hpcport").info(
+            "HPCPort daemon listening on http://127.0.0.1:%d", port,
         )
-    token = secrets.token_urlsafe(32)
-    daemon.cli_token = token
-    tf = cli_token_file()
-    tf.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(tf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(token)
-    config.daemon_pid_file().write_text(str(os.getpid()))
-    logging.getLogger("hpcport").info(
-        "HPCPort daemon listening on http://127.0.0.1:%d", port,
-    )
-    # Never write the pairing PIN to daemon.log; print only to an interactive terminal.
-    if sys.stderr.isatty():
-        sys.stderr.write("Headless unlock PIN: %s\n" % daemon.pairing_pin)
-        sys.stderr.flush()
-    if getattr(args, "open", False):
-        tab = getattr(args, "tab", None) or "approvals"
+        # Never write the pairing PIN to daemon.log; print only to an interactive terminal.
+        if sys.stderr.isatty():
+            sys.stderr.write("Headless unlock PIN: %s\n" % daemon.pairing_pin)
+            sys.stderr.flush()
+        if getattr(args, "open", False):
+            tab = getattr(args, "tab", None) or "approvals"
 
-        def _open_when_ready() -> None:
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                if stdio_bridge._daemon_alive(port):
-                    daemon.open_dashboard(tab=tab)
-                    return
-                time.sleep(0.15)
+            def _open_when_ready() -> None:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    if stdio_bridge._daemon_alive(port):
+                        daemon.open_dashboard(tab=tab)
+                        return
+                    time.sleep(0.15)
 
-        threading.Thread(target=_open_when_ready, daemon=True).start()
-    uvicorn.run(build_app(daemon), host="127.0.0.1", port=port, log_level="warning")
+            threading.Thread(target=_open_when_ready, daemon=True).start()
+        uv_cfg = uvicorn.Config(build_app(daemon), host="127.0.0.1", port=port,
+                                log_level="warning")
+        uvicorn.Server(uv_cfg).run(sockets=[sock])
+    finally:
+        sock.close()
+        lock_f.close()
 
 
 def _cmd_mcp(args) -> None:

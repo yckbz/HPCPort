@@ -89,3 +89,45 @@ def test_web_auth_exchange_code_never_leaks_and_pin_works(hpc_home):
     assert d.verify_pin("000000") is None or d.pairing_pin == "000000"
     pin_cookie = d.verify_pin(d.pairing_pin)
     assert pin_cookie is not None and d.verify_cookie(pin_cookie) is True
+
+
+def test_duplicate_daemon_does_not_clobber_token_or_running_daemon(hpc_home, tmp_path):
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+    from hpcport import stdio_bridge
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    env = dict(os.environ, PYTHONPATH="src", HPCPORT_HOME=str(hpc_home))
+    # First daemon starts via ensure_daemon (verifies no deadlock with daemon.lock!)
+    started_port = stdio_bridge.ensure_daemon(port=port, wait_s=8.0)
+    assert started_port == port
+    orig_token = config.cli_token_file().read_text(encoding="utf-8").strip()
+    orig_pid = int(config.daemon_pid_file().read_text(encoding="utf-8").strip())
+    assert orig_token and orig_pid > 0
+
+    try:
+        # Second manual `hpcport daemon` must exit non-zero WITHOUT overwriting token or pid
+        dup = subprocess.run(
+            [sys.executable, "-m", "hpcport.cli", "--port", str(port), "daemon"],
+            env=env, cwd="/Users/liuce/Desktop/HPCPort",
+            capture_output=True, text=True, timeout=10,
+        )
+        assert dup.returncode != 0
+        assert "already running" in (dup.stderr + dup.stdout)
+        assert config.cli_token_file().read_text(encoding="utf-8").strip() == orig_token
+        assert int(config.daemon_pid_file().read_text(encoding="utf-8").strip()) == orig_pid
+        assert stdio_bridge._daemon_alive(port) is True
+    finally:
+        try:
+            os.kill(orig_pid, 15)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and stdio_bridge._daemon_alive(port):
+            time.sleep(0.05)

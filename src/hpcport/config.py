@@ -206,6 +206,10 @@ def daemon_lock_file() -> Path:
     return run_dir() / "daemon.lock"
 
 
+def daemon_instance_lock_file() -> Path:
+    return run_dir() / "daemon.instance.lock"
+
+
 def staging_dir() -> Path:
     return home() / "staging"
 
