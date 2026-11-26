@@ -18,6 +18,11 @@ def test_executor_markers_strip_banners():
     assert r_fail.rc == 1
     assert "err" in r_fail.err
 
+    # Explicit `exit` inside cmd must NOT terminate the framing shell or lose END marker
+    r_exit = ex.run("echo rejected >&2; exit 42")
+    assert r_exit.rc == 42
+    assert "rejected" in r_exit.err
+
     # Simulated login MOTD banner before and after markers
     wrapped = "WELCOME BANNER\n" + "M_BEGIN\nactual output\nM_END 0\nBYE\n"
     assert _unwrap(wrapped, "M") == (0, "actual output")

@@ -30,7 +30,7 @@ class Result:
 
 
 def _wrap(cmd: str, mark: str) -> str:
-    return ("printf '%%s\\n' %s_BEGIN\n{ %s\n}\n__rc=$?\nprintf '\\n%%s %%d\\n' %s_END \"$__rc\"\n"
+    return ("printf '%%s\\n' %s_BEGIN\n( %s\n)\n__rc=$?\nprintf '\\n%%s %%d\\n' %s_END \"$__rc\"\n"
             % (mark, cmd, mark))
 
 
