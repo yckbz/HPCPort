@@ -573,6 +573,18 @@ class SettingsService:
             self.on_preset_changed(name, old, parsed)
         else:
             old = self.projects.get(name)
+            prev_snapshot = (
+                Project(
+                    name=old.name,
+                    local_dir=old.local_dir,
+                    clusters=dict(old.clusters),
+                    cluster_overrides=dict(old.cluster_overrides),
+                    wake=old.wake,
+                    submit=old.submit,
+                    gateway=old.gateway,
+                )
+                if old is not None else None
+            )
             if old is not None:
                 old.local_dir = parsed.local_dir
                 old.clusters = parsed.clusters
@@ -582,7 +594,7 @@ class SettingsService:
                 old.gateway = parsed.gateway
             else:
                 self.projects[name] = parsed
-            self.on_project_changed(name, old, parsed)
+            self.on_project_changed(name, prev_snapshot, parsed)
         self.on_change()
 
     def _refresh_pending_proposals(self, key: str, cur_data: dict, cur_v: int) -> None:

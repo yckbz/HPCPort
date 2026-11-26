@@ -121,6 +121,23 @@ class JobService:
     def note_root(self, project: str, cluster: str, real: str) -> None:
         self.db.set_meta("root:%s:%s" % (project, cluster), real)
 
+    def clear_roots(self, project: str | None = None, cluster: str | None = None) -> None:
+        rows = self.db.all("SELECT key FROM meta WHERE key LIKE 'root:%'")
+        for row in rows:
+            parts = row["key"].split(":", 2)
+            if len(parts) != 3:
+                continue
+            _, proj, cl = parts
+            if (project is None or proj == project) and (cluster is None or cl == cluster):
+                self.db.delete_meta(row["key"])
+
+    def want_cluster(self, cluster: str) -> None:
+        if self.db.one(
+            "SELECT 1 FROM jobs WHERE cluster = ? AND state = ? LIMIT 1",
+            (cluster, slurm.HELD),
+        ):
+            self._want.add(cluster)
+
     def _real_root(self, project: str, cluster: str) -> str | None:
         return self.db.get_meta("root:%s:%s" % (project, cluster))
 
@@ -203,7 +220,7 @@ class JobService:
                                done_notified=0, created=now)
             else:
                 self.db.update("batches", {"project": project, "batch": batch},
-                               done_notified=0)
+                               done_notified=0, fail_alerted=0)
             env = {
                 "HPCPORT_PROJECT": project,
                 "HPCPORT_BATCH": batch,
@@ -565,8 +582,15 @@ class JobService:
             if j["id"] not in self._frozen and j["id"] not in self._sending
             and (j["id"] not in self._preparing or (only is not None and j["id"] in only))
         ]
-        if only is not None and any(j["id"] not in only for j in held):
-            return None
+        if only is not None:
+            only_set = set(only)
+            cand = next((j for j in held if j["id"] in only_set), None)
+            if cand is None:
+                return None
+            ahead = sum(1 for j in held if j["id"] < cand["id"] and j["id"] not in only_set)
+            if n_active + ahead >= max_jobs:
+                return None
+            return cand
         return held[0] if held else None
 
     def dispatch_wanted(self, skip=()) -> None:
@@ -888,6 +912,8 @@ class JobService:
                 "errors": errors,
                 "approval": approval,
             }
+            for cl_name in {j["cluster"] for j in active}:
+                self.want_cluster(cl_name)
             self.on_change(jobs[0]["project"] if jobs else None)
             return then(r) if then is not None else r
 

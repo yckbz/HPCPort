@@ -230,13 +230,14 @@ def build_mcp(daemon) -> MCPServer:
     ) -> CallToolResult:
         args = dict(cluster=cluster, workdir=workdir, scripts=scripts, desc=desc,
                     batch=batch, tag=tag, wait_s=wait_s)
-        return await run_tool(
-            ctx, "submit", args,
-            lambda p, s, tick: messages.submit_ok(
-                daemon.jobs.submit(p, cluster, workdir, scripts, desc, batch=batch, tag=tag,
-                                   wait_s=wait_s, on_tick=tick)
-            ),
-        )
+        def fn(p, s, tick):
+            res = daemon.jobs.submit(p, cluster, workdir, scripts, desc, batch=batch, tag=tag,
+                                     wait_s=wait_s, on_tick=tick)
+            if res.get("n_held"):
+                daemon.dispatch_soon()
+            return messages.submit_ok(res)
+
+        return await run_tool(ctx, "submit", args, fn)
 
     @tool("jobs", P.TOOL_JOBS)
     async def jobs(
@@ -273,16 +274,24 @@ def build_mcp(daemon) -> MCPServer:
         approval: Annotated[int | None, arg(P.ARG_CANCEL_APPROVAL)] = None,
         cluster: Annotated[str | None, arg(P.ARG_CANCEL_CLUSTER)] = None,
     ) -> CallToolResult:
-        def then(r):
-            daemon.submits.sweep()
-            return messages.cancel_ok(r)
+        def fn(p, s, tick):
+            def then(r):
+                daemon.submits.sweep()
+                daemon.submits.recheck(p)
+                daemon.notify_finished_batches(r.get("ended_pairs") or ())
+                daemon.waits.evaluate(render_result=lambda b: messages.wait_fired(b, daemon))
+                return messages.cancel_ok(r)
+
+            text = daemon.jobs.cancel(p, batch=batch, job_ids=job_ids,
+                                      approval=approval, by="agent", then=then,
+                                      cluster=cluster)
+            daemon.dispatch_soon()
+            return text
 
         return await run_tool(
             ctx, "cancel", {"batch": batch, "job_ids": job_ids, "approval": approval,
                             "cluster": cluster},
-            lambda p, s, tick: daemon.jobs.cancel(p, batch=batch, job_ids=job_ids,
-                                                  approval=approval, by="agent", then=then,
-                                                  cluster=cluster),
+            fn,
         )
 
     @tool("wait_for", P.TOOL_WAIT_FOR)
@@ -745,6 +754,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
         def then(r):
             daemon.submits.sweep()
+            daemon.submits.recheck(d.get("project"))
+            daemon.notify_finished_batches(r.get("ended_pairs") or ())
             for proj, info in (r.get("affected") or {}).items():
                 items = info["cancelled"] + info["ending"] + info["elements"]
                 if not items:
@@ -770,6 +781,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
             d.get("approval"), by="user", note=comment, then=then,
             cluster=d.get("cluster"),
         )
+        daemon.dispatch_soon()
         return JSONResponse({"text": messages.cancel_ok(r), "result": r})
 
     async def poll_api(request):

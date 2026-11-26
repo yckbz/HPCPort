@@ -121,6 +121,7 @@ class Daemon:
             self.ex.pop(name, None)
             self._sync_failures.pop(name, None)
             self._sync_errors.pop(name, None)
+            self.jobs.clear_roots(cluster=name)
             return
         if (old is None and name not in self.ex) or (
             old is not None and (old.connect, old.host) != (new.connect, new.host)
@@ -128,11 +129,21 @@ class Daemon:
             self.ex[name] = self.make_executor(new)
             self._sync_failures.pop(name, None)
             self._sync_errors.pop(name, None)
+            self.jobs.clear_roots(cluster=name)
+        if old is None or new.max_jobs > old.max_jobs:
+            self.jobs.want_cluster(name)
 
     def _on_project_changed(self, name: str, old: Project | None,
                             new: Project | None) -> None:
         self.gateway.clear_facts(project=name)
         if new is not None:
+            if old is not None:
+                for cname, old_cl in old.clusters.items():
+                    new_cl = new.clusters.get(cname)
+                    if new_cl is None or new_cl.root != old_cl.root:
+                        self.jobs.clear_roots(project=name, cluster=cname)
+                    if new_cl is not None and new_cl.max_jobs > old_cl.max_jobs:
+                        self.jobs.want_cluster(cname)
             self.submits.recheck(name)
 
     def update_global_config(self, patch: dict) -> GlobalConfig:
@@ -359,6 +370,25 @@ class Daemon:
         threading.Thread(target=self.jobs.dispatch_wanted, args=(self.unreachable(),),
                          daemon=True, name="dispatch").start()
 
+    def notify_finished_batches(self, pairs) -> None:
+        """Emit batch_done notices once for any (project, batch) pairs that just finished."""
+        for proj, batch in pairs:
+            brow = self.db.one(
+                "SELECT done_notified FROM batches WHERE project = ? AND batch = ?",
+                (proj, batch),
+            )
+            if not brow or brow["done_notified"]:
+                continue
+            s = self.jobs.summary(proj, batch)
+            if s and s["finished"]:
+                self.db.update("batches", {"project": proj, "batch": batch},
+                               done_notified=1)
+                self.waits.notify(
+                    proj, "batch_done", "batch:" + batch,
+                    {"batch": batch, "cluster": s["cluster"], "jobs": s["jobs"],
+                     "n_jobs": s["n_jobs"], "fail_rate": s["fail_rate"]},
+                )
+
     def cycle(self, force: bool = False) -> None:
         """Scan settings, sync each due Slurm cluster once, dispatch held jobs, evaluate waits."""
         with self._cycling:
@@ -398,23 +428,7 @@ class Daemon:
             with self.lock:
                 self.submits.sweep()
                 self.submits.recheck()
-                # Emit batch_done notices for newly finished batches
-                for proj, batch in changed:
-                    brow = self.db.one(
-                        "SELECT done_notified FROM batches WHERE project = ? AND batch = ?",
-                        (proj, batch),
-                    )
-                    if not brow or brow["done_notified"]:
-                        continue
-                    s = self.jobs.summary(proj, batch)
-                    if s and s["finished"]:
-                        self.db.update("batches", {"project": proj, "batch": batch},
-                                       done_notified=1)
-                        self.waits.notify(
-                            proj, "batch_done", "batch:" + batch,
-                            {"batch": batch, "cluster": s["cluster"], "jobs": s["jobs"],
-                             "n_jobs": s["n_jobs"], "fail_rate": s["fail_rate"]},
-                        )
+                self.notify_finished_batches(changed)
                 self.waits.evaluate(render_result=lambda b: messages.wait_fired(b, self))
                 self.waits.purge_expired_tasks()
             self.jobs.dispatch_wanted(skip=self.unreachable())

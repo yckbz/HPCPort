@@ -730,3 +730,92 @@ def test_read_job_files_post_minjobage_log_fallbacks(hpc_home, tmp_path):
     f3 = d.jobs.read_job_files(j3)
     assert "ARRAY_PATTERN_OUT" in f3["stdout"]
     assert not pwn_marker.exists()
+
+
+def test_inline_dispatch_with_other_held_cancel_dispatch_recheck_notice_and_fail_alerted(
+    hpc_home, tmp_path,
+):
+    from hpcport import slurm
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    d.waits.init_cursor("projA", "sessA")
+    wd = remote / "projA" / "sched_edge"
+    for name in ("s0.sh", "s1.sh", "s2.sh", "s3.sh", "s4.sh", "s5.sh"):
+        _write_script(wd / name, ntasks=4, gpus=0, time_s="01:00:00")
+
+    # 1. Disable approval gate and test _next_held with free slots + existing held job
+    d.settings.update_project("projA", {"submit": {"approval": False}})
+    r_init = d.jobs.submit("projA", "gpu01", str(wd), ["s0.sh", "s1.sh", "s2.sh"], desc="fill", batch="b_fill")
+    assert r_init["n_sent"] == 2 and r_init["n_held"] == 1  # max_jobs=2
+
+    # Raise max_jobs to 4 -> _on_project_changed marks gpu01 wanted; do NOT dispatch yet
+    d.settings.update_project(
+        "projA",
+        {"clusters": {"gpu01": {"root": str(remote / "projA"), "max_jobs": 4}}},
+    )
+    assert "gpu01" in d.jobs._want
+    # With 2 free slots and 1 earlier held job (s2.sh), a new submit s3.sh reserves 1 slot for s2.sh
+    # and still dispatches s3.sh inline into the remaining free slot!
+    r_new = d.jobs.submit("projA", "gpu01", str(wd), ["s3.sh"], desc="new inline", batch="b_new")
+    assert r_new["n_sent"] == 1 and r_new["n_held"] == 0
+
+    # Now dispatch_wanted sends the reserved earlier held job s2.sh -> fills 4/4 slots
+    d.jobs.dispatch_wanted()
+    rows_fill = d.jobs.job_rows("projA", "b_fill")
+    assert all(j["slurm_id"] is not None for j in rows_fill)
+
+    # 2. Submit s4.sh while 4/4 full -> held. Cancelling s0.sh frees a slot and marks cluster wanted.
+    r_h = d.jobs.submit("projA", "gpu01", str(wd), ["s4.sh"], desc="wait slot", batch="b_wait")
+    assert r_h["n_held"] == 1
+    d.jobs._want.clear()
+    d.jobs.cancel("projA", job_ids=[r_init["ids"][0]])
+    assert "gpu01" in d.jobs._want
+    d.jobs.dispatch_wanted()
+    assert d.jobs.job_rows("projA", "b_wait")[0]["slurm_id"] is not None
+
+    # 3. Cancelling remaining jobs in b_new emits batch_done via notify_finished_batches
+    d.waits.pop_notices("projA", "sessA")
+    cr = d.jobs.cancel("projA", batch="b_new")
+    with d.lock:
+        d.notify_finished_batches(cr["ended_pairs"])
+    notices = d.waits.pop_notices("projA", "sessA")
+    assert any(n["reason"] == "batch_done" and n["subject"] == "batch:b_new" for n in notices)
+
+    # 4. Two concurrent waits on the same failing batch both fire in one evaluate(),
+    #    and appending a new job resets fail_alerted!
+    with d.lock:
+        w1 = d.waits.register("projA", "s1", groups=[{"items": ["b_fill"], "priority": 1}], fail_frac=0.1)
+        w2 = d.waits.register("projA", "s2", groups=[{"items": ["b_fill"], "priority": 1}], fail_frac=0.1)
+    ex.finish(r_init["ids"][1], "FAILED", "1:0", run_s=10.0)
+    d.cycle(force=True)
+    assert d.db.one("SELECT state FROM waits WHERE id = ?", (w1["id"],))["state"] == "fired"
+    assert d.db.one("SELECT state FROM waits WHERE id = ?", (w2["id"],))["state"] == "fired"
+    assert d.db.one("SELECT fail_alerted FROM batches WHERE project = 'projA' AND batch = 'b_fill'")["fail_alerted"] == 1
+
+    # Appending s5.sh resets fail_alerted back to 0
+    d.jobs.submit("projA", "gpu01", str(wd), ["s5.sh"], desc="append", batch="b_fill")
+    assert d.db.one("SELECT fail_alerted FROM batches WHERE project = 'projA' AND batch = 'b_fill'")["fail_alerted"] == 0
+
+    # 5. recheck() auto-releasing a non-inline waiting approval emits submit_approved notice!
+    d.settings.update_project("projA", {"submit": {"approval": True}})
+    d.jobs.cancel("projA", batch="b_fill")
+    d.jobs.cancel("projA", batch="b_wait")
+    _write_script(wd / "a1.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    _write_script(wd / "a2.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    _write_script(wd / "a3.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    ra1 = d.jobs.submit("projA", "gpu01", str(wd), ["a1.sh"], desc="grant", wait_s=0)
+    with d.lock:
+        d.approvals.decide(ra1["approval"], True, always=True, total_core_hours=5.0)
+    d.jobs.dispatch_wanted()
+    ra2 = d.jobs.submit("projA", "gpu01", str(wd), ["a2.sh"], desc="uses 4", wait_s=0)
+    ra3 = d.jobs.submit("projA", "gpu01", str(wd), ["a3.sh"], desc="waits over", wait_s=0)
+    assert ra3["approval"] is not None
+    d.waits.pop_notices("projA", "sessA")
+    ex.finish(ra2["ids"][0], "COMPLETED", "0:0", run_s=36.0)
+    d.cycle(force=True)
+    n_auto = d.waits.pop_notices("projA", "sessA")
+    assert any(
+        n["reason"] == "submit_approved" and n["body"]["approval"] == ra3["approval"]
+        for n in n_auto
+    )
+    assert d.jobs.job_rows("projA", ra3["batch"])[0]["state"] == slurm.QUEUED

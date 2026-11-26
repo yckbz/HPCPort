@@ -328,6 +328,7 @@ class WaitService:
     def evaluate(self, render_result=None) -> list[dict]:
         """Evaluate all active waits under state lock; update linked tasks & sync waiters."""
         fired = []
+        fail_batches: set[tuple[str, str]] = set()
         for w in self.db.all("SELECT * FROM waits WHERE state = 'active' ORDER BY id"):
             body = self.check(w)
             if body is None:
@@ -339,8 +340,7 @@ class WaitService:
                                    status_message=self.progress_message(w), updated=self.now())
                 continue
             if body["reason"] == "fail":
-                self.db.update("batches", {"project": w["project"], "batch": body["batch"]},
-                               fail_alerted=1)
+                fail_batches.add((w["project"], body["batch"]))
             self.db.update("waits", {"id": w["id"]}, state="fired",
                            result=json.dumps(body, ensure_ascii=False))
             rendered = render_result(body) if render_result else json.dumps(body)
@@ -367,6 +367,8 @@ class WaitService:
                     body,
                 )
             fired.append(body)
+        for proj, batch in fail_batches:
+            self.db.update("batches", {"project": proj, "batch": batch}, fail_alerted=1)
         return fired
 
     # ------------------------------------------------------------------ sync short wait

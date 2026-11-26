@@ -214,6 +214,13 @@ class SubmitApprovals:
                                                auto_released=True)
                     if not inline:
                         self.jobs.want_approval(aid)
+                        self.notify(
+                            pname,
+                            "submit_approved",
+                            "approval:%d" % aid,
+                            {"approval": aid, "batches": batches, "comment": RELEASED,
+                             "standing": False, "auto_released": True},
+                        )
                     log.info("submission approval %d (%s) auto-released", aid, pname)
                     continue
                 summary = self.describe(pname, sub, now)
