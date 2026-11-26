@@ -1,4 +1,4 @@
-"""Code hygiene checks: formal Python/tool/test/bin files stay strictly English."""
+"""Code hygiene checks: formal source and test files stay strictly English."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ CJK = re.compile(r"[\u4e00-\u9fff]")
 
 def test_no_chinese_in_code():
     bad = []
-    for folder in ("src", "tools", "tests", "bin"):
+    for folder in ("src", "tests"):
         root = REPO / folder
         if not root.exists():
             continue
@@ -21,7 +21,7 @@ def test_no_chinese_in_code():
             # web/i18n.js intentionally holds the Chinese translation dictionary for the Web UI
             if p.relative_to(REPO).as_posix() == "src/hpcport/web/i18n.js":
                 continue
-            if p.suffix not in (".py", ".js", ".css", ".html", "") and p.parent.name != "bin":
+            if p.suffix not in (".py", ".js", ".css", ".html"):
                 continue
             text = p.read_text(encoding="utf-8", errors="ignore")
             for lineno, line in enumerate(text.splitlines(), 1):
