@@ -9,6 +9,7 @@ child cleanup, head+tail output truncation, and guard.py safety checks.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -153,31 +154,73 @@ def exec_result(st: dict, log_path: str) -> dict:
     }
 
 
+def _ci_glob(name: str) -> str:
+    """Case-insensitive glob pattern for rsync excludes (protects case-insensitive FS like APFS)."""
+    return "".join("[%s%s]" % (c.lower(), c.upper()) if c.isalpha() else c for c in name)
+
+
+def _stored_output(op: dict) -> str:
+    res = op.get("result") or {}
+    head = res.get("head") or ""
+    tail = res.get("tail") or ""
+    if res.get("truncated") and tail:
+        return head + ("\n... (truncated; full remote log unavailable) ...\n" if head else "") + tail
+    return head
+
+
 class _Transfer:
-    def __init__(self, legs: list[list[str]], limit_s: float, cleanup=None):
+    def __init__(self, legs: list[list[str]], limit_s: float, cleanup=None,
+                 stage_dir: Path | None = None, stage_lock: threading.Lock | None = None):
         self.legs = legs
         self.limit_s = limit_s
         self.cleanup = cleanup
+        self.stage_dir = stage_dir
+        self.stage_lock = stage_lock
         self.done = threading.Event()
         self.stop = threading.Event()
         self.result: dict | None = None
 
-    def run(self) -> None:
+    def run(self, slots: threading.Semaphore | None = None) -> None:
         t0 = time.monotonic()
         res = {"rc": 0, "timeout": False, "stopped": False, "error": "", "leg": None}
+        lock_held = False
         try:
-            for k, argv in enumerate(self.legs, 1):
-                rc, err = self._leg(argv, t0, res)
-                if rc != 0:
-                    res.update(rc=rc, error=err.strip()[-1500:],
-                               leg=k if len(self.legs) > 1 else None)
-                    break
+            if self.stage_lock is not None:
+                while not self.stage_lock.acquire(timeout=0.2):
+                    over = time.monotonic() - t0 > self.limit_s
+                    if over or self.stop.is_set():
+                        res["timeout" if over and not self.stop.is_set() else "stopped"] = True
+                        res["rc"] = -1
+                        res["elapsed"] = time.monotonic() - t0
+                        self.result = res
+                        self.done.set()
+                        return
+                lock_held = True
+            if self.stop.is_set():
+                res.update(rc=-1, stopped=True)
             else:
-                if self.cleanup:
-                    self.cleanup()
+                ctx = slots if slots is not None else contextlib.nullcontext()
+                with ctx:
+                    if self.stop.is_set():
+                        res.update(rc=-1, stopped=True)
+                    else:
+                        if self.stage_dir is not None:
+                            self.stage_dir.mkdir(parents=True, exist_ok=True)
+                        for k, argv in enumerate(self.legs, 1):
+                            rc, err = self._leg(argv, t0, res)
+                            if rc != 0:
+                                res.update(rc=rc, error=err.strip()[-1500:],
+                                           leg=k if len(self.legs) > 1 else None)
+                                break
+                        else:
+                            if self.cleanup:
+                                self.cleanup()
         except Exception as e:
             log.exception("transfer failed")
             res.update(rc=-1, error=str(e))
+        finally:
+            if lock_held and self.stage_lock is not None:
+                self.stage_lock.release()
         res["elapsed"] = time.monotonic() - t0
         self.result = res
         self.done.set()
@@ -230,6 +273,7 @@ class GatewayService:
         self._misses: dict[int, int] = {}
         self._next_poll: dict[str, float] = {}
         self._slots: dict[str, threading.Semaphore] = {}
+        self._stage_locks: dict[str, threading.Lock] = {}
         self._transfer_slots = threading.BoundedSemaphore(TRANSFER_SLOTS)
         self._polling = threading.Lock()
         self.on_change = lambda project=None: None
@@ -364,8 +408,8 @@ class GatewayService:
             raise GatewayError("local_outside", path=path, project_dir=str(root))
         if dest:
             for target in [full] + ([full / name] if name else []):
-                rel = target.relative_to(root).as_posix()
-                if any(rel == b or rel.startswith(b + "/") for b in LOCAL_PROTECTED):
+                rel = target.relative_to(root).as_posix().lower()
+                if any(rel == b.lower() or rel.startswith(b.lower() + "/") for b in LOCAL_PROTECTED):
                     raise GatewayError("local_protected", path=path)
         return full
 
@@ -624,7 +668,12 @@ class GatewayService:
             raise GatewayError("unknown_op", id=op_id)
         if op["kind"] != "exec" or not op["dir"]:
             return {"op": op, "output": ""}
+        res = op.get("result") or {}
+        if op["state"] != "running" and (op.get("cleaned") or not res.get("truncated")):
+            return {"op": op, "output": _stored_output(op)}
         if op["cluster"] not in self.ex:
+            if op["state"] != "running":
+                return {"op": op, "output": _stored_output(op)}
             raise GatewayError("unknown_cluster", cluster=op["cluster"], clusters="")
         q = shlex.quote
         try:
@@ -633,8 +682,13 @@ class GatewayService:
                           % (max_bytes, q(op["dir"] + "/out")),
                           timeout=30)
         except TransportError as e:
+            if op["state"] != "running":
+                return {"op": op, "output": _stored_output(op)}
             raise GatewayError("unreachable", cluster=op["cluster"], error=str(e))
-        return {"op": op, "output": r.out}
+        out = r.out
+        if not out and op["state"] != "running":
+            out = _stored_output(op)
+        return {"op": op, "output": out}
 
     # ------------------------------------------------------------------ poll & recover
     def poll(self) -> list[int]:
@@ -762,17 +816,26 @@ class GatewayService:
                 wait_s=min(self.permissions.wait_s, p.gateway.wait_s), on_tick=on_tick,
             )
         cleanup = None
+        stage_dir: Path | None = None
+        stage_lock: threading.Lock | None = None
         if a["cluster"] is not None and b["cluster"] is not None:
             tag = hashlib.sha256(("%s\0%s\0%s" % (project, a["text"], b["text"])).encode()).hexdigest()[:12]
-            stage = staging_dir() / tag
-            stage.mkdir(parents=True, exist_ok=True)
-            mid = str(stage) + "/" + ("_/" if base is None else "")
-            back = str(stage) + "/" + ("_/" if base is None else base)
+            stage_dir = staging_dir() / tag
+            with self.lock:
+                stage_lock = self._stage_locks.setdefault(tag, threading.Lock())
+            mid = str(stage_dir) + "/" + ("_/" if base is None else "")
+            back = str(stage_dir) + "/" + ("_/" if base is None else base)
             legs = [self._rsync([a["spec"]], mid, a["rsh"], exclude),
                     self._rsync([back], b["spec"], b["rsh"], exclude)]
-            cleanup = lambda: shutil.rmtree(stage, ignore_errors=True)
+            cleanup = lambda s=stage_dir: shutil.rmtree(s, ignore_errors=True)
         else:
-            legs = [self._rsync([a["spec"]], b["spec"], a["rsh"] or b["rsh"], exclude)]
+            eff_exclude = list(exclude)
+            if (b["cluster"] is None and base is None and p.local_dir is not None
+                    and Path(b["path"].rstrip("/")).resolve() == p.local_dir.resolve()):
+                for prot in LOCAL_PROTECTED:
+                    pat = "/" + _ci_glob(prot)
+                    eff_exclude = [pat, pat + "/**"] + eff_exclude
+            legs = [self._rsync([a["spec"]], b["spec"], a["rsh"] or b["rsh"], eff_exclude)]
         with self.lock:
             if background:
                 self._room(p)
@@ -783,7 +846,7 @@ class GatewayService:
                 cluster=",".join(dict.fromkeys(e["cluster"] for e in (a, b) if e["cluster"])),
                 state="running", started=self.now(),
             )
-            job = _Transfer(legs, limit, cleanup)
+            job = _Transfer(legs, limit, cleanup, stage_dir=stage_dir, stage_lock=stage_lock)
             self._transfers[op_id] = job
             self._inline.add(op_id)
             self.on_change(project)
@@ -821,8 +884,7 @@ class GatewayService:
                 self._inline.discard(op_id)
 
     def _transfer_thread(self, op_id: int, job: _Transfer) -> None:
-        with self._transfer_slots:
-            job.run()
+        job.run(self._transfer_slots)
         with self.lock:
             if op_id in self._inline:
                 return

@@ -295,3 +295,57 @@ def test_gateway_foreground_heartbeats_fast_stop_and_poll_lock(hpc_home, tmp_pat
         assert overlap == []
     finally:
         d.gateway._poll_once = orig_poll_once
+
+
+def test_transfer_protects_local_git_stored_output_fallback_and_staging_lock(hpc_home, tmp_path):
+    d, _, local_dir, remote = _setup_gateway(hpc_home, tmp_path)
+    (local_dir / ".git" / "hooks").mkdir(parents=True)
+    (local_dir / ".git" / "config").write_text("SAFE_GIT_CONFIG", encoding="utf-8")
+
+    # 1. Trailing-slash download into local project root MUST NOT overwrite .git (or .GIT)
+    evil = remote / "p1_bare" / "evil"
+    (evil / ".git").mkdir(parents=True)
+    (evil / ".git" / "config").write_text("PWNED_LOWER", encoding="utf-8")
+    (evil / "good.txt").write_text("OK_FILE", encoding="utf-8")
+    r_tr = d.gateway.transfer("p1", "bare1:evil/", ".")
+    assert r_tr["status"] == "ended" and r_tr["op"]["result"]["rc"] == 0
+    assert (local_dir / ".git" / "config").read_text(encoding="utf-8") == "SAFE_GIT_CONFIG"
+    assert (local_dir / "good.txt").read_text(encoding="utf-8") == "OK_FILE"
+
+    with pytest.raises(GatewayError) as exc_git:
+        d.gateway.transfer("p1", "bare1:evil/good.txt", ".GIT/config")
+    assert exc_git.value.code == "local_protected"
+
+    # 2. read_output falls back to stored SQLite output after subsequent exec cleans op dir
+    r1 = d.gateway.exec("p1", "bare1", "echo STORED_LOG_LINE")
+    oid1 = r1["op"]["id"]
+    d.gateway.exec("p1", "bare1", "echo trigger_cleanup")
+    out1 = d.gateway.read_output(oid1)
+    assert "STORED_LOG_LINE" in out1["output"]
+
+    # 3. Concurrent cluster-to-cluster transfers on same (src, dst) serialize via stage lock
+    d.settings.create_preset("bare2", {
+        "connect": "local", "scheduler": "none", "projects_root": str(remote),
+    })
+    d.attach_cluster("p1", "bare2", root=str(remote / "p1_bare2"))
+    src_dir = remote / "p1_bare" / "c2c"
+    src_dir.mkdir(parents=True)
+    (src_dir / "payload.bin").write_text("A" * 4096, encoding="utf-8")
+
+    results = []
+    errors = []
+
+    def do_c2c():
+        try:
+            results.append(d.gateway.transfer("p1", "bare1:c2c/", "bare2:c2c_out/"))
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=do_c2c)
+    t2 = threading.Thread(target=do_c2c)
+    t1.start(); t2.start()
+    t1.join(timeout=15); t2.join(timeout=15)
+    assert not errors
+    assert len(results) == 2
+    assert all(r["status"] == "ended" and r["op"]["result"]["rc"] == 0 for r in results)
+    assert (remote / "p1_bare2" / "c2c_out" / "payload.bin").read_text(encoding="utf-8") == "A" * 4096
