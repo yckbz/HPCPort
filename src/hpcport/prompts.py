@@ -120,6 +120,10 @@ Enters the user's Web approval queue with a field-by-field diff; takes effect on
 ARG_CHANGES = "Mapping of preset fields to new values (`null` removes a field). Only include fields you intend to change."
 ARG_PROPOSAL_SUMMARY = "Concise one-line explanation of why this preset change is proposed."
 
+TOOL_INFO = """\
+Return the current project's compute servers (Slurm clusters and bare SSH servers), remote root directories, allowed partitions, concurrency limits, usage guides, and standing budget status.
+Call this once at the start of a session before running commands or submitting jobs."""
+
 TOOL_OPEN_DASHBOARD = """\
 Open the authenticated HPCPort Web dashboard directly in the user's browser so the user can review jobs, inspect logs, manage presets, or approve pending requests.
 Use this whenever approval is pending or the user asks to open the dashboard."""
@@ -253,4 +257,19 @@ ERRORS = {
     "no_effect": "The proposed changes match the current approved preset (no effective change).",
     "unknown_setting": "Unknown setting `{key}`.",
     "undecided_file_edit": "Setting `{key}` has an undecided disk edit (proposal #{proposal}); resolve it first.",
+    "preset_exists": "Server preset `{cluster}` already exists.",
+    "preset_in_use": "Server preset `{cluster}` is still attached to project(s): {projects}. Detach it first.",
+    "project_exists": "Project `{project}` already exists.",
+    "unknown_version": "Version v{version} does not exist for `{key}`.",
+    "unknown_approval": "Unknown approval #{id}.",
+    "already_decided": "Approval #{id} was already {state}.",
+    "bad_option": "{msg}",
+    "bad_limit": "Invalid budget limit for `{name}` (must be a non-negative number or null).",
+    "limits_without_always": "Budget limits ({names}) can only be supplied together with standing approval (`always=true`).",
+    "invalid_setting": "Invalid setting in approval #{id}: {msg}",
+    "missing_setting": "Setting file missing for approval #{id}: {msg}",
+    "stale": "Proposal in approval #{id} is stale: {msg}",
+    "changed": "Disk file changed since approval #{id} was created: {msg}",
+    "ambiguous_batch": "Batch `{batch}` exists in multiple projects ({projects}); specify `project`.",
+    "cluster_busy": "Cannot detach `{cluster}` from `{project}` while active jobs or background operations are running.",
 }

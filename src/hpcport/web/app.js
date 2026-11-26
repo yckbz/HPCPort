@@ -225,9 +225,11 @@ function connectSSE() {
     document.getElementById("sse-label").textContent = i18n.t("liveConnected");
   });
 
-  const onUpdate = () => scheduleRefresh();
-  es.addEventListener("state", onUpdate);
-  es.addEventListener("approval", () => {
+  const onUpdate = () => scheduleRefresh(false);
+  es.addEventListener("settings_changed", onUpdate);
+  es.addEventListener("jobs_changed", onUpdate);
+  es.addEventListener("ops_changed", onUpdate);
+  es.addEventListener("approvals_changed", () => {
     scheduleRefresh(true);
   });
 
@@ -369,13 +371,17 @@ function renderReasonChip(r) {
   if (code === "no_standing") {
     return `<span class="pill pill-blue">${esc(i18n.t("reason_no_standing"))}</span>`;
   }
-  if (r.rule) {
-    const key = "guardRule_" + r.rule;
+  if (code === "size") {
+    return `<span class="pill pill-amber">${esc(i18n.t("guardRule_size"))}: ${fmtNum(r.size, 2)} GB &gt; ${fmtNum(r.limit)} GB</span>`;
+  }
+  if (code) {
+    const key = "guardRule_" + code;
     const translated = i18n.t(key);
     const desc = translated !== key ? translated : (r.detail || "");
-    return `<span class="pill pill-amber">${esc(r.rule)}${desc ? ": " + esc(desc) : ""}</span>`;
+    const target = r.what ? ` (${r.what})` : "";
+    return `<span class="pill pill-amber">${esc(code)}${desc ? ": " + esc(desc) : ""}${esc(target)}</span>`;
   }
-  return `<span class="pill pill-gray">${esc(code || JSON.stringify(r))}</span>`;
+  return `<span class="pill pill-gray">${esc(JSON.stringify(r))}</span>`;
 }
 
 function renderUnifiedDiff(text) {
@@ -764,10 +770,9 @@ function renderStandingCard(standing) {
       <div class="budget-grid">
         ${bars.map((b) => {
           const total = used ? (used[b.key] || 0) : 0;
-          const parts = (used && used.parts && used.parts[b.key]) || {};
-          const done = parts.done || 0;
-          const active = parts.active || 0;
-          const wait = parts.waiting || 0;
+          const done = (used && used.measured && used.measured[b.key]) || 0;
+          const wait = (used && used.waiting && used.waiting[b.key]) || 0;
+          const active = Math.max(0, total - done - wait);
           const denom = b.limit && b.limit > 0 ? b.limit : Math.max(total, 1);
           const pDone = Math.min(100, (done / denom) * 100);
           const pAct = Math.min(100 - pDone, (active / denom) * 100);
@@ -840,7 +845,7 @@ function renderJobs() {
         <strong>${esc(i18n.t("unregBannerTitle"))}</strong>
         <div class="text-sm" style="margin-top:4px">${esc(i18n.t("unregBannerDesc"))}</div>
         <div class="mono text-xs" style="margin-top:6px">
-          ${unreg.map((u) => `${esc(u.cluster)}:${esc(u.slurm_id)} (${esc(u.state || "?")})`).join("  |  ")}
+          ${unreg.map((u) => `${esc(u.cluster)}:${esc(u.slurm_id)} (${esc(u.workdir || "-")})`).join("  |  ")}
         </div>
       </div>
     `;
@@ -993,7 +998,7 @@ function renderJobs() {
                                 <td>
                                   <div class="flex-row" style="gap:6px">
                                     <button type="button" class="btn btn-subtle btn-xs" data-inspect-job="${j.id}">${esc(i18n.t("inspectFiles"))}</button>
-                                    ${["unapproved", "held", "queued", "running"].includes(j.state) ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-job="${j.id}" data-job-project="${esc(j.project)}">${esc(i18n.t("cancelJob"))}</button>` : ""}
+                                    ${["unapproved", "held", "queued", "running"].includes(j.state) ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-job="${esc(j.slurm_id || ("#" + j.id))}" data-job-project="${esc(j.project)}">${esc(i18n.t("cancelJob"))}</button>` : ""}
                                   </div>
                                 </td>
                               </tr>
@@ -1253,7 +1258,7 @@ function renderDrawerContent() {
 function renderAudit() {
   const el = document.getElementById("view-audit");
   const rows = state.auditRows || [];
-  const tools = ["submit", "remote_exec", "transfer", "remote_stop", "jobs", "cancel", "wait_for", "propose_preset", "open_dashboard"];
+  const tools = ["info", "submit", "remote_exec", "transfer", "remote_stop", "jobs", "cancel", "wait_for", "propose_preset", "open_dashboard"];
   el.innerHTML = `
     <div class="page-header">
       <div>
@@ -1484,6 +1489,23 @@ function renderSettings() {
     btn.onclick = () => openAttachModal(btn.dataset.attachProject);
   });
 
+  el.querySelectorAll("[data-detach-cluster]").forEach((btn) => {
+    btn.onclick = async () => {
+      const [proj, cluster] = btn.dataset.detachCluster.split("::");
+      btn.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(proj)}/clusters/${encodeURIComponent(cluster)}`, {
+          method: "DELETE",
+        });
+        toast(i18n.t("detachedToast", { cluster, project: proj }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    };
+  });
+
   el.querySelectorAll("[data-snippet-tab]").forEach((btn) => {
     btn.onclick = () => {
       const [proj, agent] = btn.dataset.snippetTab.split("::");
@@ -1577,7 +1599,10 @@ function renderProjectCard(p) {
           <div class="flex-row" style="gap:8px">
             ${cnames.map((cn) => `
               <div class="metric-chip" style="min-width:auto">
-                <span class="k">${esc(cn)}${clusters[cn].max_jobs ? ` (max ${clusters[cn].max_jobs})` : ""}</span>
+                <div class="flex-between" style="gap:8px">
+                  <span class="k">${esc(cn)}${clusters[cn].max_jobs ? ` (max ${clusters[cn].max_jobs})` : ""}</span>
+                  <button type="button" class="btn btn-danger btn-xs" style="padding:1px 6px;font-size:11px" data-detach-cluster="${esc(p.name)}::${esc(cn)}">${esc(i18n.t("detachBtn"))}</button>
+                </div>
                 <span class="mono text-xs">${esc(clusters[cn].root)}</span>
               </div>
             `).join("")}
@@ -1625,13 +1650,13 @@ function renderProjectCard(p) {
             <input type="number" step="1" min="0" max="180" name="wake_wait_s" value="${esc(d.wake?.default_wait_s ?? 180)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyFailFrac"))}
-            <input type="number" step="0.05" min="0" max="1" name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.2)}" />
+            <input type="number" step="0.05" min="0" max="1" name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.1)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTimeoutH"))}
             <input type="number" step="1" min="1" name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTransferGb"))}
-            <input type="number" step="0.5" min="0" name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 2)}" />
+            <input type="number" step="0.5" min="0" name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 5)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyMaxBg"))}
             <input type="number" step="1" min="0" name="gw_max_bg" value="${esc(d.gateway?.max_background ?? 4)}" />
@@ -1694,7 +1719,7 @@ function openPresetModal(presetObj) {
             <option value="local"${d.connect === "local" ? " selected" : ""}>${esc(i18n.t("optLocal"))}</option>
           </select>
         </label>
-        <label class="field-label form-full">${esc(i18n.t("fieldHost"))}
+        <label class="field-label form-full" data-connect-ssh>${esc(i18n.t("fieldHost"))}
           <input type="text" name="host" value="${esc(d.host || "")}" placeholder="login.cluster.edu" />
           <span class="field-hint">${esc(i18n.t("fieldHostHint"))}</span>
         </label>
@@ -1702,16 +1727,16 @@ function openPresetModal(presetObj) {
           <input type="text" name="projects_root" value="${esc(d.projects_root || "")}" placeholder="/scratch/alice/hpcport" />
           <span class="field-hint">${esc(i18n.t("fieldProjectsRootHint"))}</span>
         </label>
-        <label class="field-label">${esc(i18n.t("fieldPartitions"))}
+        <label class="field-label" data-slurm-only>${esc(i18n.t("fieldPartitions"))}
           <input type="text" name="partitions" value="${esc((d.partitions || []).join(", "))}" placeholder="a100, cpu" />
         </label>
-        <label class="field-label">${esc(i18n.t("fieldMaxJobs"))}
+        <label class="field-label" data-slurm-only>${esc(i18n.t("fieldMaxJobs"))}
           <input type="number" min="1" name="max_jobs" value="${esc(d.max_jobs ?? 10)}" />
         </label>
-        <label class="field-label">${esc(i18n.t("fieldCoresPerNode"))}
+        <label class="field-label" data-slurm-only>${esc(i18n.t("fieldCoresPerNode"))}
           <input type="number" min="1" name="cores_per_node" value="${esc(d.cores_per_node ?? "")}" />
         </label>
-        <label class="field-label">${esc(i18n.t("fieldPollInterval"))}
+        <label class="field-label" data-slurm-only>${esc(i18n.t("fieldPollInterval"))}
           <input type="number" min="5" name="poll_interval_s" value="${esc(d.poll_interval_s ?? 120)}" />
         </label>
         <label class="field-label">${esc(i18n.t("fieldExecTimeout"))}
@@ -1737,7 +1762,7 @@ function openPresetModal(presetObj) {
         <label class="field-label form-full">${esc(i18n.t("fieldGuide"))}
           <textarea name="guide" rows="3" placeholder="module load cuda/12.2 ...">${esc(d.guide || "")}</textarea>
         </label>
-        <label class="field-label form-full">${esc(i18n.t("fieldJobTemplate"))}
+        <label class="field-label form-full" data-slurm-only>${esc(i18n.t("fieldJobTemplate"))}
           <textarea name="job_template" rows="3" class="mono" placeholder="#!/bin/bash&#10;#SBATCH --partition=a100">${esc(d.job_template || "")}</textarea>
         </label>
         <div class="modal-footer form-full">
@@ -1775,6 +1800,16 @@ function openPresetModal(presetObj) {
 
     const form = document.getElementById("preset-form");
     if (form) {
+      const syncVisibility = () => {
+        const isSlurm = form.querySelector('select[name="scheduler"]').value === "slurm";
+        const isSsh = form.querySelector('select[name="connect"]').value === "ssh";
+        form.querySelectorAll("[data-slurm-only]").forEach((node) => node.classList.toggle("hidden", !isSlurm));
+        form.querySelectorAll("[data-connect-ssh]").forEach((node) => node.classList.toggle("hidden", !isSsh));
+      };
+      form.querySelector('select[name="scheduler"]').onchange = syncVisibility;
+      form.querySelector('select[name="connect"]').onchange = syncVisibility;
+      syncVisibility();
+
       form.onsubmit = async (e) => {
         e.preventDefault();
         const fd = new FormData(form);
@@ -1886,6 +1921,16 @@ function openNewProjectModal() {
 
 function openAttachModal(projectName) {
   const presets = (state.snapshot && state.snapshot.presets) || [];
+  if (!presets.length) {
+    openModal(i18n.t("attachModalTitle", { project: projectName }), `
+      <p class="muted text-sm" style="margin-top:0">${esc(i18n.t("noPresetsToAttach"))}</p>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary btn-sm" id="at-ok">${esc(i18n.t("close"))}</button>
+      </div>
+    `);
+    document.getElementById("at-ok").onclick = closeModal;
+    return;
+  }
   openModal(i18n.t("attachModalTitle", { project: projectName }), `
     <form id="attach-form" class="form-grid">
       <label class="field-label form-full">${esc(i18n.t("fieldSelectServer"))}

@@ -279,6 +279,7 @@ class JobService:
             "n_held": sum(1 for j in jobs if j["state"] == slurm.HELD),
             "ids": [j["slurm_id"] for j in jobs if j["slurm_id"]],
             "approval": approval if pending_approval else None,
+            "approval_id": approval,
             "approved_inline": approved_inline,
             "refused_inline": refused_inline,
             "refuse_comment": refuse_comment,
@@ -597,6 +598,9 @@ class JobService:
                 rows = self.db.all("SELECT project FROM batches WHERE batch = ?", (batch,))
                 if not rows:
                     raise JobError("unknown_batch", batch=batch)
+                if len(rows) > 1:
+                    raise JobError("ambiguous_batch", batch=batch,
+                                   projects=", ".join(sorted(r["project"] for r in rows)))
                 project = rows[0]["project"]
             if not self.db.one("SELECT 1 FROM batches WHERE project = ? AND batch = ?",
                                (project, batch)):
@@ -680,10 +684,12 @@ class JobService:
                                  "scontrol", ctl["start"], ctl["end"], ctl["elapsed"])
 
     def _named(self, project: str | None, job_ids):
-        whole, elements, unknown = [], {}, []
+        whole, internal, elements, unknown = [], [], {}, []
         for i in dict.fromkeys(str(i).strip() for i in job_ids):
             m = ELEMENT_RE.match(i)
-            if i.isdigit():
+            if i.startswith("#") and i[1:].isdigit():
+                internal.append(int(i[1:]))
+            elif i.isdigit():
                 whole.append(i)
             elif m:
                 elements.setdefault(m.group(1), []).append(i)
@@ -692,20 +698,35 @@ class JobService:
         for i in whole:
             elements.pop(i, None)
         ids = whole + list(elements)
+        jobs_by_id: dict[int, dict] = {}
         if ids:
             if project is not None:
-                jobs = self.db.all(
+                found = self.db.all(
                     "SELECT * FROM jobs WHERE project = ? AND slurm_id IN (%s) ORDER BY id"
                     % slurm.marks(ids), (project,) + tuple(ids))
             else:
-                jobs = self.db.all(
+                found = self.db.all(
                     "SELECT * FROM jobs WHERE slurm_id IN (%s) ORDER BY id" % slurm.marks(ids),
                     tuple(ids))
-        else:
-            jobs = []
-        known = {j["slurm_id"] for j in jobs}
-        unknown += [i for i in whole if i not in known]
-        unknown += [e for i, es in elements.items() if i not in known for e in es]
+            for j in found:
+                jobs_by_id[j["id"]] = j
+        if internal:
+            if project is not None:
+                found_i = self.db.all(
+                    "SELECT * FROM jobs WHERE project = ? AND id IN (%s) ORDER BY id"
+                    % slurm.marks(internal), (project,) + tuple(internal))
+            else:
+                found_i = self.db.all(
+                    "SELECT * FROM jobs WHERE id IN (%s) ORDER BY id" % slurm.marks(internal),
+                    tuple(internal))
+            for j in found_i:
+                jobs_by_id[j["id"]] = j
+        jobs = [jobs_by_id[k] for k in sorted(jobs_by_id)]
+        known_slurm = {j["slurm_id"] for j in jobs if j["slurm_id"]}
+        known_int = {j["id"] for j in jobs}
+        unknown += [i for i in whole if i not in known_slurm]
+        unknown += ["#%d" % i for i in internal if i not in known_int]
+        unknown += [e for i, es in elements.items() if i not in known_slurm for e in es]
         if unknown:
             raise JobError("unknown_jobs", ids=", ".join(unknown))
         return jobs, elements

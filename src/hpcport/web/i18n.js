@@ -97,6 +97,10 @@ export const MESSAGES = {
     guardRule_crontab: "Modifies scheduled tasks (crontab / at)",
     guardRule_remote: "Nested remote command (ssh / scp / rsync)",
     guardRule_killall: "Broadcast process termination (killall / pkill)",
+    guardRule_size: "Transfer size exceeds limit",
+    detachBtn: "Detach",
+    detachedToast: "Detached {cluster} from {project}",
+    noPresetsToAttach: "No server presets configured yet. Click \"Add Server\" above first.",
 
     // Overview & Jobs
     overviewTitle: "Overview & Compute Jobs",
@@ -371,6 +375,10 @@ export const MESSAGES = {
     guardRule_crontab: "修改计划任务（crontab / at）",
     guardRule_remote: "嵌套远程连接或传输（ssh / scp / rsync）",
     guardRule_killall: "批量终止进程（killall / pkill）",
+    guardRule_size: "传输大小超出免审批上限",
+    detachBtn: "解绑",
+    detachedToast: "已从项目 {project} 解绑 {cluster}",
+    noPresetsToAttach: "暂无可用服务器预设，请先在上方点击「新增服务器」。",
 
     // Overview & Jobs
     overviewTitle: "集群总览与作业监控",

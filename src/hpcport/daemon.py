@@ -185,6 +185,33 @@ class Daemon:
         self.broadcast("settings_changed", {"project": project})
         return {"project": project, "cluster": cluster_name, "root": cl.root, "resolved": real}
 
+    def detach_cluster(self, project: str, cluster_name: str) -> dict:
+        with self.lock:
+            p = self.projects.get(project)
+            if p is None:
+                raise attach.AttachError("unknown project %s" % project)
+            if cluster_name not in p.clusters:
+                raise attach.AttachError("cluster %s is not attached to project %s"
+                                         % (cluster_name, project))
+            active_jobs = self.db.one(
+                "SELECT 1 FROM jobs WHERE project = ? AND cluster = ? "
+                "AND state IN ('unapproved', 'held', 'queued', 'running') LIMIT 1",
+                (project, cluster_name),
+            )
+            active_ops = self.db.one(
+                "SELECT 1 FROM ops WHERE project = ? AND state = 'running' "
+                "AND (',' || cluster || ',') LIKE ? LIMIT 1",
+                (project, "%," + cluster_name + ",%"),
+            )
+            if active_jobs or active_ops:
+                from .settings import SettingError
+                raise SettingError("cluster_busy", cluster=cluster_name, project=project)
+            res = self.settings.update_project(
+                project, {"clusters": {cluster_name: None}},
+                note="detached cluster %s" % cluster_name,
+            )
+            return {"project": project, "cluster": cluster_name, "version": res["version"]}
+
     # ------------------------------------------------------------------ Web auth & dashboard launch
     @property
     def pairing_pin(self) -> str:

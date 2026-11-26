@@ -1,15 +1,19 @@
 """hpcport: command-line interface for HPCPort.
 
-  hpcport daemon [--port PORT]                  run the global daemon (foreground)
+  hpcport daemon [--port PORT] [--open]         run the global daemon (foreground)
   hpcport mcp [--project NAME] [--port PORT]    stdio MCP bridge (auto-starts daemon)
-  hpcport web [--tab TAB] [--pin]               open authenticated Web dashboard (or show PIN)
+  hpcport web|ui [--tab TAB] [--pin]            open authenticated Web dashboard
+  hpcport pin                                   print headless 6-digit pairing PIN
+  hpcport snippets PROJECT                      print MCP setup snippets for all agents
+  hpcport doctor                                check environment, binary path, and daemon
 
-  hpcport project init NAME [--dir DIR]         register a project
+  hpcport project init|add NAME [--dir DIR]     register a project
   hpcport project list                          list registered projects
-  hpcport cluster add NAME --host H [...]       create a server preset (slurm or none)
+  hpcport cluster|preset add NAME --host H ...  create a server preset (slurm or none)
   hpcport cluster attach PROJECT CLUSTER [...]  attach a server preset to a project
-  hpcport cluster list                          list server presets
-  hpcport cluster test NAME                     test SSH connectivity to a server
+  hpcport cluster detach PROJECT CLUSTER        detach a server preset from a project
+  hpcport cluster|preset list                   list server presets
+  hpcport cluster|preset test NAME              test SSH connectivity to a server
 
   hpcport jobs [--project P] [BATCH]            list batches or jobs of a batch
   hpcport cancel --project P (--batch B | JOBID...) [-m NOTE]
@@ -29,7 +33,10 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -106,21 +113,33 @@ def _cmd_daemon(args) -> None:
         "HPCPort daemon listening on http://127.0.0.1:%d  (headless unlock PIN: %s)",
         port, daemon.pairing_pin,
     )
+    if getattr(args, "open", False):
+        tab = getattr(args, "tab", None) or "approvals"
+
+        def _open_when_ready() -> None:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if stdio_bridge._daemon_alive(port):
+                    daemon.open_dashboard(tab=tab)
+                    return
+                time.sleep(0.15)
+
+        threading.Thread(target=_open_when_ready, daemon=True).start()
     uvicorn.run(build_app(daemon), host="127.0.0.1", port=port, log_level="warning")
 
 
 def _cmd_mcp(args) -> None:
-    sys.exit(stdio_bridge.serve_stdio(project=args.project, port=args.port))
+    sys.exit(stdio_bridge.serve_stdio(project=args.project, port=getattr(args, "port", None)))
 
 
 def _cmd_web(args) -> None:
     port = stdio_bridge.ensure_daemon(port=_port(args))
-    if args.pin:
+    if getattr(args, "pin", False):
         r = _api(port, "GET", "/api/auth/pin")
         print("Dashboard: http://127.0.0.1:%d/" % port)
         print("Pairing PIN: %s" % r["pin"])
         return
-    r = _api(port, "POST", "/api/dashboard/open", {"tab": args.tab or "approvals"})
+    r = _api(port, "POST", "/api/dashboard/open", {"tab": getattr(args, "tab", None) or "approvals"})
     if r.get("opened"):
         print("Opened %s" % r["url"])
     else:
@@ -128,8 +147,59 @@ def _cmd_web(args) -> None:
         print("Open %s in your browser (PIN: %s)" % (r["url"], pin))
 
 
-def _cmd_project(args) -> None:
+def _cmd_pin(args) -> None:
+    args.pin = True
+    _cmd_web(args)
+
+
+def _cmd_snippets(args) -> None:
+    port = stdio_bridge.ensure_daemon(port=_port(args))
+    r = _api(port, "GET", "/api/projects/%s/mcp-snippets" % urllib.parse.quote(args.project))
+    snippets = r.get("snippets") or {}
+    wanted = [args.agent] if getattr(args, "agent", None) else list(snippets)
+    for key in wanted:
+        if key not in snippets:
+            sys.exit("unknown agent %r (choose from: %s)" % (key, ", ".join(snippets)))
+        s = snippets[key]
+        print("=== %s ===" % s["title"])
+        print(s["code"])
+        if s.get("http_note"):
+            print(s["http_note"])
+        print()
+
+
+def _cmd_doctor(args) -> None:
     port = _port(args)
+    bin_path = shutil.which("hpcport") or sys.executable
+    alive = stdio_bridge._daemon_alive(port)
+    info = {
+        "python": sys.version.split()[0],
+        "hpcport_bin": bin_path,
+        "home": str(config.home()),
+        "port": port,
+        "daemon_running": alive,
+        "ssh": shutil.which("ssh"),
+        "rsync": shutil.which("rsync"),
+        "presets": config.list_preset_names(),
+        "projects": config.list_project_names(),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(info, indent=2))
+        return
+    print("HPCPort Doctor")
+    print("  Python:         %s" % info["python"])
+    print("  CLI path:       %s" % info["hpcport_bin"])
+    print("  Data home:      %s" % info["home"])
+    print("  Daemon:         %s (http://127.0.0.1:%d)" % (
+        "running" if alive else "stopped (auto-starts on `hpcport ui` or `hpcport mcp`)", port))
+    print("  ssh:            %s" % (info["ssh"] or "MISSING"))
+    print("  rsync:          %s" % (info["rsync"] or "MISSING (optional, needed for transfer)"))
+    print("  Server presets: %s" % (", ".join(info["presets"]) or "(none)"))
+    print("  Projects:       %s" % (", ".join(info["projects"]) or "(none)"))
+
+
+def _cmd_project(args) -> None:
+    port = stdio_bridge.ensure_daemon(port=_port(args))
     if args.sub == "list":
         r = _api(port, "GET", "/api/projects")
         for p in r["projects"]:
@@ -142,7 +212,7 @@ def _cmd_project(args) -> None:
 
 
 def _cmd_cluster(args) -> None:
-    port = _port(args)
+    port = stdio_bridge.ensure_daemon(port=_port(args))
     if args.sub == "list":
         r = _api(port, "GET", "/api/presets")
         for p in r["presets"]:
@@ -174,6 +244,11 @@ def _cmd_cluster(args) -> None:
         r = _api(port, "POST", "/api/presets/%s/test" % urllib.parse.quote(args.name), {})
         print("Connected to %s (home=%s, slurm=%s)" % (
             args.name, r.get("home") or "-", "yes" if r.get("has_slurm") else "no"))
+        return
+    if args.sub == "detach":
+        r = _api(port, "DELETE", "/api/projects/%s/clusters/%s" % (
+            urllib.parse.quote(args.project), urllib.parse.quote(args.cluster)))
+        print("Detached %s from %s (v%d)" % (r["cluster"], r["project"], r["version"]))
         return
     if args.sub == "attach":
         payload = {"cluster": args.cluster}
@@ -291,23 +366,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=None, help="Daemon port override")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("daemon", help="Run the global daemon in the foreground")
+    def add_port(sp):
+        sp.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Daemon port override")
+
+    pd = sub.add_parser("daemon", help="Run the global daemon in the foreground")
+    add_port(pd)
+    pd.add_argument("--open", action="store_true", help="Open the Web dashboard once ready")
+    pd.add_argument("--tab", default="approvals", choices=("approvals", "jobs", "audit", "settings"))
 
     pm = sub.add_parser("mcp", help="Run the stdio MCP bridge (auto-starts daemon)")
+    add_port(pm)
     pm.add_argument("--project", default=None, help="Explicit project name")
 
-    pw = sub.add_parser("web", help="Open the authenticated Web dashboard")
+    pw = sub.add_parser("web", aliases=["ui"], help="Open the authenticated Web dashboard")
+    add_port(pw)
     pw.add_argument("--tab", default="approvals", choices=("approvals", "jobs", "audit", "settings"))
     pw.add_argument("--pin", action="store_true", help="Print headless 6-digit pairing PIN")
+
+    ppin = sub.add_parser("pin", help="Print headless 6-digit pairing PIN")
+    add_port(ppin)
+
+    psn = sub.add_parser("snippets", help="Print MCP config snippets for a project")
+    add_port(psn)
+    psn.add_argument("project")
+    psn.add_argument("--agent", default=None,
+                     choices=("codex", "opencode", "antigravity", "dsh", "claude_code"))
+
+    pdoc = sub.add_parser("doctor", help="Check installation, binary path, and daemon health")
+    add_port(pdoc)
+    pdoc.add_argument("--json", action="store_true", help="Emit JSON output")
 
     pp = sub.add_parser("project", help="Manage projects")
     ps = pp.add_subparsers(dest="sub", required=True)
     ps.add_parser("list")
-    pi = ps.add_parser("init")
+    pi = ps.add_parser("init", aliases=["add"])
     pi.add_argument("name")
-    pi.add_argument("--dir", default=None, help="Local workspace directory (default: cwd)")
+    pi.add_argument("--dir", "--local-dir", dest="dir", default=None,
+                    help="Local workspace directory (default: cwd)")
 
-    pc = sub.add_parser("cluster", help="Manage server presets and attachments")
+    pc = sub.add_parser("cluster", aliases=["preset"],
+                        help="Manage server presets and attachments")
     cs = pc.add_subparsers(dest="sub", required=True)
     cs.add_parser("list")
     ca = cs.add_parser("add")
@@ -327,6 +425,9 @@ def build_parser() -> argparse.ArgumentParser:
     cat.add_argument("cluster")
     cat.add_argument("--root", default=None)
     cat.add_argument("--max-jobs", type=int, default=None)
+    cdet = cs.add_parser("detach")
+    cdet.add_argument("project")
+    cdet.add_argument("cluster")
 
     pj = sub.add_parser("jobs", help="Show batches and jobs")
     pj.add_argument("batch", nargs="?", default=None)
@@ -383,8 +484,13 @@ def main(argv: list[str] | None = None) -> None:
         "daemon": _cmd_daemon,
         "mcp": _cmd_mcp,
         "web": _cmd_web,
+        "ui": _cmd_web,
+        "pin": _cmd_pin,
+        "snippets": _cmd_snippets,
+        "doctor": _cmd_doctor,
         "project": _cmd_project,
         "cluster": _cmd_cluster,
+        "preset": _cmd_cluster,
         "jobs": _cmd_jobs,
         "cancel": _cmd_cancel,
         "ops": _cmd_ops,

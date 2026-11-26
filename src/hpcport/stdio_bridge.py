@@ -52,8 +52,8 @@ def ensure_daemon(port: int | None = None, wait_s: float = 10.0) -> int:
         env = dict(os.environ)
         env.pop("HPCPORT_AGENT", None)
         with open(log_path, "ab") as logf:
-            subprocess.Popen(
-                [sys.executable, "-m", "hpcport.cli", "daemon", "--port", str(port)],
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "hpcport.cli", "--port", str(port), "daemon"],
                 stdin=subprocess.DEVNULL,
                 stdout=logf,
                 stderr=logf,
@@ -64,8 +64,18 @@ def ensure_daemon(port: int | None = None, wait_s: float = 10.0) -> int:
         while time.monotonic() < deadline:
             if _daemon_alive(port):
                 return port
+            if proc.poll() is not None:
+                break
             time.sleep(0.15)
-    raise RuntimeError("HPCPort daemon did not start on port %d within %.1fs" % (port, wait_s))
+    tail = ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if lines:
+            tail = " (log: %s)" % " | ".join(lines[-3:])[-300:]
+    except OSError:
+        pass
+    raise RuntimeError("HPCPort daemon did not start on port %d within %.1fs%s"
+                       % (port, wait_s, tail))
 
 
 def resolve_target(project: str | None = None, cwd: str | None = None) -> str | None:
@@ -90,6 +100,7 @@ def build_forward_headers(
     raw_json: str,
     session_id: str | None = None,
     protocol_version: str | None = None,
+    cwd: str | None = None,
 ) -> tuple[dict[str, str], str | None]:
     """Build HTTP headers for forwarding a stdio JSON-RPC line to Streamable HTTP."""
     headers = {
@@ -98,6 +109,8 @@ def build_forward_headers(
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
+    if cwd:
+        headers["X-HPCPort-Cwd"] = cwd
     detected_version = protocol_version
     method: str | None = None
     try:
@@ -132,7 +145,7 @@ def build_forward_headers(
     return headers, detected_version
 
 
-async def _run_bridge(url: str) -> None:
+async def _run_bridge(url: str, cwd: str | None = None) -> None:
     session_id: str | None = None
     protocol_version: str | None = None
     write_lock = asyncio.Lock()
@@ -156,7 +169,7 @@ async def _run_bridge(url: str) -> None:
             if not raw:
                 continue
             headers, protocol_version = build_forward_headers(
-                raw, session_id=session_id, protocol_version=protocol_version
+                raw, session_id=session_id, protocol_version=protocol_version, cwd=cwd,
             )
             try:
                 async with client.stream("POST", url, content=raw.encode("utf-8"),
@@ -202,13 +215,16 @@ async def _run_bridge(url: str) -> None:
 
 def serve_stdio(project: str | None = None, port: int | None = None) -> int:
     actual_port = ensure_daemon(port=port)
-    proj = resolve_target(project=project)
+    cwd = os.getcwd()
+    proj = resolve_target(project=project, cwd=cwd)
     if proj:
         url = "http://127.0.0.1:%d/p/%s/mcp" % (actual_port, proj)
+        bridge_cwd = None
     else:
         url = "http://127.0.0.1:%d/mcp" % actual_port
+        bridge_cwd = cwd
     try:
-        asyncio.run(_run_bridge(url))
+        asyncio.run(_run_bridge(url, cwd=bridge_cwd))
     except KeyboardInterrupt:
         pass
     return 0

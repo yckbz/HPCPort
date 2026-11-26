@@ -68,10 +68,15 @@ def _ctx_header(ctx: Context, name: str) -> str | None:
     return headers.get(name) or headers.get(name.lower())
 
 
-def _project_and_session(ctx: Context) -> tuple[str | None, str]:
-    project = _ctx_header(ctx, "x-hpcport-project")
+def _project_and_session(ctx: Context, daemon=None) -> tuple[str | None, str]:
+    project = _ctx_header(ctx, "x-hpcport-project") or None
+    if project is None and daemon is not None:
+        cwd = _ctx_header(ctx, "x-hpcport-cwd")
+        if cwd:
+            with daemon.lock:
+                project = config.resolve_project_by_cwd(cwd, daemon.projects)
     session_key = _ctx_header(ctx, "mcp-session-id") or "default"
-    return (project or None), session_key
+    return project, session_key
 
 
 def build_mcp(daemon) -> MCPServer:
@@ -79,6 +84,8 @@ def build_mcp(daemon) -> MCPServer:
         "hpcport",
         instructions=(
             "HPCPort compute-server gateway and Slurm job manager. "
+            "Call `info` first to inspect this project's attached compute servers, remote roots, "
+            "partitions, usage guides, and standing budget. "
             "Use HPCPort tools for all remote commands, file transfers, and Slurm job submissions. "
             "Call `jobs` to check status, `open_dashboard` to open the user's Web approval dashboard, "
             "and `propose_preset` to suggest updates to server presets."
@@ -98,7 +105,7 @@ def build_mcp(daemon) -> MCPServer:
         )
 
     def require_project(ctx: Context) -> tuple[str, str]:
-        proj, skey = _project_and_session(ctx)
+        proj, skey = _project_and_session(ctx, daemon)
         if not proj:
             raise JobError("unbound_project")
         if proj not in daemon.projects:
@@ -126,7 +133,7 @@ def build_mcp(daemon) -> MCPServer:
 
     async def run_tool(ctx: Context, tool: str, args: dict, fn,
                        locked: bool = False, needs_project: bool = True) -> CallToolResult:
-        proj, skey = _project_and_session(ctx)
+        proj, skey = _project_and_session(ctx, daemon)
         loop = asyncio.get_running_loop()
         on_tick = make_progress_cb(ctx, loop)
         try:
@@ -305,7 +312,33 @@ def build_mcp(daemon) -> MCPServer:
 
         return await run_tool(ctx, "wait_for", args, fn)
 
-    # ---------------------------------------------------------------- preset & dashboard
+    # ---------------------------------------------------------------- info, preset & dashboard
+    @tool("info", P.TOOL_INFO)
+    async def info(ctx: Context) -> CallToolResult:
+        def fn(p, s, tick):
+            proj = daemon.projects.get(p) if p else None
+            text = messages.server_instructions(proj)
+            if proj is not None:
+                daemon.waits.init_cursor(proj.name, s)
+                st = daemon.submits.status(proj.name)
+                if not st["approval"]:
+                    text += "\n## Compute budget\n- Auto-approval enabled.\n"
+                elif st["standing"]:
+                    lims = st["standing"]["limits"]
+                    used = st["used"] or {}
+                    text += (
+                        "\n## Standing budget\n"
+                        "- Used: %s jobs, %.1f core-h, %.1f GPU-h\n"
+                        "- Limits: %s\n"
+                        % (used.get("jobs", 0), used.get("core_hours", 0.0),
+                           used.get("gpu_hours", 0.0), json.dumps(lims))
+                    )
+                else:
+                    text += "\n## Compute budget\n- No standing budget active (Slurm submissions require approval).\n"
+            return text
+
+        return await run_tool(ctx, "info", {}, fn, locked=True, needs_project=False)
+
     @tool("propose_preset", P.TOOL_PROPOSE_PRESET)
     async def propose_preset(
         cluster: Annotated[str, arg(P.ARG_CLUSTER)],
@@ -582,6 +615,12 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                                     d.get("root"), d.get("max_jobs"))
         return JSONResponse(r)
 
+    async def project_detach(request):
+        name = request.path_params["name"]
+        cluster = request.path_params["cluster"]
+        r = await asyncio.to_thread(daemon.detach_cluster, name, cluster)
+        return JSONResponse(r)
+
     async def project_snippets(request):
         name = request.path_params["name"]
         if name not in daemon.projects:
@@ -820,6 +859,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         r_get("/api/projects/{name}", project_get),
         r_mut("/api/projects/{name}", project_patch, "PATCH"),
         r_mut("/api/projects/{name}/clusters", project_attach, "POST"),
+        r_mut("/api/projects/{name}/clusters/{cluster}", project_detach, "DELETE"),
         r_get("/api/projects/{name}/mcp-snippets", project_snippets),
         r_get("/api/presets", presets_list),
         r_mut("/api/presets", presets_create, "POST"),

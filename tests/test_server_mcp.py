@@ -185,7 +185,15 @@ def test_mcp_tools_tasks_extension_and_notices(hpc_home, tmp_path):
         assert "[HPCPort notices]" in jobs_text
         assert "op:3" in jobs_text
 
-        # 3. propose_preset via MCP queues a preset approval
+        # 3. info tool returns attached servers, roots, and budget status
+        r_info = _mcp_call(client, "/p/demo/mcp", sid_plain, 121, "tools/call", {
+            "name": "info", "arguments": {},
+        })
+        info_text = r_info["result"]["content"][0]["text"]
+        assert "gpu01 (slurm)" in info_text
+        assert "bare1 (bare SSH" in info_text
+
+        # 4. propose_preset via MCP queues a preset approval
         r_prop = _mcp_call(client, "/p/demo/mcp", sid_plain, 13, "tools/call", {
             "name": "propose_preset",
             "arguments": {
@@ -288,6 +296,104 @@ def test_cli_blocks_agent_env(hpc_home):
     )
     assert p.returncode != 0
     assert "not for agents" in p.stderr
+
+
+def test_cli_doctor_ports_and_aliases(hpc_home):
+    from hpcport.cli import build_parser
+
+    p = build_parser()
+    # --port accepted both before and after subcommand
+    assert p.parse_args(["--port", "9001", "daemon", "--open"]).port == 9001
+    assert p.parse_args(["daemon", "--port", "9002", "--open"]).port == 9002
+    assert p.parse_args(["daemon", "--open"]).open is True
+    assert p.parse_args(["ui", "--tab", "settings"]).tab == "settings"
+    assert p.parse_args(["pin", "--port", "9003"]).port == 9003
+    assert p.parse_args(["snippets", "demo", "--agent", "codex"]).agent == "codex"
+    assert p.parse_args(["project", "add", "demo", "--local-dir", "/tmp"]).dir == "/tmp"
+    assert p.parse_args(["preset", "list"]).sub == "list"
+    assert p.parse_args(["cluster", "detach", "demo", "gpu01"]).sub == "detach"
+
+    r = subprocess.run(
+        [sys.executable, "-m", "hpcport.cli", "doctor", "--json"],
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": "src", "HPCPORT_HOME": str(hpc_home)},
+        cwd="/Users/liuce/Desktop/HPCPort",
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    info = json.loads(r.stdout)
+    assert info["home"] == str(hpc_home)
+    assert "python" in info and "port" in info
+
+
+def test_unbound_dynamic_cwd_detach_and_internal_job_cancel(hpc_home, tmp_path):
+    d, ex, app, opened, remote, local_dir = _make_app(hpc_home, tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        # 1. Dynamic X-HPCPort-Cwd resolution on unbound /mcp endpoint
+        r_init = client.post(
+            "/mcp",
+            headers={"Accept": "application/json, text/event-stream",
+                     "X-HPCPort-Cwd": str(local_dir)},
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                             "clientInfo": {"name": "cwd-test", "version": "1.0"}}},
+        )
+        assert r_init.status_code == 200
+        sid = r_init.headers["mcp-session-id"]
+        client.post(
+            "/mcp",
+            headers={"Accept": "application/json, text/event-stream", "Mcp-Session-Id": sid},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        r_info = client.post(
+            "/mcp",
+            headers={"Accept": "application/json, text/event-stream",
+                     "Mcp-Session-Id": sid, "X-HPCPort-Cwd": str(local_dir)},
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "info", "arguments": {}}},
+        )
+        assert r_info.status_code == 200
+        assert "project `demo`" in r_info.json()["result"]["content"][0]["text"]
+
+        # 2. Authenticate Web client
+        client.post("/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"})
+
+        # 3. Trying to delete an in-use preset returns human-readable error message
+        r_inuse = client.delete("/api/presets/bare1", headers={"X-HPCPort-UI": "1"})
+        assert r_inuse.status_code == 400
+        assert "still attached to project" in r_inuse.json()["error"]
+
+        # 4. Detaching a cluster with an active unapproved job is blocked (cluster_busy),
+        #    cancelling that job via #<internal_id> works, then detach succeeds!
+        wd = remote / "demo_slurm" / "run2"
+        wd.mkdir(parents=True, exist_ok=True)
+        (wd / "job.sh").write_text(
+            "#!/bin/bash\n#SBATCH --partition=a100\n#SBATCH --cpus-per-task=2\n"
+            "#SBATCH --time=00:30:00\necho ok\n",
+            encoding="utf-8",
+        )
+        d.jobs.submit("demo", "gpu01", str(wd), ["job.sh"], "pending job", wait_s=0)
+        jrow = d.db.one("SELECT * FROM jobs ORDER BY id DESC LIMIT 1")
+        assert jrow["slurm_id"] is None
+
+        r_busy = client.delete("/api/projects/demo/clusters/gpu01", headers={"X-HPCPort-UI": "1"})
+        assert r_busy.status_code == 400
+        assert "Cannot detach" in r_busy.json()["error"]
+
+        # Cancel unapproved job by #<internal_id>
+        r_can = client.post(
+            "/api/cancel",
+            json={"project": "demo", "job_ids": ["#%d" % jrow["id"]], "comment": "cancel test"},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_can.status_code == 200
+        assert "#%d" % jrow["id"] in r_can.json()["result"]["cancelled"]
+
+        # Now detach gpu01 & bare1 cleanly!
+        r_det = client.delete("/api/projects/demo/clusters/gpu01", headers={"X-HPCPort-UI": "1"})
+        assert r_det.status_code == 200
+        r_det2 = client.delete("/api/projects/demo/clusters/bare1", headers={"X-HPCPort-UI": "1"})
+        assert r_det2.status_code == 200
+        assert client.delete("/api/presets/bare1", headers={"X-HPCPort-UI": "1"}).status_code == 200
 
 
 def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):

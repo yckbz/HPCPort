@@ -28,7 +28,7 @@ from mcp_types import (
     TextContent,
 )
 
-from . import messages
+from . import config, messages
 from .waits import WaitError
 
 EXTENSION_ID = "io.modelcontextprotocol/tasks"
@@ -131,6 +131,11 @@ class TasksExtension(Extension):
             return await call_next(ctx)
 
         project = _header(ctx, "x-hpcport-project")
+        if not project:
+            cwd = _header(ctx, "x-hpcport-cwd")
+            if cwd:
+                with self.daemon.lock:
+                    project = config.resolve_project_by_cwd(cwd, self.daemon.projects)
         session_key = _header(ctx, "mcp-session-id") or "default"
         args = dict(params.arguments or {})
         if not project or project not in self.daemon.projects:

@@ -141,7 +141,7 @@ def submit_ok(r: dict) -> str:
     held_part = ", %d held (max_jobs=%d)" % (r["n_held"], r["max_jobs"]) if r["n_held"] else ""
     if r.get("approved_inline"):
         return P.SUBMIT_APPROVED_INLINE.format(
-            approval=r.get("approval") or "-",
+            approval=r.get("approval_id") or "-",
             batch=r["batch"], cluster=r["cluster"], n=r["n"],
             sent_part=sent_part, held_part=held_part,
         )
