@@ -257,7 +257,8 @@ def _sockets_from_extra_node_info(text: str) -> int:
     return _count(sock)
 
 
-def resources(header: Header, cores_per_node: int | None = None) -> Resources:
+def resources(header: Header, cores_per_node: int | None = None,
+              gpus_per_node: int | None = None) -> Resources:
     o = header_options(header.directives)
     unknown: list[str] = []
 
@@ -339,6 +340,11 @@ def resources(header: Header, cores_per_node: int | None = None) -> Resources:
         cores = nodes * cores_per_node if cores_per_node else None
         if cores is None:
             unknown.append("cores")
+        if gpus_per_node is not None:
+            gpus = max(gpus, nodes * gpus_per_node)
+        else:
+            gpus = None
+            unknown.append("gpus")
     if unknown:
         cores = gpus = None
     hours = read("time", time_limit_hours, None)

@@ -24,12 +24,25 @@ def test_preset_slurm_and_bare_ssh(hpc_home):
         "gpu01",
         {"connect": "ssh", "host": "gpu-login", "scheduler": "slurm",
          "partitions": ["a100", "debug"], "max_jobs": 8, "cores_per_node": 64,
-         "projects_root": "/work/user"},
+         "gpus_per_node": 8, "projects_root": "/work/user"},
         "gpu01.yaml",
     )
     assert p_slurm.scheduler == "slurm"
     assert p_slurm.partitions == ("a100", "debug")
     assert p_slurm.cores_per_node == 64
+    assert p_slurm.gpus_per_node == 8
+    assert config.preset_to_dict(p_slurm)["gpus_per_node"] == 8
+
+    # gpus_per_node=0 is valid for CPU-only nodes; negative values must fail
+    p_cpu = config.parse_preset(
+        "cpu01",
+        {"connect": "local", "scheduler": "slurm", "cores_per_node": 32, "gpus_per_node": 0},
+        "cpu01.yaml",
+    )
+    assert p_cpu.gpus_per_node == 0
+    assert config.preset_to_dict(p_cpu)["gpus_per_node"] == 0
+    with pytest.raises(config.ConfigError):
+        config.parse_preset("neg", {"connect": "local", "gpus_per_node": -1}, "neg.yaml")
 
     p_bare = config.parse_preset(
         "box1",

@@ -1825,6 +1825,9 @@ function openPresetModal(presetObj) {
         <label class="field-label" data-slurm-only>${esc(i18n.t("fieldCoresPerNode"))}
           <input type="number" min="1" name="cores_per_node" value="${esc(d.cores_per_node ?? "")}" />
         </label>
+        <label class="field-label" data-slurm-only>${esc(i18n.t("fieldGpusPerNode"))}
+          <input type="number" min="0" name="gpus_per_node" value="${esc(d.gpus_per_node ?? "")}" placeholder="0" />
+        </label>
         <label class="field-label" data-slurm-only>${esc(i18n.t("fieldPollInterval"))}
           <input type="number" min="5" name="poll_interval_s" value="${esc(d.poll_interval_s ?? 120)}" />
         </label>
@@ -1910,6 +1913,7 @@ function openPresetModal(presetObj) {
         const extra_paths = (fd.get("extra_paths") || "").toString().split("\n").map((s) => s.trim()).filter(Boolean);
         const gateway_allow = fd.getAll("gateway_allow").map(String);
         const cpnRaw = (fd.get("cores_per_node") || "").toString().trim();
+        const gpnRaw = (fd.get("gpus_per_node") || "").toString().trim();
         const guide = (fd.get("guide") || "").toString().trim();
         const job_template = (fd.get("job_template") || "").toString();
 
@@ -1921,6 +1925,7 @@ function openPresetModal(presetObj) {
           partitions,
           max_jobs: parseInt(fd.get("max_jobs") || "10", 10),
           cores_per_node: cpnRaw ? parseInt(cpnRaw, 10) : null,
+          gpus_per_node: gpnRaw !== "" ? parseInt(gpnRaw, 10) : null,
           poll_interval_s: parseInt(fd.get("poll_interval_s") || "120", 10),
           exec_timeout_s: parseInt(fd.get("exec_timeout_s") || "1800", 10),
           python: (fd.get("python") || "python3").toString().trim() || "python3",

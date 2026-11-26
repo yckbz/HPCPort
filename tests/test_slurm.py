@@ -30,8 +30,28 @@ echo hello
 def test_exclusive_and_missing_time():
     script = "#!/bin/bash\n#SBATCH -N 2 --exclusive\n#SBATCH -t 01:00:00\n"
     h = slurm.parse_header(script)
-    assert slurm.resources(h).unknown == ("cores",)
-    assert slurm.resources(h, cores_per_node=64).core_hours == 128.0
+    assert slurm.resources(h).unknown == ("cores", "gpus")
+    # cores_per_node alone still leaves exclusive GPU allocation unknown (never 0 GPU-h!)
+    r_only_cores = slurm.resources(h, cores_per_node=64)
+    assert r_only_cores.unknown == ("gpus",)
+    assert r_only_cores.gpu_hours is None
+    # CPU-only nodes declare gpus_per_node=0 -> 128 core-h, 0 GPU-h
+    r_cpu = slurm.resources(h, cores_per_node=64, gpus_per_node=0)
+    assert r_cpu.unknown == ()
+    assert r_cpu.core_hours == 128.0
+    assert r_cpu.gpu_hours == 0.0
+    # GPU nodes declare gpus_per_node=8 -> 2 nodes * 8 GPUs * 1h = 16 GPU-h
+    r_gpu = slurm.resources(h, cores_per_node=64, gpus_per_node=8)
+    assert r_gpu.unknown == ()
+    assert r_gpu.core_hours == 128.0
+    assert r_gpu.gpu_hours == 16.0
+    assert r_gpu.gpus == 16
+    # Explicit smaller --gres=gpu:2 with --exclusive still accounts whole-node GPUs
+    h_ex_gres = slurm.parse_header(
+        "#!/bin/bash\n#SBATCH -N 2 --exclusive --gres=gpu:2\n#SBATCH -t 01:00:00\n"
+    )
+    assert slurm.resources(h_ex_gres, cores_per_node=64, gpus_per_node=8).gpu_hours == 16.0
+    assert "gpus" in slurm.resources(h_ex_gres, cores_per_node=64).unknown
 
     no_time = slurm.parse_header("#!/bin/bash\n#SBATCH -n 4\n")
     res = slurm.resources(no_time)

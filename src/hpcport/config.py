@@ -28,12 +28,12 @@ SCHEDULERS = ("slurm", "none")
 
 PRESET_KEYS = (
     "connect", "host", "scheduler", "partitions", "max_jobs", "python",
-    "cores_per_node", "poll_interval_s", "job_template", "guide",
+    "cores_per_node", "gpus_per_node", "poll_interval_s", "job_template", "guide",
     "projects_root", "exec_timeout_s", "extra_paths", "gateway_allow",
 )
 PRESET_SAFETY = (
     "connect", "host", "scheduler", "partitions", "max_jobs", "projects_root",
-    "extra_paths", "gateway_allow", "exec_timeout_s", "cores_per_node",
+    "extra_paths", "gateway_allow", "exec_timeout_s", "cores_per_node", "gpus_per_node",
 )
 
 PROJECT_KEYS = ("project", "local_dir", "clusters", "wake", "submit", "gateway")
@@ -70,6 +70,7 @@ class ClusterPreset:
     max_jobs: int = 10                  # default per-project concurrency limit
     python: str = "python3"
     cores_per_node: int | None = None
+    gpus_per_node: int | None = None
     poll_interval_s: int = 120
     job_template: str | None = None
     guide: str = ""
@@ -91,6 +92,7 @@ class Cluster:
     max_jobs: int = 10                  # effective concurrency limit for this project
     python: str = "python3"
     cores_per_node: int | None = None
+    gpus_per_node: int | None = None
     poll_interval_s: int = 120
     job_template: str | None = None
     guide: str = ""
@@ -112,6 +114,7 @@ class Cluster:
             max_jobs=preset.max_jobs if max_jobs is None else max_jobs,
             python=preset.python,
             cores_per_node=preset.cores_per_node,
+            gpus_per_node=preset.gpus_per_node,
             poll_interval_s=preset.poll_interval_s,
             job_template=preset.job_template,
             guide=preset.guide,
@@ -357,6 +360,9 @@ def _parse_preset(name: str, d: dict, path: str) -> ClusterPreset:
     cpn = d.get("cores_per_node")
     if cpn is not None and (not isinstance(cpn, int) or isinstance(cpn, bool) or cpn < 1):
         raise ConfigError("%s: cores_per_node must be a positive integer" % path)
+    gpn = d.get("gpus_per_node")
+    if gpn is not None and (not isinstance(gpn, int) or isinstance(gpn, bool) or gpn < 0):
+        raise ConfigError("%s: gpus_per_node must be a non-negative integer" % path)
     base = d.get("projects_root")
     if base is not None and (not isinstance(base, str) or not os.path.isabs(base)
                              or not base.rstrip("/")):
@@ -386,6 +392,7 @@ def _parse_preset(name: str, d: dict, path: str) -> ClusterPreset:
         max_jobs=max_jobs,
         python=str(d.get("python", "python3")),
         cores_per_node=cpn,
+        gpus_per_node=gpn,
         poll_interval_s=int(interval),
         job_template=d.get("job_template"),
         guide=str(d.get("guide") or "").strip(),
@@ -528,6 +535,8 @@ def preset_to_dict(p: ClusterPreset) -> dict:
     d["max_jobs"] = p.max_jobs
     if p.cores_per_node is not None:
         d["cores_per_node"] = p.cores_per_node
+    if p.gpus_per_node is not None:
+        d["gpus_per_node"] = p.gpus_per_node
     if p.scheduler == "slurm":
         d["poll_interval_s"] = p.poll_interval_s
     if p.python != "python3":

@@ -240,6 +240,8 @@ def _cmd_cluster(args) -> None:
             data["partitions"] = [x.strip() for x in args.partitions.split(",") if x.strip()]
         if args.cores_per_node:
             data["cores_per_node"] = args.cores_per_node
+        if args.gpus_per_node is not None:
+            data["gpus_per_node"] = args.gpus_per_node
         r = _api(port, "POST", "/api/presets", {"name": args.name, "data": data})
         print("Preset created: %s (v%d)" % (r["name"], r["version"]))
         return
@@ -421,6 +423,8 @@ def build_parser() -> argparse.ArgumentParser:
     ca.add_argument("--partitions", default=None, help="Comma-separated partition names")
     ca.add_argument("--max-jobs", type=int, default=10)
     ca.add_argument("--cores-per-node", type=int, default=None)
+    ca.add_argument("--gpus-per-node", type=int, default=None,
+                    help="GPUs per node for --exclusive estimates (0 for CPU-only nodes)")
     ca.add_argument("--exec-timeout", type=int, default=3600)
     ct = cs.add_parser("test")
     ct.add_argument("name")

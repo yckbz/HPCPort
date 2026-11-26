@@ -164,7 +164,10 @@ class JobService:
                                    cluster=cluster, allowed=", ".join(cl.partitions))
             headers[f] = h
 
-        asked = {f: slurm.resources(headers[f], cl.cores_per_node) for f in files}
+        asked = {
+            f: slurm.resources(headers[f], cl.cores_per_node, cl.gpus_per_node)
+            for f in files
+        }
         previews = {f: texts[f][:SCRIPT_PREVIEW_MAX] for f in files}
 
         with self.lock:
