@@ -173,6 +173,13 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
 
     async def forward_one(client: httpx.AsyncClient, raw: str) -> None:
         nonlocal session_id, protocol_version
+        try:
+            req_obj = json.loads(raw)
+        except ValueError:
+            req_obj = None
+        has_id = isinstance(req_obj, dict) and "id" in req_obj
+        req_id = req_obj["id"] if has_id else None
+
         headers, det_ver = build_forward_headers(
             raw, session_id=session_id, protocol_version=protocol_version, cwd=cwd,
         )
@@ -181,12 +188,39 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
         try:
             async with client.stream("POST", url, content=raw.encode("utf-8"),
                                      headers=headers) as resp:
+                if resp.status_code == 404:
+                    session_id = None
                 sid = resp.headers.get("mcp-session-id")
                 if sid:
                     session_id = sid
                 pv_hdr = resp.headers.get("mcp-protocol-version")
                 if pv_hdr:
                     protocol_version = pv_hdr
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", errors="replace").strip()
+                    if not has_id:
+                        return
+                    err_obj = None
+                    if body:
+                        try:
+                            parsed = json.loads(body)
+                            if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+                                err_obj = parsed["error"]
+                        except ValueError:
+                            pass
+                    if err_obj is None:
+                        err_obj = {
+                            "code": -32000,
+                            "message": "HTTP %d: %s" % (
+                                resp.status_code, (body or resp.reason_phrase or "error")[:300],
+                            ),
+                        }
+                    await emit(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": err_obj,
+                    }))
+                    return
                 ctype = resp.headers.get("content-type", "")
                 if "text/event-stream" in ctype:
                     data_lines: list[str] = []
@@ -205,17 +239,22 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
                 else:
                     body = (await resp.aread()).decode("utf-8", errors="replace").strip()
                     if body:
+                        if has_id and req_id is not None:
+                            try:
+                                parsed = json.loads(body)
+                                if (isinstance(parsed, dict) and parsed.get("id") is None
+                                        and "error" in parsed):
+                                    parsed["id"] = req_id
+                                    body = json.dumps(parsed)
+                            except ValueError:
+                                pass
                         await emit(body)
         except Exception as e:
             # Return a JSON-RPC internal error if this was a request with an id
-            try:
-                req = json.loads(raw)
-            except ValueError:
-                req = {}
-            if isinstance(req, dict) and "id" in req:
+            if has_id:
                 await emit(json.dumps({
                     "jsonrpc": "2.0",
-                    "id": req["id"],
+                    "id": req_id,
                     "error": {"code": -32603, "message": "HPCPort bridge error: %s" % e},
                 }))
 

@@ -514,12 +514,13 @@ def test_stdio_bridge_concurrent_ping_not_blocked_by_wait_for(hpc_home, tmp_path
         # Wait until live HTTP daemon is reachable
         import httpx
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                if httpx.get("http://127.0.0.1:%d/api/health" % port, timeout=0.5).status_code == 200:
-                    break
-            except Exception:
-                time.sleep(0.05)
+        with httpx.Client(trust_env=False, timeout=0.5) as hc:
+            while time.monotonic() < deadline:
+                try:
+                    if hc.get("http://127.0.0.1:%d/api/health" % port).status_code == 200:
+                        break
+                except Exception:
+                    time.sleep(0.05)
 
         # Start a background op so wait_for(wait_s=2.0) blocks for ~2s
         op = d.gateway.exec("demo", "bare1", "sleep 20", background=True)
@@ -726,3 +727,60 @@ def test_wait_for_replace_and_tasks_validation_isolation(hpc_home, tmp_path):
                                     {"taskId": tid}, sid=sid_t)
         assert r_own["result"]["status"] == "working"
         d.gateway.stop("demo", oid, by="user")
+
+
+def test_stdio_bridge_preserves_id_on_404_and_skips_notifications():
+    import asyncio
+    import io
+    import socket
+    import threading
+    import time
+    import httpx
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+    from hpcport import stdio_bridge
+
+    async def fake_mcp(request):
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Session not found"}},
+            status_code=404,
+        )
+
+    fake_app = Starlette(routes=[Route("/p/demo/mcp", fake_mcp, methods=["POST"])])
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        fport = s.getsockname()[1]
+    srv = uvicorn.Server(uvicorn.Config(fake_app, host="127.0.0.1", port=fport, log_level="error"))
+    t = threading.Thread(target=srv.run, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        with httpx.Client(trust_env=False, timeout=0.5) as hc:
+            while time.monotonic() < deadline:
+                try:
+                    hc.post("http://127.0.0.1:%d/p/demo/mcp" % fport, content=b"{}")
+                    break
+                except Exception:
+                    time.sleep(0.05)
+
+        fake_in = io.StringIO(
+            json.dumps({"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
+        fake_out = io.StringIO()
+        orig_in, orig_out = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = fake_in, fake_out
+        try:
+            asyncio.run(stdio_bridge._run_bridge("http://127.0.0.1:%d/p/demo/mcp" % fport))
+        finally:
+            sys.stdin, sys.stdout = orig_in, orig_out
+        lines = [ln for ln in fake_out.getvalue().splitlines() if ln.strip()]
+        assert len(lines) == 1
+        resp = json.loads(lines[0])
+        assert resp["id"] == 42
+        assert "Session not found" in resp["error"]["message"]
+    finally:
+        srv.should_exit = True
+        t.join(timeout=5)
