@@ -16,7 +16,7 @@ HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算�
 
 - **全局单守护进程管理多项目**：本地监听 `127.0.0.1:8765`，所有服务器预设、项目配置、SQLite 状态与 YAML 版本历史均集中在 `~/.hpcport/`，对业务代码目录零侵入。
 - **同时支持 Slurm 集群与无 Slurm 的普通 SSH 服务器**：Slurm 集群（`scheduler: slurm`）支持完整的 `sbatch`/`squeue`/`sacct` 批次托管；普通 SSH 服务器（`scheduler: none`）支持基于 `remote_exec(..., background=True)` 的后台长任务管理与实时日志查看。
-- **目录安全边界与算力预算门禁**：强制限制远端读写在项目 `root` 之内，拦截越界删除与绕过 `sbatch` 等危险命令；各项目独立维护并发上限（`max_jobs`）与常设预算额度（单次与累计 `core_hours`、`gpu_hours`、`total_jobs`）。
+- **目录安全护栏与算力预算门禁**：严格约束 `submit` 工作目录、`remote_exec` 的 `cwd` 以及 `transfer` 传输端点位于项目远端 `root` 内，通过前置词法守卫（`guard.py`）拒绝绕过 `sbatch` 并拦截越界删除等危险命令转入人工审批；各项目独立维护并发上限（`max_jobs`）与常设预算额度（单次与累计 `core_hours`、`gpu_hours`、`total_jobs`）。远端命令以零集群安装方式在你的 SSH 账号权限下运行（面向防误操作与审批门禁，而非 OS/容器级硬沙箱）。
 - **防 Agent 自审批的本地 Web 面板**：苹果极简设计风格，支持浅色 / 深色双主题与 **EN / 中文** 实时切换。Agent 可主动调用 `open_dashboard` 帮你唤起浏览器页面，但会话认证采用仅驻留内存的密钥与 60 秒一次性兑换码，Agent 永远无法获取凭据；支持开启 `web_only_approval`（禁用 CLI 审批）以及 SSH 端口转发场景下的 6 位 PIN 码解锁。
 - **更稳健的异步等待机制**：
   - 对支持 **MCP Tasks 扩展（`io.modelcontextprotocol/tasks`）** 的客户端（如 Claude Code）原生返回异步 Task 句柄；
@@ -120,6 +120,8 @@ hpcport doctor
 hpcport pin
 ```
 
+> **提示（开启 `web_only_approval` 时）**：在设置中开启「仅允许网页审批」后，为防止 CLI 凭据换取 Web 会话，`hpcport pin`（以及 CLI 审批与 CLI 策略修改）会被刻意禁用。无头环境下若启用此模式，请在 `tmux`/`screen` 等前台终端运行 `hpcport daemon`，直接查看启动时打印的 6 位 PIN 码。
+
 ### 3. 添加服务器预设与项目（网页或命令行均可）
 
 推荐直接在浏览器的 **设置（Settings）** 页面图形化操作，也支持 CLI（配置命令会自动拉起守护进程）：
@@ -204,7 +206,8 @@ HPCPort 同时支持**自动拉起守护进程的 stdio 桥接器**（`hpcport m
   - `clusters/<name>.yaml` — 全局共享服务器预设（版本历史保存在 `clusters/history/<name>/`）
   - `projects/<name>.yaml` — 项目远端目录、并发上限覆盖与独立策略（版本历史保存在 `projects/history/<name>/`）
   - `state.db` — SQLite WAL 数据库，记录批次、作业、后台任务、审批、等待、通知与审计日志
-- **防 Agent 自审批**：Web Cookie 仅由守护进程内存密钥通过 60 秒一次性浏览器重定向码（`/auth/exchange?code=...`）或 6 位 PIN 码签发；所有写操作校验 `X-HPCPort-UI: 1` 防 CSRF；在设置页开启 **仅允许网页审批** 后将彻底禁用 CLI 审批。
+- **防 Agent 自审批**：Web Cookie 仅由守护进程内存密钥通过 60 秒一次性浏览器重定向码（`/auth/exchange?code=...`）或 6 位 PIN 码签发；所有写操作校验 `X-HPCPort-UI: 1` 防 CSRF；在设置页开启 **仅允许网页审批** 后将彻底禁用 CLI 审批、CLI 策略修改与 `hpcport pin`。
+- **安全边界**：HPCPort 保持零集群端安装，远端命令以当前 SSH 用户权限执行。该机制旨在防止 LLM 失误、越界破坏、绕过预算提交与审批误操作，并非针对同系统用户恶意对抗的 OS/容器级硬沙箱。
 
 ---
 

@@ -468,7 +468,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
             return "cli"
         return None
 
-    def guarded(handler, mutating: bool = False, approval_action: bool = False):
+    def guarded(handler, mutating: bool = False, approval_action: bool = False,
+                web_only_when_locked: bool = False):
         async def wrapper(request):
             kind = auth_kind(request)
             if kind is None:
@@ -477,6 +478,12 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                 return fail(403, "missing X-HPCPort-UI header")
             if approval_action and kind == "cli" and daemon.global_cfg.web_only_approval:
                 return fail(403, "CLI approvals are disabled (web_only_approval is enabled)")
+            if web_only_when_locked and kind == "cli" and daemon.global_cfg.web_only_approval:
+                return fail(
+                    403,
+                    "Configuration and policy changes via CLI are disabled while "
+                    "web_only_approval is enabled",
+                )
             try:
                 return await handler(request)
             except (ApprovalError, AttachError, ConfigError) + ToolErrors as e:
@@ -533,7 +540,12 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         if auth_kind(request) != "cli":
             return fail(403, "CLI authentication required")
         if daemon.global_cfg.web_only_approval:
-            return fail(403, "PIN retrieval via CLI is disabled while web_only_approval is enabled")
+            return fail(
+                403,
+                "PIN retrieval via CLI is disabled while web_only_approval is enabled. "
+                "On a headless host, run `hpcport daemon` in a foreground terminal (e.g. tmux/screen) "
+                "to view the startup pairing PIN, or open the dashboard from a local desktop.",
+            )
         return JSONResponse({"pin": daemon.pairing_pin})
 
     async def dashboard_open_api(request):
@@ -844,9 +856,13 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
     def r_get(path, fn):
         return Route(path, guarded(fn, mutating=False), methods=["GET"])
 
-    def r_mut(path, fn, method="POST", approval_action=False):
-        return Route(path, guarded(fn, mutating=True, approval_action=approval_action),
-                     methods=[method])
+    def r_mut(path, fn, method="POST", approval_action=False, web_only_when_locked=False):
+        return Route(
+            path,
+            guarded(fn, mutating=True, approval_action=approval_action,
+                    web_only_when_locked=web_only_when_locked),
+            methods=[method],
+        )
 
     routes = [
         Route("/", index_page, methods=["GET"]),
@@ -859,21 +875,22 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         r_mut("/api/dashboard/open", dashboard_open_api, "POST"),
         r_get("/api/state", state_snapshot),
         r_get("/api/config", config_get),
-        r_mut("/api/config", config_patch, "PATCH"),
+        r_mut("/api/config", config_patch, "PATCH", web_only_when_locked=True),
         r_get("/api/projects", projects_list),
-        r_mut("/api/projects", projects_create, "POST"),
+        r_mut("/api/projects", projects_create, "POST", web_only_when_locked=True),
         r_get("/api/projects/{name}", project_get),
-        r_mut("/api/projects/{name}", project_patch, "PATCH"),
-        r_mut("/api/projects/{name}/clusters", project_attach, "POST"),
-        r_mut("/api/projects/{name}/clusters/{cluster}", project_detach, "DELETE"),
+        r_mut("/api/projects/{name}", project_patch, "PATCH", web_only_when_locked=True),
+        r_mut("/api/projects/{name}/clusters", project_attach, "POST", web_only_when_locked=True),
+        r_mut("/api/projects/{name}/clusters/{cluster}", project_detach, "DELETE",
+              web_only_when_locked=True),
         r_get("/api/projects/{name}/mcp-snippets", project_snippets),
         r_get("/api/presets", presets_list),
-        r_mut("/api/presets", presets_create, "POST"),
+        r_mut("/api/presets", presets_create, "POST", web_only_when_locked=True),
         r_get("/api/presets/{name}", preset_get),
-        r_mut("/api/presets/{name}", preset_patch, "PATCH"),
-        r_mut("/api/presets/{name}", preset_delete, "DELETE"),
+        r_mut("/api/presets/{name}", preset_patch, "PATCH", web_only_when_locked=True),
+        r_mut("/api/presets/{name}", preset_delete, "DELETE", web_only_when_locked=True),
         r_mut("/api/presets/{name}/test", preset_test, "POST"),
-        r_mut("/api/presets/{name}/restore", preset_restore, "POST"),
+        r_mut("/api/presets/{name}/restore", preset_restore, "POST", web_only_when_locked=True),
         r_get("/api/jobs", jobs_list),
         r_get("/api/jobs/{project}/{batch}", batch_detail),
         r_get("/api/job/{id:int}/files", job_files),

@@ -16,7 +16,7 @@ Instead of giving an agent raw, unguarded SSH access or polling loops, HPCPort p
 
 - **One global daemon for all projects**: Listens on `127.0.0.1:8765`, stores all presets, projects, SQLite state, and YAML version history cleanly under `~/.hpcport/` — zero clutter inside your code repositories.
 - **Slurm clusters & bare SSH servers**: Full `sbatch`/`squeue`/`sacct` batch lifecycle on Slurm clusters (`scheduler: slurm`) plus detached background execution (`remote_exec(..., background=True)`) on standard GPU/CPU servers without Slurm (`scheduler: none`).
-- **Workspace & command safety boundaries**: Confines remote operations inside each project's remote `root`, guards destructive or out-of-bounds shell commands, and enforces per-project concurrency limits (`max_jobs`) and standing compute budgets (`core_hours`, `gpu_hours`, `total_jobs`).
+- **Workspace & command safety guardrails**: Restricts `submit` workdirs, `remote_exec` working directories, and `transfer` endpoints to each project's remote `root`, scans commands before execution (`guard.py`) to refuse stray Slurm calls and require approval for destructive out-of-root or risky shell commands, and enforces per-project concurrency limits (`max_jobs`) and standing compute budgets (`core_hours`, `gpu_hours`, `total_jobs`). Commands execute under your SSH user with zero cluster-side installation (anti-mistake guardrail, not an OS/container sandbox).
 - **Anti-self-approval local Web UI**: Modern, Apple-minimalist light/dark dashboard with **EN / 中文** toggle. Agents can open the dashboard for you (`open_dashboard`), but authentication uses an in-memory secret and single-use 60-second browser exchange codes that are never exposed to the agent — plus optional `web_only_approval` lock and 6-digit PIN unlock for headless SSH port forwarding.
 - **Smart waiting without brittle push hacks**:
   - Protocol-level **MCP Tasks (`io.modelcontextprotocol/tasks`)** support for Tasks-capable clients (e.g. Claude Code).
@@ -120,6 +120,8 @@ On a headless remote machine over SSH port forwarding (`ssh -L 8765:127.0.0.1:87
 hpcport pin
 ```
 
+> **Note (`web_only_approval`)**: When `web_only_approval` is enabled in Settings, `hpcport pin` (along with CLI approvals and CLI policy edits) is intentionally disabled so CLI credentials cannot mint a Web session. On a headless host with `web_only_approval` enabled, run `hpcport daemon` in a foreground terminal (e.g. `tmux`/`screen`) to read the pairing PIN printed at startup.
+
 ### 3. Add a Server & Project (Web UI or CLI)
 
 You can configure everything visually in the **Settings** tab, or from the CLI (all setup commands auto-start the daemon if needed):
@@ -204,7 +206,8 @@ Example stdio config (works across projects automatically via `cwd`):
   - `clusters/<name>.yaml` — shared compute server presets (with `clusters/history/<name>/` versions)
   - `projects/<name>.yaml` — per-project remote roots, `max_jobs` overrides, and policies (with `projects/history/<name>/` versions)
   - `state.db` — SQLite WAL state for batches, jobs, background ops, approvals, waits, notices, and audit log
-- **Anti-self-approval**: Web cookies are minted only via an in-memory daemon secret redeemed through a 60s single-use browser redirect (`/auth/exchange?code=...`) or the 6-digit pairing PIN. All mutating Web endpoints require `X-HPCPort-UI: 1` (CSRF protection), and enabling `web_only_approval` in Settings disables CLI approvals completely.
+- **Anti-self-approval**: Web cookies are minted only via an in-memory daemon secret redeemed through a 60s single-use browser redirect (`/auth/exchange?code=...`) or the 6-digit pairing PIN. All mutating Web endpoints require `X-HPCPort-UI: 1` (CSRF protection), and enabling `web_only_approval` in Settings disables CLI approvals, CLI policy edits, and `hpcport pin` completely.
+- **Threat model**: HPCPort requires zero cluster-side installation and executes remote commands under your normal SSH account. It prevents accidental LLM mistakes, out-of-root deletions, stray Slurm submissions, and unapproved compute spend; it is not an OS/container sandbox against adversarial code running under the same OS user.
 
 ---
 

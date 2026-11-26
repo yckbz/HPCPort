@@ -146,6 +146,15 @@ def _cmd_web(args) -> None:
     if r.get("opened"):
         print("Opened %s" % r["url"])
     else:
+        st = _api(port, "GET", "/api/auth/status")
+        if st.get("web_only_approval"):
+            print("Open %s in your browser." % r["url"])
+            print(
+                "Note: web_only_approval is enabled, so CLI PIN retrieval is disabled. "
+                "On a headless host, run `hpcport daemon` in a foreground terminal "
+                "(e.g. tmux/screen) to view the startup pairing PIN."
+            )
+            return
         pin = _api(port, "GET", "/api/auth/pin").get("pin", "")
         print("Open %s in your browser (PIN: %s)" % (r["url"], pin))
 

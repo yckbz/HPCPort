@@ -266,20 +266,28 @@ def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):
         for key in ("codex", "opencode", "antigravity", "dsh", "claude_code"):
             assert key in snips
 
-        # Enable web_only_approval -> CLI token cannot approve AND cannot read pairing PIN!
+        # Enable web_only_approval -> CLI token cannot approve, read PIN, OR weaken config/policies!
         client.patch("/api/config", json={"web_only_approval": True},
                      headers={"X-HPCPort-UI": "1"})
         aid = d.settings.propose_preset("demo", "gpu01", {"guide": "new"}, "add note")["approval"]
         cli_client = TestClient(app)
-        r_cli_pin = cli_client.get(
-            "/api/auth/pin",
-            headers={"Authorization": "Bearer secret-cli-token"},
-        )
+        cli_hdr = {"Authorization": "Bearer secret-cli-token"}
+        r_cli_pin = cli_client.get("/api/auth/pin", headers=cli_hdr)
         assert r_cli_pin.status_code == 403
+        assert "hpcport daemon" in r_cli_pin.json()["error"]
+        # CLI cannot disable web_only_approval or mutate project/preset policies
+        assert cli_client.patch(
+            "/api/config", json={"web_only_approval": False}, headers=cli_hdr,
+        ).status_code == 403
+        assert d.global_cfg.web_only_approval is True
+        assert cli_client.patch(
+            "/api/projects/demo", json={"changes": {"submit": {"approval": False}}}, headers=cli_hdr,
+        ).status_code == 403
+        assert cli_client.patch(
+            "/api/presets/gpu01", json={"changes": {"gateway_allow": ["outside"]}}, headers=cli_hdr,
+        ).status_code == 403
         r_cli = cli_client.post(
-            "/api/approvals/%d/approve" % aid,
-            json={},
-            headers={"Authorization": "Bearer secret-cli-token"},
+            "/api/approvals/%d/approve" % aid, json={}, headers=cli_hdr,
         )
         assert r_cli.status_code == 403
         r_web = client.post(
@@ -289,6 +297,11 @@ def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):
         )
         assert r_web.status_code == 200
         assert r_web.json()["state"] == "approved"
+        # Web session CAN still toggle web_only_approval back off
+        assert client.patch(
+            "/api/config", json={"web_only_approval": False}, headers={"X-HPCPort-UI": "1"},
+        ).status_code == 200
+        assert d.global_cfg.web_only_approval is False
 
 
 def test_cli_blocks_agent_env(hpc_home):
