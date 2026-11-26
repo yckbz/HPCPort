@@ -591,8 +591,16 @@ function renderApprovalCard(a) {
     // proposal
     const fields = d.fields || [];
     const diffOpen = state.openDiffs.has(a.id);
+    const errMsg = d.error || "";
     bodyHtml = `
       ${d.shared ? `<div style="margin-bottom:8px"><span class="pill pill-purple">${esc(i18n.t("sharedBadge"))}</span></div>` : ""}
+      ${errMsg ? `
+        <div class="alert-banner-error">
+          <div style="font-weight:600;font-size:13px">${esc(i18n.t("invalidYamlTitle"))}</div>
+          <div class="mono text-xs" style="margin-top:4px;white-space:pre-wrap">${esc(errMsg)}</div>
+          <div class="text-xs" style="margin-top:6px;opacity:0.9">${esc(i18n.t("invalidYamlHint"))}</div>
+        </div>
+      ` : ""}
       ${fields.length ? `
         <div class="table-wrap" style="margin-top:6px">
           <table>
@@ -625,7 +633,10 @@ function renderApprovalCard(a) {
         </div>
       ` : ""}
     `;
-    actionButtons = `
+    actionButtons = errMsg ? `
+      <button type="button" class="btn btn-primary btn-sm" disabled title="${esc(i18n.t("invalidYamlTitle"))}">${esc(i18n.t("approveApply"))}</button>
+      <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("rejectRevert"))}</button>
+    ` : `
       <button type="button" class="btn btn-primary btn-sm" data-decide="approve" data-id="${a.id}">${esc(i18n.t("approveApply"))}</button>
       <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("reject"))}</button>
     `;
@@ -1918,7 +1929,7 @@ function openPresetModal(presetObj) {
   const isEdit = Boolean(presetObj);
   const d = (presetObj && presetObj.data) || {
     connect: "ssh", scheduler: "slurm", max_jobs: 10, poll_interval_s: 120,
-    exec_timeout_s: 1800, python: "python3", partitions: [], extra_paths: [], gateway_allow: [],
+    exec_timeout_s: 3600, python: "python3", partitions: [], extra_paths: [], gateway_allow: [],
   };
   let subTab = "form";
 
@@ -1973,10 +1984,10 @@ function openPresetModal(presetObj) {
           <input type="number" min="0" name="gpus_per_node" value="${esc(d.gpus_per_node ?? "")}" placeholder="0" />
         </label>
         <label class="field-label" data-slurm-only>${esc(i18n.t("fieldPollInterval"))}
-          <input type="number" min="5" name="poll_interval_s" value="${esc(d.poll_interval_s ?? 120)}" />
+          <input type="number" min="1" name="poll_interval_s" value="${esc(d.poll_interval_s ?? 120)}" />
         </label>
         <label class="field-label">${esc(i18n.t("fieldExecTimeout"))}
-          <input type="number" min="10" name="exec_timeout_s" value="${esc(d.exec_timeout_s ?? 1800)}" />
+          <input type="number" min="1" name="exec_timeout_s" value="${esc(d.exec_timeout_s ?? 3600)}" />
         </label>
         <label class="field-label">${esc(i18n.t("fieldPython"))}
           <input type="text" name="python" value="${esc(d.python || "python3")}" />

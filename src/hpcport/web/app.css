@@ -668,7 +668,7 @@ select {
 .progress-seg-active { background: var(--accent); }
 .progress-seg-wait { background: var(--amber); }
 .progress-seg-fail { background: var(--red); }
-.progress-seg-cancel { background: var(--text-tertiary); opacity: 0.45; }
+.progress-seg-cancel { background: var(--text-muted); opacity: 0.45; }
 
 .budget-grid {
   display: grid;
@@ -757,6 +757,15 @@ tr:last-child td { border-bottom: none; }
   border-radius: var(--radius-md);
   padding: 14px 16px;
   margin-bottom: 16px;
+}
+
+.alert-banner-error {
+  background: var(--red-soft);
+  border: 1px solid rgba(198, 40, 40, 0.28);
+  color: var(--red);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin: 8px 0 10px;
 }
 
 /* Settings Grids */
