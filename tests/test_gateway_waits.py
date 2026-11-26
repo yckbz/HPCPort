@@ -229,3 +229,69 @@ def test_pop_notices_initializes_head_for_new_session(hpc_home, tmp_path):
     d.waits.notify("p1", "batch_done", "batch:new", {"batch": "new", "cluster": "slurm1", "jobs": {}})
     got = d.waits.pop_notices("p1", "brand_new_session")
     assert len(got) == 1 and got[0]["subject"] == "batch:new"
+
+
+def test_gateway_foreground_heartbeats_fast_stop_and_poll_lock(hpc_home, tmp_path):
+    import hpcport.gateway as gw_mod
+
+    d, _, local_dir, remote = _setup_gateway(hpc_home, tmp_path)
+    (local_dir / "small.txt").write_text("hello", encoding="utf-8")
+
+    # 1. max_background=0 blocks background=True but MUST NOT block foreground exec/transfer
+    d.settings.update_project("p1", {"gateway": {"max_background": 0}})
+    r_fg = d.gateway.exec("p1", "bare1", "echo FG_OK", background=False)
+    assert r_fg["status"] == "ended" and "FG_OK" in r_fg["op"]["result"]["head"]
+    r_tr = d.gateway.transfer("p1", "small.txt", "bare1:small.txt", background=False)
+    assert r_tr["status"] == "ended" and r_tr["op"]["result"]["rc"] == 0
+    with pytest.raises(GatewayError) as exc_bg:
+        d.gateway.exec("p1", "bare1", "sleep 5", background=True)
+    assert exc_bg.value.code == "too_many_background"
+    with pytest.raises(GatewayError) as exc_tr_bg:
+        d.gateway.transfer("p1", "small.txt", "bare1:small2.txt", background=True)
+    assert exc_tr_bg.value.code == "too_many_background"
+
+    # 2. Foreground exec sends progress heartbeats while running
+    d.settings.update_project("p1", {"gateway": {"max_background": 4}})
+    old_tick = gw_mod.TICK_S
+    gw_mod.TICK_S = 0.05
+    ticks = []
+    try:
+        r_hb = d.gateway.exec(
+            "p1", "bare1", "sleep 0.25 && echo HB_DONE",
+            background=False, on_tick=lambda e, tot, m: ticks.append(m),
+        )
+        assert r_hb["status"] == "ended" and "HB_DONE" in r_hb["op"]["result"]["head"]
+        assert len(ticks) >= 1
+    finally:
+        gw_mod.TICK_S = old_tick
+
+    # 3. background=True immediately followed by remote_stop cleanly ends (never lost)
+    r_bg = d.gateway.exec("p1", "bare1", "sleep 30", background=True)
+    oid = r_bg["op"]["id"]
+    r_stop = d.gateway.stop("p1", oid, by="agent")
+    assert r_stop["status"] == "ended"
+    assert r_stop["op"]["state"] == "ended"
+    assert r_stop["op"]["result"].get("stopped") is True
+
+    # 4. gateway.poll() serializes concurrent callers
+    overlap = []
+    in_flight = [0]
+    orig_poll_once = d.gateway._poll_once
+
+    def slow_poll_once():
+        in_flight[0] += 1
+        if in_flight[0] > 1:
+            overlap.append(True)
+        time.sleep(0.05)
+        in_flight[0] -= 1
+        return []
+
+    d.gateway._poll_once = slow_poll_once
+    try:
+        t1 = threading.Thread(target=d.gateway.poll)
+        t2 = threading.Thread(target=d.gateway.poll)
+        t1.start(); t2.start()
+        t1.join(timeout=2); t2.join(timeout=2)
+        assert overlap == []
+    finally:
+        d.gateway._poll_once = orig_poll_once

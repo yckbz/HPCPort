@@ -30,6 +30,7 @@ from .executor import TransportError
 log = logging.getLogger("hpcport.gateway")
 
 WAIT_S = 180.0
+TICK_S = 15.0
 EXEC_DEFAULT_S = 120
 TRANSFER_DEFAULT_S = 1800
 TRANSFER_MAX_S = 3600
@@ -230,6 +231,7 @@ class GatewayService:
         self._next_poll: dict[str, float] = {}
         self._slots: dict[str, threading.Semaphore] = {}
         self._transfer_slots = threading.BoundedSemaphore(TRANSFER_SLOTS)
+        self._polling = threading.Lock()
         self.on_change = lambda project=None: None
 
     # ------------------------------------------------------------------ helpers
@@ -470,8 +472,9 @@ class GatewayService:
             self._ask(project, "remote_exec", args,
                       [{"code": f.rule, "what": f.what} for f in found],
                       wait_s=min(self.permissions.wait_s, p.gateway.wait_s), on_tick=on_tick)
-        with self.lock:
-            self._room(p)
+        if background:
+            with self.lock:
+                self._room(p)
         if files:
             if cwd and not SAFE_PATH.match(cwd):
                 raise GatewayError("bad_path", path=cwd)
@@ -511,12 +514,29 @@ class GatewayService:
             self.on_change(project)
         wait = 0.0 if background else min(self.wait_s, p.gateway.wait_s)
         script = self._start_script(project, cl, ex, d, wd, command, limit, wait, done)
+        stop_hb = threading.Event()
+        if wait > 0 and on_tick is not None:
+            t0_hb = time.monotonic()
+
+            def _heartbeat():
+                while not stop_hb.wait(TICK_S):
+                    elapsed = time.monotonic() - t0_hb
+                    if elapsed >= wait:
+                        return
+                    try:
+                        on_tick(elapsed, wait, "Running op:%d on %s" % (op_id, cluster))
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_heartbeat, daemon=True, name="exec-hb-%d" % op_id).start()
         try:
             try:
                 r = self._run(cluster, script, timeout=wait + 90)
             except TransportError as e:
                 log.warning("command %d on %s: %s", op_id, cluster, e)
                 return {"status": "unknown", "op": self.op(op_id)}
+            finally:
+                stop_hb.set()
             st = parse_status(r.out)
             if st.get("error"):
                 with self.lock:
@@ -567,6 +587,9 @@ class GatewayService:
             "if command -v setsid > /dev/null 2>&1; then\n"
             "  setsid %(shell)s \"$d/run.sh\" < /dev/null > /dev/null 2>&1 &\n"
             "else nohup %(shell)s \"$d/run.sh\" < /dev/null > /dev/null 2>&1 &\nfi\n"
+            "__hpcp_boot=0\n"
+            "while [ ! -f \"$d/pid\" ] && [ ! -f \"$d/rc\" ] && [ \"$__hpcp_boot\" -lt 100 ]; do\n"
+            "  sleep 0.05; __hpcp_boot=$((__hpcp_boot+1))\ndone\n"
             "SECONDS=0; t=0\n"
             "while [ ! -f \"$d/rc\" ] && [ \"$SECONDS\" -lt %(wait)d ]; do\n"
             "  if [ $t -lt 30 ]; then sleep 0.1; else sleep 1; fi; t=$((t+1))\ndone\n"
@@ -615,6 +638,10 @@ class GatewayService:
 
     # ------------------------------------------------------------------ poll & recover
     def poll(self) -> list[int]:
+        with self._polling:
+            return self._poll_once()
+
+    def _poll_once(self) -> list[int]:
         ended = []
         with self.lock:
             rows = [self.op(r["id"]) for r in self.db.all(
@@ -747,7 +774,8 @@ class GatewayService:
         else:
             legs = [self._rsync([a["spec"]], b["spec"], a["rsh"] or b["rsh"], exclude)]
         with self.lock:
-            self._room(p)
+            if background:
+                self._room(p)
             spec = dict(args, src=a["text"], dst=b["text"], size=size)
             op_id = self.db.insert(
                 "ops", project=project, kind="transfer",
@@ -763,7 +791,23 @@ class GatewayService:
                          name="transfer-%d" % op_id).start()
         wait = 0.0 if background else min(self.wait_s, p.gateway.wait_s)
         try:
-            job.done.wait(wait)
+            if wait > 0 and on_tick is not None:
+                t0_tr = time.monotonic()
+                deadline_tr = t0_tr + wait
+                while not job.done.is_set():
+                    left = deadline_tr - time.monotonic()
+                    if left <= 0:
+                        break
+                    if job.done.wait(min(left, TICK_S)):
+                        break
+                    if time.monotonic() < deadline_tr:
+                        try:
+                            on_tick(time.monotonic() - t0_tr, wait,
+                                    "Transferring op:%d (%s -> %s)" % (op_id, src, dst))
+                        except Exception:
+                            pass
+            else:
+                job.done.wait(wait)
             with self.lock:
                 row = self.op(op_id)
                 if job.done.is_set() and row["state"] == "running":
