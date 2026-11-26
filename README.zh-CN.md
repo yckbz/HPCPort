@@ -27,28 +27,28 @@ HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算�
 
 ## 零代码安装：直接交给 AI Agent 自动装好
 
-如果你不想手动敲命令，直接把本仓库的 GitHub 链接（或下载后的本地文件夹路径）发给你的 AI Agent，告诉它：
+如果你不想手动敲命令，直接把下面这句话发给你的 AI Agent 即可（若已下载到本地文件夹，把链接换成本地路径即可）：
 
-> 请根据 `<仓库链接或本地路径>` 中 README 的「Agent 自动安装协议」帮我安装并配置 HPCPort，接入你的 MCP 配置，然后帮我在浏览器里打开设置页面。
+> 请根据 `https://github.com/yckbz/HPCPort` 中 README 的「Agent 自动安装协议」帮我安装并配置 HPCPort，接入你的 MCP 配置，然后帮我在浏览器里打开设置页面。
 
 <details>
 <summary><strong>Agent 自动安装协议（给 AI Agent 执行的标准化步骤）</strong></summary>
 
-当用户要求你从本地路径或 Git 链接安装 HPCPort 时，请按以下顺序执行：
+当用户要求你安装 HPCPort（从 GitHub 或用户提供的本地文件夹路径）时，请按以下顺序执行：
 
-1. **全局安装 `hpcport` 包**（需 Python >= 3.10）：
+1. **全局安装 `hpcport` 包**（需 Python >= 3.10；如用户提供了本地路径，将下方链接替换为本地路径）：
    - 优先使用 `uv`（如果已安装）：
      ```bash
-     uv tool install "<仓库路径或 git+https 链接>"
+     uv tool install git+https://github.com/yckbz/HPCPort.git
      ```
    - 或使用 `pipx`：
      ```bash
-     pipx install "<仓库路径或 git+https 链接>"
+     pipx install git+https://github.com/yckbz/HPCPort.git
      ```
    - 通用兜底方案（标准 Python 均可运行）：
      ```bash
      python3 -m venv ~/.hpcport/venv
-     ~/.hpcport/venv/bin/pip install "<仓库路径或 git+https 链接>"
+     ~/.hpcport/venv/bin/pip install git+https://github.com/yckbz/HPCPort.git
      ```
 2. **获取绝对可执行路径并自检环境**：
    ```bash
@@ -70,7 +70,7 @@ HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算�
    - 若用户指定了项目名，可设为 `"args": ["mcp", "--project", "<项目名>"]`；原生 HTTP 客户端可直接连接 `http://127.0.0.1:8765/p/<项目名>/mcp`。
 4. **拉起守护进程并在用户浏览器打开设置页**：
    ```bash
-   "$HPCPORT_BIN" web --tab settings
+   "$HPCPORT_BIN" ui --tab settings
    ```
 5. **向用户交接**：
    - 告知用户浏览器已打开 HPCPort 设置页面，可直接点击**新增服务器**和**新建项目**（或让用户提供 SSH 主机别名由你代填）。
@@ -90,14 +90,15 @@ HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算�
 ### 1. 安装
 
 ```bash
-# 推荐：使用 uv
-uv tool install .
-# 或直接从 GitHub 安装：
-# uv tool install git+https://github.com/yckbz/HPCPort.git
+# 推荐：使用 uv 直接从 GitHub 安装
+uv tool install git+https://github.com/yckbz/HPCPort.git
 
-# 或使用标准 Python 虚拟环境
+# 或从本地克隆目录安装
+uv tool install .
+
+# 或使用标准 Python 虚拟环境 + pip
 python3 -m venv ~/.hpcport/venv
-~/.hpcport/venv/bin/pip install .
+~/.hpcport/venv/bin/pip install git+https://github.com/yckbz/HPCPort.git
 ```
 
 ### 2. 打开 Web 控制台
@@ -200,8 +201,8 @@ HPCPort 同时支持**自动拉起守护进程的 stdio 桥接器**（`hpcport m
 
 - **集中存储**：全部状态存放在 `~/.hpcport/`（可通过 `HPCPORT_HOME` 自定义）：
   - `config.yaml` — 端口、`auto_open_dashboard`、`web_only_approval` 与默认界面语言
-  - `clusters/<name>.yaml` — 全局共享服务器预设（带 `.history/` 历史版本）
-  - `projects/<name>.yaml` — 项目远端目录、并发上限覆盖与独立策略
+  - `clusters/<name>.yaml` — 全局共享服务器预设（版本历史保存在 `clusters/history/<name>/`）
+  - `projects/<name>.yaml` — 项目远端目录、并发上限覆盖与独立策略（版本历史保存在 `projects/history/<name>/`）
   - `state.db` — SQLite WAL 数据库，记录批次、作业、后台任务、审批、等待、通知与审计日志
 - **防 Agent 自审批**：Web Cookie 仅由守护进程内存密钥通过 60 秒一次性浏览器重定向码（`/auth/exchange?code=...`）或 6 位 PIN 码签发；所有写操作校验 `X-HPCPort-UI: 1` 防 CSRF；在设置页开启 **仅允许网页审批** 后将彻底禁用 CLI 审批。
 

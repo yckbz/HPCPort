@@ -23,6 +23,11 @@ dev = ["pytest>=8"]
 [project.scripts]
 hpcport = "hpcport.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/yckbz/HPCPort"
+Repository = "https://github.com/yckbz/HPCPort"
+Issues = "https://github.com/yckbz/HPCPort/issues"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

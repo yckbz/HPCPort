@@ -27,28 +27,28 @@ Instead of giving an agent raw, unguarded SSH access or polling loops, HPCPort p
 
 ## Zero-Code Setup: Let Your AI Agent Install It
 
-If you prefer not to run terminal commands manually, simply share this repository URL (or the downloaded local folder path) with your AI agent and send:
+If you prefer not to run terminal commands manually, simply copy and send the following prompt to your AI agent (if you already downloaded the repository locally, replace the URL with your local folder path):
 
-> Install HPCPort from `<repo-url-or-local-path>` following its README "Agent Self-Install Protocol", connect it to your MCP config, and open the Settings Web dashboard for me.
+> Install HPCPort from `https://github.com/yckbz/HPCPort` following its README "Agent Self-Install Protocol", connect it to your MCP config, and open the Settings Web dashboard for me.
 
 <details>
 <summary><strong>Agent Self-Install Protocol (instructions for AI agents)</strong></summary>
 
-When a user asks you to install HPCPort from a local path or Git URL, perform these exact steps:
+When a user asks you to install HPCPort (from GitHub or a local folder path), perform these exact steps:
 
-1. **Install the `hpcport` package globally** (requires Python >= 3.10):
+1. **Install the `hpcport` package globally** (requires Python >= 3.10; replace the URL with the local path if the user provided one):
    - Preferred if `uv` is installed:
      ```bash
-     uv tool install "<repo-path-or-git+https-url>"
+     uv tool install git+https://github.com/yckbz/HPCPort.git
      ```
    - Or if `pipx` is installed:
      ```bash
-     pipx install "<repo-path-or-git+https-url>"
+     pipx install git+https://github.com/yckbz/HPCPort.git
      ```
    - Fallback (always works with standard Python):
      ```bash
      python3 -m venv ~/.hpcport/venv
-     ~/.hpcport/venv/bin/pip install "<repo-path-or-git+https-url>"
+     ~/.hpcport/venv/bin/pip install git+https://github.com/yckbz/HPCPort.git
      ```
 2. **Resolve the absolute executable path and verify the environment**:
    ```bash
@@ -70,7 +70,7 @@ When a user asks you to install HPCPort from a local path or Git URL, perform th
    - Or, if the user already named a project, pass `"args": ["mcp", "--project", "<project-name>"]` or point HTTP-native clients to `http://127.0.0.1:8765/p/<project-name>/mcp`.
 4. **Start the daemon and open the Settings dashboard in the user's browser**:
    ```bash
-   "$HPCPORT_BIN" web --tab settings
+   "$HPCPORT_BIN" ui --tab settings
    ```
 5. **Hand off to the user**:
    - Tell the user the Settings dashboard is open in their browser where they can click **Add Server** and **New Project** (or offer to add presets/projects for them if they share their SSH host / alias).
@@ -90,14 +90,15 @@ When a user asks you to install HPCPort from a local path or Git URL, perform th
 ### 1. Install
 
 ```bash
-# Using uv (recommended)
-uv tool install .
-# Or directly from GitHub:
-# uv tool install git+https://github.com/yckbz/HPCPort.git
+# Recommended: install directly from GitHub with uv
+uv tool install git+https://github.com/yckbz/HPCPort.git
 
-# Or using pip inside a virtual environment
+# Or install from a local clone
+uv tool install .
+
+# Or using standard Python venv + pip
 python3 -m venv ~/.hpcport/venv
-~/.hpcport/venv/bin/pip install .
+~/.hpcport/venv/bin/pip install git+https://github.com/yckbz/HPCPort.git
 ```
 
 ### 2. Open the Web Dashboard
@@ -200,8 +201,8 @@ Example stdio config (works across projects automatically via `cwd`):
 
 - **Data directory**: Everything lives under `~/.hpcport/` (override with `HPCPORT_HOME`):
   - `config.yaml` — global port, `auto_open_dashboard`, `web_only_approval`, UI language
-  - `clusters/<name>.yaml` — shared compute server presets (with `.history/` versions)
-  - `projects/<name>.yaml` — per-project remote roots, `max_jobs` overrides, and policies
+  - `clusters/<name>.yaml` — shared compute server presets (with `clusters/history/<name>/` versions)
+  - `projects/<name>.yaml` — per-project remote roots, `max_jobs` overrides, and policies (with `projects/history/<name>/` versions)
   - `state.db` — SQLite WAL state for batches, jobs, background ops, approvals, waits, notices, and audit log
 - **Anti-self-approval**: Web cookies are minted only via an in-memory daemon secret redeemed through a 60s single-use browser redirect (`/auth/exchange?code=...`) or the 6-digit pairing PIN. All mutating Web endpoints require `X-HPCPort-UI: 1` (CSRF protection), and enabling `web_only_approval` in Settings disables CLI approvals completely.
 
