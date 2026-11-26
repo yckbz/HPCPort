@@ -327,17 +327,61 @@ def commands(src: str, depth: int = 0) -> list[Command]:
     return out
 
 
+_UNSET = object()
+_DIR_INDEX_RE = re.compile(r"^[+-]\d+$")
+
+
 def _inside(base: str, path: str) -> bool:
     base = base.rstrip("/") or "/"
     return path == base or path.startswith(base + "/" if base != "/" else "/")
 
 
-def locate(word: Word, place: Place, moved: bool) -> tuple[str, str]:
+def _resolve_dir(word: Word, cur_cwd: str | None, place: Place) -> str | None:
     text = word.text
-    if word.tilde and (text == "~" or text.startswith("~/")):
-        if place.home is None:
+    if not text:
+        return cur_cwd
+    if word.tilde:
+        if text == "~" or text.startswith("~/"):
+            if place.home is None:
+                return None
+            text = place.home + text[1:]
+        elif text == "~+" or text.startswith("~+/"):
+            if cur_cwd is None:
+                return None
+            text = cur_cwd + text[2:]
+        else:
+            return None
+    else:
+        for var in ("$HOME", "${HOME}"):
+            if text == var or text.startswith(var + "/"):
+                if place.home is None:
+                    return None
+                text = place.home + text[len(var):]
+                break
+    if "$" in text or "`" in text or any(ch in text for ch in "*?["):
+        return None
+    if text.startswith("/"):
+        return posixpath.normpath(text)
+    if cur_cwd is None:
+        return None
+    return posixpath.normpath(posixpath.join(cur_cwd, text))
+
+
+def locate(word: Word, place: Place, moved: bool = False, cwd=_UNSET) -> tuple[str, str]:
+    cur_cwd = None if moved else (place.cwd if cwd is _UNSET else cwd)
+    text = word.text
+    if word.tilde:
+        if text == "~" or text.startswith("~/"):
+            if place.home is None:
+                return "outside", text
+            text = place.home + text[1:]
+        elif text == "~+" or text.startswith("~+/"):
+            if cur_cwd is None:
+                return "outside", word.text
+            text = cur_cwd + text[2:]
+        else:
+            # ~otheruser/... or ~- cannot lie inside the project root
             return "outside", text
-        text = place.home + text[1:]
     else:
         for var in ("$HOME", "${HOME}"):
             if text == var or text.startswith(var + "/"):
@@ -360,9 +404,9 @@ def locate(word: Word, place: Place, moved: bool) -> tuple[str, str]:
             whole = False
             break
     if not fixed.startswith("/"):
-        if moved or word.tilde:
-            return "unknown", word.text
-        fixed = posixpath.join(place.cwd, fixed)
+        if cur_cwd is None:
+            return "outside", word.text
+        fixed = posixpath.join(cur_cwd, fixed)
     path = posixpath.normpath(fixed)
     if whole and any(path == r.rstrip("/") for r in place.roots):
         return "root", path
@@ -378,8 +422,6 @@ def _startup(path: str) -> bool:
 
 def check(command: str, place: Place, allow=(), scheduler: str = "slurm") -> list[Finding]:
     """Return all rule findings for a command; empty list means allowed to run."""
-    cmds = commands(command)
-    moved = any(c.words and _name(c.words[0]) in ("cd", "pushd", "popd") for c in cmds)
     found: list[Finding] = []
     use_slurm = scheduler == "slurm"
 
@@ -388,57 +430,105 @@ def check(command: str, place: Place, allow=(), scheduler: str = "slurm") -> lis
         if (RULES[rule] == REFUSE or rule not in allow) and f not in found:
             found.append(f)
 
-    def paths(words, startup_only=False):
-        for a in words:
-            where, path = locate(a, place, moved)
-            if where == "outside" and _startup(path):
-                add("startup", a.text)
-            elif startup_only:
-                continue
-            elif where == "outside":
-                add("outside", a.text)
-            elif where == "root":
-                add("root", a.text)
+    def scan_src(src: str, init_cwd: str | None, init_prev: str | None,
+                 init_stack: list[str | None], depth: int = 0) -> None:
+        cur_cwd: str | None = init_cwd
+        prev_cwd: str | None = init_prev
+        dir_stack: list[str | None] = list(init_stack)
 
-    for cmd in cmds:
-        for op, target in cmd.redirects:
-            if op.startswith(">") or op == "<>":
-                paths([target], startup_only=True)
-        if not cmd.words:
-            continue
-        name, args = _name(cmd.words[0]), cmd.words[1:]
-        ops = _operands(cmd.words)
-        texts = [a.text for a in args]
-        if use_slurm and name in SCHEDULER:
-            add("scheduler", name)
-        elif use_slurm and name == "scancel":
-            add("scancel", name)
-        elif name in DESTRUCTIVE:
-            paths(ops)
-        elif name == "find":
-            k = next((k for k, t in enumerate(texts) if t.startswith("-") or t in ("(", "!")),
-                     len(args))
-            acts = [posixpath.basename(texts[j + 1]) for j, t in enumerate(texts[:-1])
-                    if t in ("-exec", "-execdir", "-ok")]
-            if "-delete" in texts or any(a in DESTRUCTIVE for a in acts):
-                paths(args[:k] or [Word(".")])
-        elif name == "crontab":
-            if not texts or any(t != "-l" for t in texts):
-                add("crontab", name)
-        elif name in REMOTE:
-            add("remote", name)
-        elif name == "rsync":
-            if any(HOSTSPEC.match(a.text) for a in ops):
+        def paths(words, startup_only=False):
+            for a in words:
+                where, path = locate(a, place, cwd=cur_cwd)
+                if where == "outside" and _startup(path):
+                    add("startup", a.text)
+                elif startup_only:
+                    continue
+                elif where == "outside":
+                    add("outside", a.text)
+                elif where == "root":
+                    add("root", a.text)
+
+        for cmd in parse(src):
+            cmd.words = _strip(cmd.words)
+            for op, target in cmd.redirects:
+                if op.startswith(">") or op == "<>":
+                    paths([target], startup_only=True)
+            if not cmd.words:
+                continue
+            name, args = _name(cmd.words[0]), cmd.words[1:]
+            ops = _operands(cmd.words)
+            texts = [a.text for a in args]
+            if name == "cd":
+                if not ops:
+                    new_cwd = place.home
+                elif ops[0].text == "-":
+                    new_cwd = prev_cwd
+                else:
+                    new_cwd = _resolve_dir(ops[0], cur_cwd, place)
+                prev_cwd, cur_cwd = cur_cwd, new_cwd
+            elif name == "pushd":
+                if not ops:
+                    if dir_stack:
+                        top = dir_stack.pop()
+                        dir_stack.append(cur_cwd)
+                        prev_cwd, cur_cwd = cur_cwd, top
+                    else:
+                        prev_cwd, cur_cwd = cur_cwd, None
+                elif _DIR_INDEX_RE.match(ops[0].text):
+                    dir_stack.append(cur_cwd)
+                    prev_cwd, cur_cwd = cur_cwd, None
+                else:
+                    new_cwd = _resolve_dir(ops[0], cur_cwd, place)
+                    dir_stack.append(cur_cwd)
+                    prev_cwd, cur_cwd = cur_cwd, new_cwd
+            elif name == "popd":
+                if ops and _DIR_INDEX_RE.match(ops[0].text):
+                    cur_cwd = None
+                elif dir_stack:
+                    prev_cwd, cur_cwd = cur_cwd, dir_stack.pop()
+                else:
+                    prev_cwd, cur_cwd = cur_cwd, None
+            elif use_slurm and name in SCHEDULER:
+                add("scheduler", name)
+            elif use_slurm and name == "scancel":
+                add("scancel", name)
+            elif name in DESTRUCTIVE:
+                paths(ops)
+            elif name == "find":
+                k = next((k for k, t in enumerate(texts) if t.startswith("-") or t in ("(", "!")),
+                         len(args))
+                acts = [posixpath.basename(texts[j + 1]) for j, t in enumerate(texts[:-1])
+                        if t in ("-exec", "-execdir", "-ok")]
+                if "-delete" in texts or any(a in DESTRUCTIVE for a in acts):
+                    paths(args[:k] or [Word(".")])
+            elif name == "crontab":
+                if not texts or any(t != "-l" for t in texts):
+                    add("crontab", name)
+            elif name in REMOTE:
                 add("remote", name)
-        elif name in KILL_BY_NAME:
-            add("killall", name)
-        elif name == "tee":
-            paths(ops, startup_only=True)
-        elif name == "sed":
-            if any(re.match(r"^(-[a-zA-Z]*i|--in-place)", t) for t in texts):
+            elif name == "rsync":
+                if any(HOSTSPEC.match(a.text) for a in ops):
+                    add("remote", name)
+            elif name in KILL_BY_NAME:
+                add("killall", name)
+            elif name == "tee":
                 paths(ops, startup_only=True)
-        elif name in ("cp", "ln", "install", "chmod", "chown", "touch"):
-            paths(ops[-1:] if name in ("cp", "ln", "install") else ops, startup_only=True)
+            elif name == "sed":
+                if any(re.match(r"^(-[a-zA-Z]*i|--in-place)", t) for t in texts):
+                    paths(ops, startup_only=True)
+            elif name in ("cp", "ln", "install", "chmod", "chown", "touch"):
+                paths(ops[-1:] if name in ("cp", "ln", "install") else ops, startup_only=True)
+
+            if depth < MAX_DEPTH:
+                if name in SHELLS:
+                    for k, a in enumerate(args):
+                        if re.match(r"^-[a-z]*c$", a.text) and k + 1 < len(args):
+                            scan_src(args[k + 1].text, cur_cwd, prev_cwd, dir_stack, depth + 1)
+                            break
+                elif name == "eval":
+                    scan_src(" ".join(a.text for a in args), cur_cwd, prev_cwd, dir_stack, depth + 1)
+
+    scan_src(command, place.cwd, None, [], 0)
     return found
 
 
