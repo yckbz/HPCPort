@@ -18,6 +18,8 @@ def test_no_chinese_in_code():
         for p in sorted(root.rglob("*")):
             if not p.is_file() or "__pycache__" in p.parts:
                 continue
+            if any(part.endswith((".egg-info", ".dist-info")) for part in p.parts):
+                continue
             # web/i18n.js intentionally holds the Chinese translation dictionary for the Web UI
             if p.relative_to(REPO).as_posix() == "src/hpcport/web/i18n.js":
                 continue

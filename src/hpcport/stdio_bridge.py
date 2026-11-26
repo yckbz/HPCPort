@@ -149,12 +149,75 @@ def build_forward_headers(
 async def _run_bridge(url: str, cwd: str | None = None) -> None:
     session_id: str | None = None
     protocol_version: str | None = None
+    seen_any = False
     write_lock = asyncio.Lock()
+    in_flight: set[asyncio.Task] = set()
 
     async def emit(payload: str) -> None:
         async with write_lock:
             sys.stdout.write(payload.strip() + "\n")
             sys.stdout.flush()
+
+    def is_handshake(raw: str) -> bool:
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("method") in (
+            "initialize",
+            "notifications/initialized",
+            "server/discover",
+        )
+
+    async def forward_one(client: httpx.AsyncClient, raw: str) -> None:
+        nonlocal session_id, protocol_version
+        headers, det_ver = build_forward_headers(
+            raw, session_id=session_id, protocol_version=protocol_version, cwd=cwd,
+        )
+        if det_ver:
+            protocol_version = det_ver
+        try:
+            async with client.stream("POST", url, content=raw.encode("utf-8"),
+                                     headers=headers) as resp:
+                sid = resp.headers.get("mcp-session-id")
+                if sid:
+                    session_id = sid
+                pv_hdr = resp.headers.get("mcp-protocol-version")
+                if pv_hdr:
+                    protocol_version = pv_hdr
+                ctype = resp.headers.get("content-type", "")
+                if "text/event-stream" in ctype:
+                    data_lines: list[str] = []
+                    async for sse_line in resp.aiter_lines():
+                        if sse_line.startswith("data:"):
+                            data_lines.append(sse_line[5:].lstrip())
+                        elif sse_line == "" and data_lines:
+                            msg = "\n".join(data_lines).strip()
+                            data_lines.clear()
+                            if msg:
+                                await emit(msg)
+                    if data_lines:
+                        msg = "\n".join(data_lines).strip()
+                        if msg:
+                            await emit(msg)
+                else:
+                    body = (await resp.aread()).decode("utf-8", errors="replace").strip()
+                    if body:
+                        await emit(body)
+        except Exception as e:
+            # Return a JSON-RPC internal error if this was a request with an id
+            try:
+                req = json.loads(raw)
+            except ValueError:
+                req = {}
+            if isinstance(req, dict) and "id" in req:
+                await emit(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "error": {"code": -32603, "message": "HPCPort bridge error: %s" % e},
+                }))
 
     async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
         loop = asyncio.get_running_loop()
@@ -169,49 +232,17 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
             raw = line.strip()
             if not raw:
                 continue
-            headers, protocol_version = build_forward_headers(
-                raw, session_id=session_id, protocol_version=protocol_version, cwd=cwd,
-            )
-            try:
-                async with client.stream("POST", url, content=raw.encode("utf-8"),
-                                         headers=headers) as resp:
-                    sid = resp.headers.get("mcp-session-id")
-                    if sid:
-                        session_id = sid
-                    pv_hdr = resp.headers.get("mcp-protocol-version")
-                    if pv_hdr:
-                        protocol_version = pv_hdr
-                    ctype = resp.headers.get("content-type", "")
-                    if "text/event-stream" in ctype:
-                        data_lines: list[str] = []
-                        async for sse_line in resp.aiter_lines():
-                            if sse_line.startswith("data:"):
-                                data_lines.append(sse_line[5:].lstrip())
-                            elif sse_line == "" and data_lines:
-                                msg = "\n".join(data_lines).strip()
-                                data_lines.clear()
-                                if msg:
-                                    await emit(msg)
-                        if data_lines:
-                            msg = "\n".join(data_lines).strip()
-                            if msg:
-                                await emit(msg)
-                    else:
-                        body = (await resp.aread()).decode("utf-8", errors="replace").strip()
-                        if body:
-                            await emit(body)
-            except Exception as e:
-                # Return a JSON-RPC internal error if this was a request with an id
-                try:
-                    req = json.loads(raw)
-                except ValueError:
-                    req = {}
-                if isinstance(req, dict) and "id" in req:
-                    await emit(json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": req["id"],
-                        "error": {"code": -32603, "message": "HPCPort bridge error: %s" % e},
-                    }))
+            if is_handshake(raw) or (session_id is None and not seen_any):
+                seen_any = True
+                await forward_one(client, raw)
+            else:
+                seen_any = True
+                task = asyncio.create_task(forward_one(client, raw))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
 
 
 def serve_stdio(project: str | None = None, port: int | None = None) -> int:

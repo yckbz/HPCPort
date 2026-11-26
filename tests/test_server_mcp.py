@@ -490,3 +490,89 @@ def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):
         # Jobs & Audit endpoints respond cleanly
         assert client.get("/api/jobs?project=demo").status_code == 200
         assert client.get("/api/audit?project=demo").status_code == 200
+
+
+def test_stdio_bridge_concurrent_ping_not_blocked_by_wait_for(hpc_home, tmp_path):
+    """Real `hpcport mcp` stdio bridge must answer `ping` immediately while `wait_for` runs."""
+    import os
+    import socket
+    import threading
+    import time
+    import uvicorn
+
+    d, ex, app, _, _, _ = _make_app(hpc_home, tmp_path)
+    # Find an ephemeral free local port
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    try:
+        # Wait until live HTTP daemon is reachable
+        import httpx
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                if httpx.get("http://127.0.0.1:%d/api/health" % port, timeout=0.5).status_code == 200:
+                    break
+            except Exception:
+                time.sleep(0.05)
+
+        # Start a background op so wait_for(wait_s=2.0) blocks for ~2s
+        op = d.gateway.exec("demo", "bare1", "sleep 20", background=True)
+        oid = op["op"]["id"]
+
+        env = dict(os.environ, PYTHONPATH="src", HPCPORT_HOME=str(hpc_home))
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hpcport.cli", "mcp", "--project", "demo", "--port", str(port)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, env=env, cwd="/Users/liuce/Desktop/HPCPort",
+        )
+        try:
+            def send(obj):
+                proc.stdin.write(json.dumps(obj) + "\n")
+                proc.stdin.flush()
+
+            send({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "stdio-conc", "version": "1.0"},
+                },
+            })
+            r1 = json.loads(proc.stdout.readline())
+            assert r1["id"] == 1
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            # Fire a 2.0s wait_for, then immediately fire ping
+            t0 = time.monotonic()
+            send({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "wait_for",
+                    "arguments": {"groups": [{"items": ["op:%d" % oid], "priority": 1}], "wait_s": 2.0},
+                },
+            })
+            time.sleep(0.05)
+            t_ping = time.monotonic()
+            send({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}})
+
+            first = json.loads(proc.stdout.readline())
+            ping_dt = time.monotonic() - t_ping
+            second = json.loads(proc.stdout.readline())
+            total_dt = time.monotonic() - t0
+
+            assert first["id"] == 3, "ping was blocked behind wait_for: first=%r" % (first,)
+            assert ping_dt < 0.8, "ping took %.2fs (head-of-line blocked)" % ping_dt
+            assert second["id"] == 2
+            assert total_dt >= 1.8
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=5)
+            d.gateway.stop("demo", oid, by="user")
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
