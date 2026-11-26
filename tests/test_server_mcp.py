@@ -288,3 +288,58 @@ def test_cli_blocks_agent_env(hpc_home):
     )
     assert p.returncode != 0
     assert "not for agents" in p.stderr
+
+
+def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):
+    d, ex, app, opened, remote, _ = _make_app(hpc_home, tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        # Static assets served publicly (auth is enforced on /api/*)
+        r_idx = client.get("/")
+        assert r_idx.status_code == 200
+        assert "HPCPort" in r_idx.text
+        for asset in ("/static/app.css", "/static/app.js", "/static/i18n.js"):
+            ra = client.get(asset)
+            assert ra.status_code == 200, asset
+
+        # Authenticate via PIN
+        r_pin = client.post("/api/auth/pin", json={"pin": d.pairing_pin},
+                            headers={"X-HPCPort-UI": "1"})
+        assert r_pin.status_code == 200
+        assert client.get("/api/auth/status").json()["authenticated"] is True
+
+        # Create, test, update, restore, and delete a bare SSH preset via Web API
+        r_cp = client.post(
+            "/api/presets",
+            json={"name": "lab4090", "data": {
+                "connect": "local", "scheduler": "none", "projects_root": str(remote),
+            }},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_cp.status_code == 200
+        r_test = client.post("/api/presets/lab4090/test", json={},
+                             headers={"X-HPCPort-UI": "1"})
+        assert r_test.status_code == 200
+        assert r_test.json()["ok"] is True
+
+        r_up = client.patch(
+            "/api/presets/lab4090",
+            json={"changes": {"guide": "4x RTX 4090 workstation"}},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_up.status_code == 200
+        assert r_up.json()["version"] == 2
+
+        r_rest = client.post(
+            "/api/presets/lab4090/restore",
+            json={"version": 1},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_rest.status_code == 200
+        assert r_rest.json()["version"] == 3
+
+        r_del = client.delete("/api/presets/lab4090", headers={"X-HPCPort-UI": "1"})
+        assert r_del.status_code == 200
+
+        # Jobs & Audit endpoints respond cleanly
+        assert client.get("/api/jobs?project=demo").status_code == 200
+        assert client.get("/api/audit?project=demo").status_code == 200

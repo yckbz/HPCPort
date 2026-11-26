@@ -1,0 +1,2064 @@
+// HPCPort Local Web Dashboard - Zero-build Vanilla ES Module App
+
+import { createI18n } from "/static/i18n.js";
+
+const ALLOWABLE_RULES = ["scancel", "outside", "root", "startup", "crontab", "remote", "killall"];
+const VALID_TABS = new Set(["approvals", "jobs", "audit", "settings"]);
+
+const i18n = createI18n(localStorage.getItem("hpcport_lang") || "en");
+
+const state = {
+  authenticated: false,
+  tab: "approvals",
+  project: localStorage.getItem("hpcport_project") || "",
+  theme: localStorage.getItem("hpcport_theme") || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+  alertsEnabled: localStorage.getItem("hpcport_alerts") === "1",
+  showHistory: false,
+  batchFilterStatus: "all",
+  batchFilterCluster: "",
+  auditTool: "",
+  auditLimit: 50,
+
+  // Data caches
+  snapshot: null,
+  approvals: [],
+  approvalsHistory: [],
+  jobsData: null,
+  expandedBatches: {},      // key "proj::batch" -> job rows
+  auditRows: [],
+  snippetsCache: {},        // project -> { codex, opencode, ... }
+  activeSnippetTab: {},     // project -> agent key
+  testResults: {},          // preset -> { ok, text }
+  openScripts: new Set(),   // approval ids showing scripts
+  openStanding: new Set(),  // approval ids showing standing form
+  openDiffs: new Set(),     // approval ids showing unified diff
+
+  // Live SSE
+  sse: null,
+  sseConnected: false,
+  lastPendingIds: new Set(),
+  refreshTimer: null,
+
+  // Drawer state
+  drawer: null,
+};
+
+// ------------------------------------------------------------------ helpers
+function esc(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function fmtTime(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  return d.toLocaleString(i18n.lang === "zh" ? "zh-CN" : "en-US", {
+    month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false,
+  });
+}
+
+function fmtRel(ts) {
+  if (!ts) return i18n.t("neverSynced");
+  const diff = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  return `${Math.floor(diff / 86400)}d`;
+}
+
+function fmtNum(v, digits = 1) {
+  if (v === null || v === undefined) return "-";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return Number.isInteger(n) ? String(n) : n.toFixed(digits);
+}
+
+function toast(msg, isError = false) {
+  const root = document.getElementById("toast-root");
+  const el = document.createElement("div");
+  el.className = "toast" + (isError ? " error" : "");
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 220);
+  }, 3200);
+}
+
+async function api(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  const headers = Object.assign({}, opts.headers || {});
+  if (method !== "GET") {
+    headers["X-HPCPort-UI"] = "1";
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
+  }
+  const resp = await fetch(path, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    credentials: "same-origin",
+  });
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch {
+    data = {};
+  }
+  if (resp.status === 401) {
+    showAuthGate();
+    throw new Error(data.error || "Authentication required");
+  }
+  if (!resp.ok) {
+    throw new Error(data.error || `HTTP ${resp.status}`);
+  }
+  return data;
+}
+
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", state.theme);
+  localStorage.setItem("hpcport_theme", state.theme);
+  const sun = document.getElementById("theme-icon-sun");
+  const moon = document.getElementById("theme-icon-moon");
+  if (sun && moon) {
+    sun.classList.toggle("hidden", state.theme !== "dark");
+    moon.classList.toggle("hidden", state.theme === "dark");
+  }
+}
+
+function updateLangButtonLabels() {
+  for (const group of document.querySelectorAll(".lang-pill")) {
+    for (const btn of group.querySelectorAll("button")) {
+      btn.classList.toggle("active", btn.dataset.lang === i18n.lang);
+      btn.textContent = btn.dataset.lang === "en" ? i18n.t("langEn") : i18n.t("langZh");
+    }
+  }
+}
+
+function applyStaticLabels() {
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = i18n.t(el.dataset.i18n);
+  });
+  document.getElementById("auth-title").textContent = i18n.t("unlockTitle");
+  document.getElementById("auth-desc").textContent = i18n.t("unlockDesc");
+  document.getElementById("pin-input").placeholder = i18n.t("unlockPlaceholder");
+  document.getElementById("pin-submit").textContent = i18n.t("unlockBtn");
+  document.getElementById("auth-tip").textContent = i18n.t("unlockTip");
+  document.getElementById("notif-btn-label").textContent = state.alertsEnabled ? i18n.t("alertsOn") : i18n.t("alertsOff");
+  document.getElementById("sse-label").textContent = state.sseConnected ? i18n.t("liveConnected") : i18n.t("liveReconnecting");
+  document.getElementById("drawer-refresh").textContent = i18n.t("refresh");
+  updateLangButtonLabels();
+}
+
+async function setLanguage(lang, persistServer = true) {
+  i18n.setLang(lang);
+  localStorage.setItem("hpcport_lang", i18n.lang);
+  applyStaticLabels();
+  renderAll();
+  if (persistServer && state.authenticated) {
+    try {
+      await api("/api/config", { method: "PATCH", body: { language: i18n.lang } });
+    } catch {
+      // Ignore if offline
+    }
+  }
+}
+
+// ------------------------------------------------------------------ Auth & Boot
+function showAuthGate() {
+  state.authenticated = false;
+  if (state.sse) {
+    state.sse.close();
+    state.sse = null;
+  }
+  document.getElementById("app-shell").classList.add("hidden");
+  document.getElementById("auth-gate").classList.remove("hidden");
+  applyStaticLabels();
+}
+
+function showAppShell() {
+  state.authenticated = true;
+  document.getElementById("auth-gate").classList.add("hidden");
+  document.getElementById("app-shell").classList.remove("hidden");
+  applyStaticLabels();
+  connectSSE();
+  refreshAll();
+}
+
+function readHashTab() {
+  const h = (location.hash || "").replace(/^#/, "").trim();
+  if (VALID_TABS.has(h)) return h;
+  return "approvals";
+}
+
+function switchTab(tab, pushHash = true) {
+  if (!VALID_TABS.has(tab)) tab = "approvals";
+  state.tab = tab;
+  if (pushHash && location.hash !== `#${tab}`) {
+    history.replaceState(null, "", `#${tab}`);
+  }
+  document.querySelectorAll(".nav-tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  ["approvals", "jobs", "audit", "settings"].forEach((t) => {
+    document.getElementById(`view-${t}`).classList.toggle("hidden", t !== tab);
+  });
+  refreshActiveTab();
+}
+
+// ------------------------------------------------------------------ SSE
+function connectSSE() {
+  if (state.sse) state.sse.close();
+  const es = new EventSource("/api/events");
+  state.sse = es;
+  const pill = document.getElementById("sse-indicator");
+
+  es.addEventListener("connected", () => {
+    state.sseConnected = true;
+    pill.classList.add("connected");
+    document.getElementById("sse-label").textContent = i18n.t("liveConnected");
+  });
+
+  const onUpdate = () => scheduleRefresh();
+  es.addEventListener("state", onUpdate);
+  es.addEventListener("approval", () => {
+    scheduleRefresh(true);
+  });
+
+  es.onerror = () => {
+    state.sseConnected = false;
+    pill.classList.remove("connected");
+    document.getElementById("sse-label").textContent = i18n.t("liveReconnecting");
+  };
+}
+
+function scheduleRefresh(fromApprovalEvent = false) {
+  if (state.refreshTimer) clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(async () => {
+    state.refreshTimer = null;
+    await refreshAll(fromApprovalEvent);
+  }, 180);
+}
+
+// ------------------------------------------------------------------ Data Fetching
+async function refreshAll(notifyNewApproval = false) {
+  if (!state.authenticated) return;
+  try {
+    const snap = await api("/api/state");
+    state.snapshot = snap;
+    // Validate selected project still exists
+    const names = (snap.projects || []).map((p) => p.name);
+    if (state.project && !names.includes(state.project)) {
+      state.project = "";
+      localStorage.setItem("hpcport_project", "");
+    }
+    renderProjectSelect();
+    updateApprovalsBadge(snap.pending_approvals || 0);
+    await refreshActiveTab(notifyNewApproval);
+  } catch (e) {
+    if (state.authenticated) toast(e.message, true);
+  }
+}
+
+async function refreshActiveTab(notifyNewApproval = false) {
+  if (!state.authenticated) return;
+  try {
+    const qProj = state.project ? `project=${encodeURIComponent(state.project)}` : "";
+    if (state.tab === "approvals" || notifyNewApproval) {
+      const pending = await api(`/api/approvals${qProj ? "?" + qProj : ""}`);
+      const list = pending.approvals || [];
+      if (notifyNewApproval && state.alertsEnabled && "Notification" in window && Notification.permission === "granted") {
+        for (const a of list) {
+          if (!state.lastPendingIds.has(a.id)) {
+            new Notification(`HPCPort: ${a.summary}`, { body: `${a.project || "global"} (#${a.id})` });
+          }
+        }
+      }
+      state.lastPendingIds = new Set(list.map((a) => a.id));
+      state.approvals = list;
+      updateApprovalsBadge(state.snapshot ? state.snapshot.pending_approvals : list.length);
+      if (state.showHistory) {
+        const all = await api(`/api/approvals?all=1${qProj ? "&" + qProj : ""}`);
+        state.approvalsHistory = (all.approvals || []).filter((a) => a.state !== "pending");
+      }
+      if (state.tab === "approvals") renderApprovals();
+    }
+    if (state.tab === "jobs") {
+      const qs = [];
+      if (state.project) qs.push(`project=${encodeURIComponent(state.project)}`);
+      if (state.batchFilterCluster) qs.push(`cluster=${encodeURIComponent(state.batchFilterCluster)}`);
+      state.jobsData = await api(`/api/jobs${qs.length ? "?" + qs.join("&") : ""}`);
+      renderJobs();
+    }
+    if (state.tab === "audit") {
+      const qs = [`n=${state.auditLimit}`];
+      if (state.project) qs.push(`project=${encodeURIComponent(state.project)}`);
+      if (state.auditTool) qs.push(`tool=${encodeURIComponent(state.auditTool)}`);
+      const res = await api(`/api/audit?${qs.join("&")}`);
+      state.auditRows = res.audit || [];
+      renderAudit();
+    }
+    if (state.tab === "settings") {
+      await ensureSnippetsLoaded();
+      renderSettings();
+    }
+  } catch (e) {
+    if (state.authenticated) toast(e.message, true);
+  }
+}
+
+async function ensureSnippetsLoaded() {
+  const projs = (state.snapshot && state.snapshot.projects) || [];
+  await Promise.all(
+    projs.map(async (p) => {
+      if (!state.snippetsCache[p.name]) {
+        try {
+          const r = await api(`/api/projects/${encodeURIComponent(p.name)}/mcp-snippets`);
+          state.snippetsCache[p.name] = r.snippets || {};
+        } catch {
+          state.snippetsCache[p.name] = {};
+        }
+      }
+    })
+  );
+}
+
+function updateApprovalsBadge(n) {
+  const b = document.getElementById("approvals-badge");
+  b.textContent = String(n);
+  b.classList.toggle("hidden", !n);
+  document.title = n > 0 ? `(${n}) HPCPort` : "HPCPort";
+}
+
+function renderProjectSelect() {
+  const sel = document.getElementById("project-select");
+  const projects = (state.snapshot && state.snapshot.projects) || [];
+  const opts = [`<option value="">${esc(i18n.t("allProjects"))}</option>`];
+  for (const p of projects) {
+    opts.push(`<option value="${esc(p.name)}"${p.name === state.project ? " selected" : ""}>${esc(p.name)}</option>`);
+  }
+  sel.innerHTML = opts.join("");
+}
+
+function renderAll() {
+  renderProjectSelect();
+  if (state.tab === "approvals") renderApprovals();
+  if (state.tab === "jobs") renderJobs();
+  if (state.tab === "audit") renderAudit();
+  if (state.tab === "settings") renderSettings();
+}
+
+// ------------------------------------------------------------------ TAB 1: APPROVALS
+function renderReasonChip(r) {
+  const code = r.code || r.rule || "";
+  if (code === "over") {
+    return `<span class="pill pill-amber">${esc(i18n.t("reason_over"))}: ${esc(r.what)} ${fmtNum(r.asked)} &gt; ${fmtNum(r.limit)}</span>`;
+  }
+  if (code === "total") {
+    return `<span class="pill pill-amber">${esc(i18n.t("reason_total"))}: ${esc(r.what)} ${fmtNum(r.reached)} &gt; ${fmtNum(r.limit)}</span>`;
+  }
+  if (code === "unknown") {
+    return `<span class="pill pill-amber">${esc(i18n.t("reason_unknown"))} (${esc((r.scripts || []).join(", "))})</span>`;
+  }
+  if (code === "no_standing") {
+    return `<span class="pill pill-blue">${esc(i18n.t("reason_no_standing"))}</span>`;
+  }
+  if (r.rule) {
+    return `<span class="pill pill-amber">${esc(r.rule)}${r.detail ? ": " + esc(r.detail) : ""}</span>`;
+  }
+  return `<span class="pill pill-gray">${esc(code || JSON.stringify(r))}</span>`;
+}
+
+function renderUnifiedDiff(text) {
+  if (!text) return "";
+  return text.split("\n").map((line) => {
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
+      return `<span class="diff-line-hdr">${esc(line)}</span>`;
+    }
+    if (line.startsWith("+")) return `<span class="diff-line-add">${esc(line)}</span>`;
+    if (line.startsWith("-")) return `<span class="diff-line-del">${esc(line)}</span>`;
+    return `<span>${esc(line)}\n</span>`;
+  }).join("");
+}
+
+function renderApprovalCard(a) {
+  const d = a.detail || {};
+  const kindBadge =
+    a.kind === "submit" ? `<span class="pill pill-blue">${esc(i18n.t("kindSubmit"))}</span>` :
+    a.kind === "permission" ? `<span class="pill pill-amber">${esc(i18n.t("kindPermission"))}</span>` :
+    `<span class="pill pill-purple">${esc(i18n.t(d.origin === "detected" ? "kindDiskEdit" : "kindProposal"))}</span>`;
+
+  let bodyHtml = "";
+  let actionButtons = "";
+
+  if (a.kind === "submit") {
+    const sub = d.submission || {};
+    const why = d.why || [];
+    const scripts = sub.script_texts || {};
+    const scriptNames = Object.keys(scripts);
+    const scriptsOpen = state.openScripts.has(a.id);
+    const standingOpen = state.openStanding.has(a.id);
+    const projInfo = ((state.snapshot && state.snapshot.projects) || []).find((p) => p.name === a.project);
+    const defaults = (projInfo && projInfo.data && projInfo.data.submit) || {};
+
+    bodyHtml = `
+      <div class="muted text-sm">
+        <span class="mono">${esc(sub.cluster || "")}</span> &middot;
+        <span class="mono">${esc(sub.batch || "")}</span> &middot;
+        <span class="mono">${esc(sub.workdir || "")}</span>
+        ${sub.tag ? ` &middot; <span class="pill pill-gray">${esc(sub.tag)}</span>` : ""}
+      </div>
+      <div class="metrics-strip">
+        <div class="metric-chip"><span class="k">${esc(i18n.t("metricJobs"))}</span><span class="v">${esc(sub.jobs ?? 0)}</span></div>
+        <div class="metric-chip"><span class="k">${esc(i18n.t("metricCoreH"))}</span><span class="v">${fmtNum(sub.core_hours)}</span></div>
+        <div class="metric-chip"><span class="k">${esc(i18n.t("metricGpuH"))}</span><span class="v">${fmtNum(sub.gpu_hours)}</span></div>
+      </div>
+      ${why.length ? `<div class="reason-row">${why.map(renderReasonChip).join("")}</div>` : ""}
+      ${scriptNames.length ? `
+        <div style="margin-top:8px">
+          <button type="button" class="btn btn-subtle btn-xs" data-toggle-scripts="${a.id}">
+            ${esc(scriptsOpen ? i18n.t("hideScripts") : i18n.t("previewScripts"))} (${scriptNames.length})
+          </button>
+          ${scriptsOpen ? scriptNames.map((fn) => `
+            <div style="margin-top:8px">
+              <div class="mono text-xs muted">${esc(fn)}</div>
+              <pre class="code-block">${esc(scripts[fn])}</pre>
+            </div>
+          `).join("") : ""}
+        </div>
+      ` : ""}
+      ${standingOpen ? `
+        <div class="standing-drawer" data-standing-box="${a.id}">
+          <div class="text-sm" style="font-weight:600">${esc(i18n.t("standingFormTitle"))}</div>
+          <div class="standing-grid">
+            <label class="field-label">${esc(i18n.t("limCoreH"))}
+              <input type="number" step="any" min="0" name="core_hours" value="${defaults.core_hours ?? ""}" />
+            </label>
+            <label class="field-label">${esc(i18n.t("limGpuH"))}
+              <input type="number" step="any" min="0" name="gpu_hours" value="${defaults.gpu_hours ?? ""}" />
+            </label>
+            <label class="field-label">${esc(i18n.t("limTotalJobs"))}
+              <input type="number" step="1" min="0" name="total_jobs" value="${defaults.total_jobs ?? ""}" />
+            </label>
+            <label class="field-label">${esc(i18n.t("limTotalCoreH"))}
+              <input type="number" step="any" min="0" name="total_core_hours" value="${defaults.total_core_hours ?? ""}" />
+            </label>
+            <label class="field-label">${esc(i18n.t("limTotalGpuH"))}
+              <input type="number" step="any" min="0" name="total_gpu_hours" value="${defaults.total_gpu_hours ?? ""}" />
+            </label>
+          </div>
+          <div class="flex-row">
+            <button type="button" class="btn btn-primary btn-sm" data-decide-standing="${a.id}">${esc(i18n.t("confirmGrant"))}</button>
+            <button type="button" class="btn btn-outline btn-sm" data-toggle-standing="${a.id}">${esc(i18n.t("cancelBtn"))}</button>
+          </div>
+        </div>
+      ` : ""}
+    `;
+    actionButtons = `
+      <button type="button" class="btn btn-primary btn-sm" data-decide="approve" data-id="${a.id}">${esc(i18n.t("approveOnce"))}</button>
+      <button type="button" class="btn btn-soft btn-sm" data-toggle-standing="${a.id}">${esc(i18n.t("approveAndStand"))}</button>
+      <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("reject"))}</button>
+    `;
+  } else if (a.kind === "permission") {
+    const inp = d.input || {};
+    const why = d.why || [];
+    const preview = d.tool === "remote_exec"
+      ? `cluster: ${inp.cluster || "-"}\ncwd:     ${inp.cwd || "(project root)"}\ncommand: ${inp.command || ""}`
+      : JSON.stringify(inp, null, 2);
+    bodyHtml = `
+      ${why.length ? `<div class="reason-row">${why.map(renderReasonChip).join("")}</div>` : ""}
+      <pre class="code-block">${esc(preview)}</pre>
+    `;
+    actionButtons = `
+      <button type="button" class="btn btn-primary btn-sm" data-decide="approve" data-id="${a.id}">${esc(i18n.t("allowOnce"))}</button>
+      <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("deny"))}</button>
+    `;
+  } else {
+    // proposal
+    const fields = d.fields || [];
+    const diffOpen = state.openDiffs.has(a.id);
+    bodyHtml = `
+      ${d.shared ? `<div style="margin-bottom:8px"><span class="pill pill-purple">${esc(i18n.t("sharedBadge"))}</span></div>` : ""}
+      ${fields.length ? `
+        <div class="table-wrap" style="margin-top:6px">
+          <table>
+            <thead>
+              <tr>
+                <th>${esc(i18n.t("fieldCol"))}</th>
+                <th>${esc(i18n.t("currentCol"))}</th>
+                <th>${esc(i18n.t("proposedCol"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${fields.map((f) => `
+                <tr>
+                  <td class="mono">
+                    ${esc(f.name)}
+                    ${f.safety ? `<span class="pill pill-red" style="margin-left:6px">${esc(i18n.t("safetyBadge"))}</span>` : ""}
+                  </td>
+                  <td class="mono muted">${esc(f.old)}</td>
+                  <td class="mono" style="color:var(--green);font-weight:600">${esc(f.new)}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : ""}
+      ${d.diff ? `
+        <div style="margin-top:10px">
+          <button type="button" class="btn btn-subtle btn-xs" data-toggle-diff="${a.id}">${esc(i18n.t("unifiedDiff"))}</button>
+          ${diffOpen ? `<pre class="code-block">${renderUnifiedDiff(d.diff)}</pre>` : ""}
+        </div>
+      ` : ""}
+    `;
+    actionButtons = `
+      <button type="button" class="btn btn-primary btn-sm" data-decide="approve" data-id="${a.id}">${esc(i18n.t("approveApply"))}</button>
+      <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("reject"))}</button>
+    `;
+  }
+
+  return `
+    <article class="approval-card" data-approval-card="${a.id}">
+      <div class="approval-meta">
+        ${kindBadge}
+        ${a.project ? `<span class="pill pill-gray">${esc(a.project)}</span>` : ""}
+        <span class="mono muted">#${a.id}</span>
+        <span class="muted text-xs" style="margin-left:auto">${esc(fmtTime(a.created))}</span>
+      </div>
+      <h3 class="approval-summary">${esc(a.summary)}</h3>
+      ${bodyHtml}
+      <div class="approval-actions">
+        <input type="text" data-comment-for="${a.id}" placeholder="${esc(i18n.t("commentPlaceholder"))}" />
+        ${actionButtons}
+      </div>
+    </article>
+  `;
+}
+
+function renderApprovals() {
+  const el = document.getElementById("view-approvals");
+  const pending = state.approvals || [];
+  let html = `
+    <div class="page-header">
+      <div>
+        <h1>${esc(i18n.t("approvalsTitle"))}</h1>
+        <p>${esc(i18n.t("approvalsSubtitle"))}</p>
+      </div>
+      <button type="button" class="btn btn-subtle btn-sm" id="toggle-history-btn">
+        ${esc(state.showHistory ? i18n.t("hideHistory") : i18n.t("showHistory"))}
+      </button>
+    </div>
+  `;
+
+  if (!pending.length) {
+    html += `
+      <div class="empty-state">
+        <div class="empty-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h3>${esc(i18n.t("noApprovalsTitle"))}</h3>
+        <p>${esc(i18n.t("noApprovalsDesc"))}</p>
+      </div>
+    `;
+  } else {
+    html += pending.map(renderApprovalCard).join("");
+  }
+
+  if (state.showHistory) {
+    const hist = state.approvalsHistory || [];
+    html += `
+      <div class="card" style="margin-top:20px">
+        <div class="card-header"><h2 class="card-title">${esc(i18n.t("recentDecisions"))}</h2></div>
+        ${!hist.length ? `<p class="muted text-sm">${esc(i18n.t("noDecisions"))}</p>` : `
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>${esc(i18n.t("colProject"))}</th>
+                  <th>${esc(i18n.t("colKind"))}</th>
+                  <th>Summary</th>
+                  <th>${esc(i18n.t("colStatus"))}</th>
+                  <th>${esc(i18n.t("colTime"))}</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${hist.slice(0, 30).map((a) => `
+                  <tr>
+                    <td class="mono muted">#${a.id}</td>
+                    <td>${esc(a.project || "-")}</td>
+                    <td><span class="pill pill-gray">${esc(a.kind)}</span></td>
+                    <td>
+                      <div>${esc(a.summary)}</div>
+                      ${a.comment ? `<div class="muted text-xs">${esc(a.comment)}</div>` : ""}
+                    </td>
+                    <td>${renderStatePill(a.state)}</td>
+                    <td class="muted text-xs tabular">${esc(fmtTime(a.decided || a.created))}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `}
+      </div>
+    `;
+  }
+
+  el.innerHTML = html;
+
+  document.getElementById("toggle-history-btn").onclick = async () => {
+    state.showHistory = !state.showHistory;
+    await refreshActiveTab();
+  };
+
+  el.querySelectorAll("[data-toggle-scripts]").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.toggleScripts);
+      if (state.openScripts.has(id)) state.openScripts.delete(id);
+      else state.openScripts.add(id);
+      renderApprovals();
+    };
+  });
+
+  el.querySelectorAll("[data-toggle-standing]").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.toggleStanding);
+      if (state.openStanding.has(id)) state.openStanding.delete(id);
+      else state.openStanding.add(id);
+      renderApprovals();
+    };
+  });
+
+  el.querySelectorAll("[data-toggle-diff]").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.toggleDiff);
+      if (state.openDiffs.has(id)) state.openDiffs.delete(id);
+      else state.openDiffs.add(id);
+      renderApprovals();
+    };
+  });
+
+  el.querySelectorAll("[data-decide]").forEach((btn) => {
+    btn.onclick = async () => {
+      const id = Number(btn.dataset.id);
+      const action = btn.dataset.decide;
+      const comment = (el.querySelector(`[data-comment-for="${id}"]`)?.value || "").trim();
+      btn.disabled = true;
+      try {
+        await api(`/api/approvals/${id}/${action}`, { method: "POST", body: { comment } });
+        toast(i18n.t(action === "approve" ? "approvedToast" : "rejectedToast", { id }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    };
+  });
+
+  el.querySelectorAll("[data-decide-standing]").forEach((btn) => {
+    btn.onclick = async () => {
+      const id = Number(btn.dataset.decideStanding);
+      const box = el.querySelector(`[data-standing-box="${id}"]`);
+      const comment = (el.querySelector(`[data-comment-for="${id}"]`)?.value || "").trim();
+      const payload = { always: true, comment };
+      for (const inp of box.querySelectorAll("input[name]")) {
+        const raw = inp.value.trim();
+        if (raw === "") {
+          payload[inp.name] = null;
+        } else {
+          payload[inp.name] = inp.name === "total_jobs" ? parseInt(raw, 10) : parseFloat(raw);
+        }
+      }
+      btn.disabled = true;
+      try {
+        await api(`/api/approvals/${id}/approve`, { method: "POST", body: payload });
+        state.openStanding.delete(id);
+        toast(i18n.t("approvedToast", { id }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+// ------------------------------------------------------------------ TAB 2: OVERVIEW & JOBS
+function renderStatePill(st) {
+  const s = String(st || "").toLowerCase();
+  if (["done", "completed", "approved", "ended"].includes(s)) return `<span class="pill pill-green">${esc(st)}</span>`;
+  if (["running", "queued", "active"].includes(s)) return `<span class="pill pill-blue">${esc(st)}</span>`;
+  if (["held", "unapproved", "pending", "stopping", "timeout"].includes(s)) return `<span class="pill pill-amber">${esc(st)}</span>`;
+  if (["failed", "rejected", "submit_failed", "lost", "error", "cancelled"].includes(s)) return `<span class="pill pill-red">${esc(st)}</span>`;
+  return `<span class="pill pill-gray">${esc(st)}</span>`;
+}
+
+function renderStandingCard(standing) {
+  if (!state.project) {
+    return `
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">${esc(i18n.t("standingTitle"))}</h2>
+        </div>
+        <p class="muted text-sm" style="margin:0">${esc(i18n.t("standingSelectHint"))}</p>
+      </div>
+    `;
+  }
+  if (!standing) return "";
+  if (!standing.approval) {
+    return `
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
+          <span class="pill pill-green">${esc(i18n.t("standingAuto"))}</span>
+        </div>
+      </div>
+    `;
+  }
+  const st = standing.standing;
+  const used = standing.used;
+  if (!st) {
+    return `
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
+          <span class="pill pill-gray">Off</span>
+        </div>
+        <p class="muted text-sm" style="margin:0">${esc(i18n.t("standingNone"))}</p>
+      </div>
+    `;
+  }
+  const lims = st.limits || {};
+  const bars = [
+    { label: i18n.t("limTotalJobs"), key: "jobs", limit: lims.total_jobs },
+    { label: i18n.t("limTotalCoreH"), key: "core_hours", limit: lims.total_core_hours },
+    { label: i18n.t("limTotalGpuH"), key: "gpu_hours", limit: lims.total_gpu_hours },
+  ];
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
+          <div class="muted text-xs" style="margin-top:2px">
+            ${esc(i18n.t("perSubmitCaps"))}:
+            ${esc(i18n.t("metricCoreH"))} ${lims.core_hours ?? i18n.t("unlimited")} &middot;
+            ${esc(i18n.t("metricGpuH"))} ${lims.gpu_hours ?? i18n.t("unlimited")}
+          </div>
+        </div>
+        <button type="button" class="btn btn-danger btn-sm" id="revoke-standing-btn">
+          ${esc(i18n.t("revokeStanding"))}
+        </button>
+      </div>
+      <div class="budget-grid">
+        ${bars.map((b) => {
+          const total = used ? (used[b.key] || 0) : 0;
+          const parts = (used && used.parts && used.parts[b.key]) || {};
+          const done = parts.done || 0;
+          const active = parts.active || 0;
+          const wait = parts.waiting || 0;
+          const denom = b.limit && b.limit > 0 ? b.limit : Math.max(total, 1);
+          const pDone = Math.min(100, (done / denom) * 100);
+          const pAct = Math.min(100 - pDone, (active / denom) * 100);
+          const pWait = Math.min(100 - pDone - pAct, (wait / denom) * 100);
+          return `
+            <div class="budget-item">
+              <div class="budget-item-top tabular">
+                <span>${esc(b.label)}</span>
+                <span>${fmtNum(total)} / ${b.limit == null ? esc(i18n.t("unlimited")) : fmtNum(b.limit)}</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-seg-done" style="width:${pDone}%"></div>
+                <div class="progress-seg-active" style="width:${pAct}%"></div>
+                <div class="progress-seg-wait" style="width:${pWait}%"></div>
+              </div>
+              <div class="muted text-xs tabular" style="margin-top:6px">
+                ${esc(i18n.t("budgetMeasured"))} ${fmtNum(done)} &middot;
+                ${esc(i18n.t("budgetActive"))} ${fmtNum(active)} &middot;
+                ${esc(i18n.t("budgetWaiting"))} ${fmtNum(wait)}
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderJobs() {
+  const el = document.getElementById("view-jobs");
+  const data = state.jobsData || { batches: [], ops: [], unregistered: [], usage: {}, standing: null };
+  const health = (state.snapshot && state.snapshot.health) || {};
+  const batches = data.batches || [];
+  const ops = data.ops || [];
+  const unreg = data.unregistered || [];
+  const usage = data.usage || {};
+
+  const activeBatches = batches.filter((b) => !b.finished).length;
+  const activeJobs = batches.reduce((acc, b) => acc + (b.jobs.running || 0) + (b.jobs.queued || 0), 0);
+  const runningOps = ops.filter((o) => o.state === "running").length;
+  const serverNames = Object.keys(health);
+  const onlineServers = serverNames.filter((n) => health[n].reachable).length;
+
+  const filteredBatches = batches.filter((b) => {
+    if (state.batchFilterStatus === "active") return !b.finished;
+    if (state.batchFilterStatus === "finished") return b.finished;
+    if (state.batchFilterStatus === "failed") return (b.jobs.failed || 0) + (b.jobs.submit_failed || 0) > 0;
+    return true;
+  });
+
+  let html = `
+    <div class="page-header">
+      <div>
+        <h1>${esc(i18n.t("overviewTitle"))}</h1>
+        <p>${esc(i18n.t("overviewSubtitle"))}</p>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">${esc(i18n.t("statActiveBatches"))}</div><div class="stat-value">${activeBatches}</div></div>
+      <div class="stat-card"><div class="stat-label">${esc(i18n.t("statRunningJobs"))}</div><div class="stat-value">${activeJobs}</div></div>
+      <div class="stat-card"><div class="stat-label">${esc(i18n.t("statBgOps"))}</div><div class="stat-value">${runningOps}</div></div>
+      <div class="stat-card"><div class="stat-label">${esc(i18n.t("statServers"))}</div><div class="stat-value">${onlineServers} / ${serverNames.length}</div></div>
+    </div>
+  `;
+
+  if (unreg.length) {
+    html += `
+      <div class="alert-banner">
+        <strong>${esc(i18n.t("unregBannerTitle"))}</strong>
+        <div class="text-sm" style="margin-top:4px">${esc(i18n.t("unregBannerDesc"))}</div>
+        <div class="mono text-xs" style="margin-top:6px">
+          ${unreg.map((u) => `${esc(u.cluster)}:${esc(u.slurm_id)} (${esc(u.state || "?")})`).join("  |  ")}
+        </div>
+      </div>
+    `;
+  }
+
+  html += renderStandingCard(data.standing);
+
+  if (serverNames.length) {
+    html += `
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">${esc(i18n.t("serversHealthTitle"))}</h2>
+        </div>
+        <div class="servers-grid">
+          ${serverNames.map((name) => {
+            const h = health[name];
+            const u = usage[name];
+            const pct = u && u.max_jobs ? Math.min(100, Math.round((u.in_slurm / u.max_jobs) * 100)) : 0;
+            return `
+              <div class="server-card">
+                <div class="server-card-top">
+                  <div class="flex-row" style="gap:7px">
+                    <span class="status-dot ${h.reachable ? "green" : "red"}"></span>
+                    <strong class="mono">${esc(name)}</strong>
+                  </div>
+                  <span class="pill ${h.scheduler === "slurm" ? "pill-blue" : "pill-gray"}">
+                    ${esc(h.scheduler === "slurm" ? i18n.t("schedulerSlurm") : i18n.t("schedulerNone"))}
+                  </span>
+                </div>
+                <div class="muted text-xs mono">${esc(h.connect === "local" ? "local" : (h.host || "ssh"))}</div>
+                <div class="muted text-xs" style="margin-top:4px">
+                  ${esc(h.reachable ? i18n.t("reachable") : i18n.t("unreachable"))}
+                  ${h.scheduler === "slurm" ? ` &middot; ${esc(i18n.t("lastSync"))}: ${esc(fmtRel(h.last_sync))}` : ""}
+                </div>
+                ${u && h.scheduler === "slurm" ? `
+                  <div style="margin-top:10px">
+                    <div class="flex-between text-xs tabular">
+                      <span>${esc(i18n.t("slotsLabel"))}</span>
+                      <span>${u.in_slurm} / ${u.max_jobs}</span>
+                    </div>
+                    <div class="progress-track" style="margin-top:5px">
+                      <div class="progress-seg-active" style="width:${pct}%"></div>
+                    </div>
+                    <div class="muted text-xs tabular" style="margin-top:4px">
+                      ${u.held} ${esc(i18n.t("heldLabel"))} &middot; ${u.unapproved} ${esc(i18n.t("unapprovedLabel"))}
+                    </div>
+                  </div>
+                ` : ""}
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  // Slurm Batches Card
+  html += `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">${esc(i18n.t("batchesTitle"))}</h2>
+        <div class="filter-bar">
+          <select id="batch-cluster-filter" class="select-compact">
+            <option value="">${esc(i18n.t("allClusters"))}</option>
+            ${serverNames.map((n) => `<option value="${esc(n)}"${n === state.batchFilterCluster ? " selected" : ""}>${esc(n)}</option>`).join("")}
+          </select>
+          ${["all", "active", "finished", "failed"].map((st) => `
+            <button type="button" class="btn btn-xs ${state.batchFilterStatus === st ? "btn-primary" : "btn-subtle"}" data-batch-filter="${st}">
+              ${esc(i18n.t("filter" + st[0].toUpperCase() + st.slice(1)))}
+            </button>
+          `).join("")}
+        </div>
+      </div>
+      ${!filteredBatches.length ? `<p class="muted text-sm">${esc(i18n.t("noBatches"))}</p>` : `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>${esc(i18n.t("colBatch"))}</th>
+                <th>${esc(i18n.t("colProject"))}</th>
+                <th>${esc(i18n.t("colServer"))}</th>
+                <th>${esc(i18n.t("colProgress"))}</th>
+                <th>${esc(i18n.t("colFailRate"))}</th>
+                <th>${esc(i18n.t("colUpdated"))}</th>
+                <th>${esc(i18n.t("colActions"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filteredBatches.map((b) => {
+                const key = `${b.project}::${b.batch}`;
+                const rows = state.expandedBatches[key];
+                const c = b.jobs || {};
+                const tot = Math.max(b.n_jobs || 1, 1);
+                const pDone = ((c.done || 0) / tot) * 100;
+                const pAct = (((c.running || 0) + (c.queued || 0)) / tot) * 100;
+                const pWait = (((c.held || 0) + (c.unapproved || 0)) / tot) * 100;
+                const pFail = (((c.failed || 0) + (c.submit_failed || 0)) / tot) * 100;
+                const summaryChips = Object.entries(c).map(([k, v]) => `${k}:${v}`).join(" ");
+                return `
+                  <tr>
+                    <td>
+                      <div class="flex-row" style="gap:6px">
+                        <strong class="mono">${esc(b.batch)}</strong>
+                        ${b.tag ? `<span class="pill pill-gray">${esc(b.tag)}</span>` : ""}
+                      </div>
+                      <div class="muted text-xs">${esc(b.desc || "")}</div>
+                    </td>
+                    <td>${esc(b.project)}</td>
+                    <td class="mono">${esc(b.cluster)}</td>
+                    <td style="min-width:190px">
+                      <div class="progress-track">
+                        <div class="progress-seg-done" style="width:${pDone}%"></div>
+                        <div class="progress-seg-active" style="width:${pAct}%"></div>
+                        <div class="progress-seg-wait" style="width:${pWait}%"></div>
+                        <div class="progress-seg-fail" style="width:${pFail}%"></div>
+                      </div>
+                      <div class="muted text-xs tabular" style="margin-top:4px">${esc(summaryChips)}</div>
+                    </td>
+                    <td class="tabular">${b.fail_rate ? Math.round(b.fail_rate * 100) + "%" : "0%"}</td>
+                    <td class="muted text-xs tabular">${esc(fmtTime(b.changed))}</td>
+                    <td>
+                      <div class="flex-row" style="gap:6px">
+                        <button type="button" class="btn btn-subtle btn-xs" data-expand-batch="${esc(key)}">${esc(i18n.t("inspectJobs"))} (${b.n_jobs})</button>
+                        ${!b.finished ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-batch="${esc(key)}">${esc(i18n.t("cancelBatch"))}</button>` : ""}
+                      </div>
+                    </td>
+                  </tr>
+                  ${rows ? `
+                    <tr class="subrow">
+                      <td colspan="7">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>ID</th>
+                              <th>Slurm ID</th>
+                              <th>Script</th>
+                              <th>State</th>
+                              <th>Cores / GPUs</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            ${rows.map((j) => `
+                              <tr>
+                                <td class="mono muted">#${j.id}</td>
+                                <td class="mono">${esc(j.slurm_id || "-")}</td>
+                                <td class="mono">${esc(j.script)}</td>
+                                <td>${renderStatePill(j.state)}${j.slurm_state ? ` <span class="muted text-xs">${esc(j.slurm_state)}</span>` : ""}</td>
+                                <td class="tabular text-xs">${esc(j.cores ?? "-")}c / ${esc(j.gpus ?? 0)}g</td>
+                                <td>
+                                  <div class="flex-row" style="gap:6px">
+                                    <button type="button" class="btn btn-subtle btn-xs" data-inspect-job="${j.id}">${esc(i18n.t("inspectFiles"))}</button>
+                                    ${["unapproved", "held", "queued", "running"].includes(j.state) ? `<button type="button" class="btn btn-danger btn-xs" data-cancel-job="${j.id}" data-job-project="${esc(j.project)}">${esc(i18n.t("cancelJob"))}</button>` : ""}
+                                  </div>
+                                </td>
+                              </tr>
+                            `).join("")}
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  ` : ""}
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+  `;
+
+  // Background Ops Card
+  html += `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">${esc(i18n.t("opsTitle"))}</h2>
+      </div>
+      ${!ops.length ? `<p class="muted text-sm">${esc(i18n.t("noOps"))}</p>` : `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>${esc(i18n.t("colOp"))}</th>
+                <th>${esc(i18n.t("colProject"))}</th>
+                <th>${esc(i18n.t("colServer"))}</th>
+                <th>${esc(i18n.t("colKind"))}</th>
+                <th>${esc(i18n.t("colCommand"))}</th>
+                <th>${esc(i18n.t("colStatus"))}</th>
+                <th>${esc(i18n.t("colActions"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${ops.map((o) => {
+                const sp = o.spec || {};
+                const cmdText = o.kind === "exec" ? (sp.command || "") : `${sp.src || ""} -> ${sp.dst || ""}`;
+                return `
+                  <tr>
+                    <td class="mono"><strong>op:${o.id}</strong></td>
+                    <td>${esc(o.project)}</td>
+                    <td class="mono">${esc(o.cluster || "-")}</td>
+                    <td><span class="pill pill-gray">${esc(o.kind)}</span></td>
+                    <td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(cmdText)}">${esc(cmdText)}</td>
+                    <td>${renderStatePill(o.state)}</td>
+                    <td>
+                      <div class="flex-row" style="gap:6px">
+                        ${o.kind === "exec" ? `<button type="button" class="btn btn-subtle btn-xs" data-inspect-op="${o.id}">${esc(i18n.t("viewOutput"))}</button>` : ""}
+                        ${o.state === "running" ? `<button type="button" class="btn btn-danger btn-xs" data-stop-op="${o.id}">${esc(i18n.t("stopOp"))}</button>` : ""}
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+  `;
+
+  el.innerHTML = html;
+
+  const revokeBtn = document.getElementById("revoke-standing-btn");
+  if (revokeBtn) {
+    revokeBtn.onclick = async () => {
+      try {
+        await api(`/api/standing/${encodeURIComponent(state.project)}`, { method: "DELETE" });
+        toast(i18n.t("revokedToast", { project: state.project }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    };
+  }
+
+  const cf = document.getElementById("batch-cluster-filter");
+  if (cf) {
+    cf.onchange = () => {
+      state.batchFilterCluster = cf.value;
+      refreshActiveTab();
+    };
+  }
+
+  el.querySelectorAll("[data-batch-filter]").forEach((btn) => {
+    btn.onclick = () => {
+      state.batchFilterStatus = btn.dataset.batchFilter;
+      renderJobs();
+    };
+  });
+
+  el.querySelectorAll("[data-expand-batch]").forEach((btn) => {
+    btn.onclick = async () => {
+      const key = btn.dataset.expandBatch;
+      if (state.expandedBatches[key]) {
+        delete state.expandedBatches[key];
+        renderJobs();
+        return;
+      }
+      const [proj, batch] = key.split("::");
+      try {
+        const res = await api(`/api/jobs/${encodeURIComponent(proj)}/${encodeURIComponent(batch)}`);
+        state.expandedBatches[key] = res.jobs || [];
+        renderJobs();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    };
+  });
+
+  el.querySelectorAll("[data-cancel-batch]").forEach((btn) => {
+    btn.onclick = () => {
+      const [proj, batch] = btn.dataset.cancelBatch.split("::");
+      openCancelModal({ project: proj, batch });
+    };
+  });
+
+  el.querySelectorAll("[data-cancel-job]").forEach((btn) => {
+    btn.onclick = () => {
+      openCancelModal({ project: btn.dataset.jobProject, job_ids: [String(btn.dataset.cancelJob)] });
+    };
+  });
+
+  el.querySelectorAll("[data-inspect-job]").forEach((btn) => {
+    btn.onclick = () => openJobDrawer(Number(btn.dataset.inspectJob));
+  });
+
+  el.querySelectorAll("[data-inspect-op]").forEach((btn) => {
+    btn.onclick = () => openOpDrawer(Number(btn.dataset.inspectOp));
+  });
+
+  el.querySelectorAll("[data-stop-op]").forEach((btn) => {
+    btn.onclick = async () => {
+      const id = Number(btn.dataset.stopOp);
+      btn.disabled = true;
+      try {
+        await api(`/api/ops/${id}/stop`, { method: "POST" });
+        toast(i18n.t("stoppedToast", { id }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+function openCancelModal(target) {
+  openModal(i18n.t("cancelPromptTitle"), `
+    <p class="muted text-sm" style="margin-top:0">${esc(i18n.t("cancelPromptDesc"))}</p>
+    <input type="text" id="cancel-comment-input" style="width:100%" placeholder="${esc(i18n.t("commentPlaceholder"))}" />
+    <div class="modal-footer">
+      <button type="button" class="btn btn-outline btn-sm" id="modal-cancel-btn">${esc(i18n.t("cancelBtn"))}</button>
+      <button type="button" class="btn btn-danger btn-sm" id="modal-confirm-cancel">${esc(i18n.t("cancelPromptConfirm"))}</button>
+    </div>
+  `);
+  document.getElementById("modal-cancel-btn").onclick = closeModal;
+  document.getElementById("modal-confirm-cancel").onclick = async () => {
+    const comment = document.getElementById("cancel-comment-input").value.trim();
+    try {
+      await api("/api/cancel", { method: "POST", body: Object.assign({}, target, { comment }) });
+      closeModal();
+      toast(i18n.t("cancelledToast"));
+      await refreshAll();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+}
+
+// ------------------------------------------------------------------ DRAWER (Job Files / Op Output)
+async function openJobDrawer(jobId) {
+  state.drawer = { type: "job", id: jobId, activeTab: "script", data: null };
+  showDrawer(i18n.t("drawerJobTitle", { id: jobId }), "Loading...");
+  await loadDrawerData();
+}
+
+async function openOpDrawer(opId) {
+  state.drawer = { type: "op", id: opId, activeTab: "output", data: null };
+  showDrawer(i18n.t("drawerOpTitle", { id: opId }), "Loading...");
+  await loadDrawerData();
+}
+
+function showDrawer(title, subtitle) {
+  document.getElementById("drawer-title").textContent = title;
+  document.getElementById("drawer-subtitle").textContent = subtitle || "";
+  document.getElementById("drawer-backdrop").classList.remove("hidden");
+  document.getElementById("drawer").classList.remove("hidden");
+  document.getElementById("drawer").setAttribute("aria-hidden", "false");
+}
+
+function closeDrawer() {
+  state.drawer = null;
+  document.getElementById("drawer-backdrop").classList.add("hidden");
+  document.getElementById("drawer").classList.add("hidden");
+  document.getElementById("drawer").setAttribute("aria-hidden", "true");
+}
+
+async function loadDrawerData() {
+  if (!state.drawer) return;
+  try {
+    if (state.drawer.type === "job") {
+      const r = await api(`/api/job/${state.drawer.id}/files`);
+      state.drawer.data = r;
+      const j = r.job || {};
+      document.getElementById("drawer-subtitle").textContent =
+        `${j.project || ""} / ${j.cluster || ""} / ${j.script || ""} (Slurm ${j.slurm_id || "-"})`;
+    } else {
+      const r = await api(`/api/ops/${state.drawer.id}/output`);
+      state.drawer.data = r;
+      const o = r.op || {};
+      document.getElementById("drawer-subtitle").textContent =
+        `${o.project || ""} / ${o.cluster || ""} (${o.state || ""})`;
+    }
+    renderDrawerContent();
+  } catch (e) {
+    document.getElementById("drawer-body").innerHTML = `<div class="inline-error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderDrawerContent() {
+  if (!state.drawer || !state.drawer.data) return;
+  const tabsEl = document.getElementById("drawer-tabs");
+  const bodyEl = document.getElementById("drawer-body");
+  if (state.drawer.type === "job") {
+    const tabs = [
+      { key: "script", label: i18n.t("tabScript") },
+      { key: "stdout", label: i18n.t("tabStdout") },
+      { key: "stderr", label: i18n.t("tabStderr") },
+    ];
+    tabsEl.innerHTML = tabs.map((t) => `
+      <button type="button" class="snippet-tab ${state.drawer.activeTab === t.key ? "active" : ""}" data-dtab="${t.key}">
+        ${esc(t.label)}
+      </button>
+    `).join("");
+    tabsEl.querySelectorAll("[data-dtab]").forEach((b) => {
+      b.onclick = () => {
+        state.drawer.activeTab = b.dataset.dtab;
+        renderDrawerContent();
+      };
+    });
+    const text = state.drawer.data[state.drawer.activeTab] || "";
+    bodyEl.innerHTML = `<pre>${esc(text || i18n.t("emptyOutput"))}</pre>`;
+  } else {
+    tabsEl.innerHTML = `<span class="pill pill-blue">${esc(i18n.t("tabOutput"))}</span>`;
+    const text = state.drawer.data.output || "";
+    bodyEl.innerHTML = `<pre>${esc(text || i18n.t("emptyOutput"))}</pre>`;
+  }
+}
+
+// ------------------------------------------------------------------ TAB 3: AUDIT
+function renderAudit() {
+  const el = document.getElementById("view-audit");
+  const rows = state.auditRows || [];
+  const tools = ["submit", "remote_exec", "transfer", "remote_stop", "jobs", "cancel", "wait_for", "propose_preset", "open_dashboard"];
+  el.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h1>${esc(i18n.t("auditTitle"))}</h1>
+        <p>${esc(i18n.t("auditSubtitle"))}</p>
+      </div>
+      <div class="filter-bar">
+        <select id="audit-tool-filter" class="select-compact">
+          <option value="">${esc(i18n.t("allTools"))}</option>
+          ${tools.map((t) => `<option value="${t}"${t === state.auditTool ? " selected" : ""}>${t}</option>`).join("")}
+        </select>
+        <select id="audit-limit-filter" class="select-compact">
+          ${[50, 200, 500].map((n) => `<option value="${n}"${n === state.auditLimit ? " selected" : ""}>${n}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div class="card">
+      ${!rows.length ? `<p class="muted text-sm">${esc(i18n.t("noAudit"))}</p>` : `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>${esc(i18n.t("colTime"))}</th>
+                <th>${esc(i18n.t("colProject"))}</th>
+                <th>${esc(i18n.t("colTool"))}</th>
+                <th>${esc(i18n.t("colResult"))}</th>
+                <th>${esc(i18n.t("colArgs"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map((r) => {
+                const res = String(r.result || "");
+                const resCls = res === "ok" ? "pill-green" : res.startsWith("task:") ? "pill-blue" : res.startsWith("pending") ? "pill-amber" : "pill-red";
+                return `
+                  <tr>
+                    <td class="muted text-xs tabular" style="white-space:nowrap">${esc(fmtTime(r.ts))}</td>
+                    <td>${esc(r.project || "-")}</td>
+                    <td><span class="pill pill-gray mono">${esc(r.tool)}</span></td>
+                    <td><span class="pill ${resCls}">${esc(res)}</span></td>
+                    <td class="mono text-xs" style="max-width:460px;word-break:break-all">${esc(r.args || "")}</td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+  `;
+
+  document.getElementById("audit-tool-filter").onchange = (e) => {
+    state.auditTool = e.target.value;
+    refreshActiveTab();
+  };
+  document.getElementById("audit-limit-filter").onchange = (e) => {
+    state.auditLimit = Number(e.target.value);
+    refreshActiveTab();
+  };
+}
+
+// ------------------------------------------------------------------ TAB 4: SETTINGS
+function renderSettings() {
+  const el = document.getElementById("view-settings");
+  const snap = state.snapshot || { config: {}, presets: [], projects: [] };
+  const cfg = snap.config || {};
+  const presets = snap.presets || [];
+  const projects = snap.projects || [];
+
+  el.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h1>${esc(i18n.t("settingsTitle"))}</h1>
+        <p>${esc(i18n.t("settingsSubtitle"))}</p>
+      </div>
+    </div>
+
+    <!-- Global Preferences -->
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">${esc(i18n.t("globalPrefsTitle"))}</h2>
+        <span class="pill pill-gray mono">http://127.0.0.1:${esc(cfg.port || 8765)}</span>
+      </div>
+      <div class="pref-row">
+        <div>
+          <div style="font-weight:580">${esc(i18n.t("prefAutoOpen"))}</div>
+          <div class="muted text-xs">${esc(i18n.t("prefAutoOpenDesc"))}</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="pref-auto-open"${cfg.auto_open_dashboard ? " checked" : ""} />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="pref-row">
+        <div>
+          <div style="font-weight:580">${esc(i18n.t("prefWebOnly"))}</div>
+          <div class="muted text-xs">${esc(i18n.t("prefWebOnlyDesc"))}</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="pref-web-only"${cfg.web_only_approval ? " checked" : ""} />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Compute Server Presets -->
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">${esc(i18n.t("presetsTitle"))}</h2>
+          <div class="muted text-xs" style="margin-top:2px">${esc(i18n.t("presetsDesc"))}</div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" id="add-preset-btn">+ ${esc(i18n.t("addPreset"))}</button>
+      </div>
+      ${!presets.length ? `<p class="muted text-sm">${esc(i18n.t("noPresets"))}</p>` : `
+        <div class="settings-grid">
+          ${presets.map((pr) => {
+            const d = pr.data || {};
+            const tr = state.testResults[pr.name];
+            const inUse = (pr.attached_projects || []).length > 0;
+            return `
+              <div class="preset-card">
+                <div class="flex-between">
+                  <div class="flex-row" style="gap:7px">
+                    <strong class="mono" style="font-size:14.5px">${esc(pr.name)}</strong>
+                    <span class="pill ${d.scheduler === "slurm" ? "pill-blue" : "pill-gray"}">
+                      ${esc(d.scheduler === "slurm" ? i18n.t("schedulerSlurm") : i18n.t("schedulerNone"))}
+                    </span>
+                  </div>
+                  <span class="mono muted text-xs">v${esc(pr.version ?? 1)}</span>
+                </div>
+                <div class="text-xs muted mono">
+                  ${esc(d.connect === "local" ? "local" : `ssh://${d.host || ""}`)}
+                  ${d.projects_root ? `<br/>root: ${esc(d.projects_root)}` : ""}
+                  ${d.scheduler === "slurm" ? `<br/>max_jobs: ${esc(d.max_jobs ?? 10)}${d.partitions && d.partitions.length ? " | " + esc(d.partitions.join(", ")) : ""}` : ""}
+                </div>
+                <div class="text-xs muted">
+                  ${inUse ? `${esc(i18n.t("attachedTo"))}: ${pr.attached_projects.map((n) => `<span class="pill pill-gray" style="margin-left:3px">${esc(n)}</span>`).join("")}` : esc(i18n.t("unusedPreset"))}
+                </div>
+                ${tr ? `<div class="text-xs ${tr.ok ? "pill pill-green" : "pill pill-red"}" style="align-self:flex-start">${esc(tr.text)}</div>` : ""}
+                <div class="flex-row" style="margin-top:auto;padding-top:6px">
+                  <button type="button" class="btn btn-subtle btn-xs" data-test-preset="${esc(pr.name)}">${esc(i18n.t("testConn"))}</button>
+                  <button type="button" class="btn btn-soft btn-xs" data-edit-preset="${esc(pr.name)}">${esc(i18n.t("edit"))}</button>
+                  <button type="button" class="btn btn-danger btn-xs" data-del-preset="${esc(pr.name)}" ${inUse ? `disabled title="${esc(i18n.t("cannotDeleteInUse"))}"` : ""}>${esc(i18n.t("deleteBtn"))}</button>
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      `}
+    </div>
+
+    <!-- Projects & Agent MCP Setup -->
+    <div style="margin-top:22px">
+      <div class="flex-between" style="margin-bottom:10px">
+        <div>
+          <h2 class="card-title" style="font-size:17px">${esc(i18n.t("projectsTitle"))}</h2>
+          <div class="muted text-xs">${esc(i18n.t("projectsDesc"))}</div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" id="new-project-btn">+ ${esc(i18n.t("newProject"))}</button>
+      </div>
+      ${!projects.length ? `<div class="card"><p class="muted text-sm" style="margin:0">${esc(i18n.t("noProjects"))}</p></div>` :
+        projects.map((p) => renderProjectCard(p)).join("")}
+    </div>
+  `;
+
+  document.getElementById("pref-auto-open").onchange = async (e) => {
+    try {
+      await api("/api/config", { method: "PATCH", body: { auto_open_dashboard: e.target.checked } });
+      toast(i18n.t("savedToast"));
+      await refreshAll();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+
+  document.getElementById("pref-web-only").onchange = async (e) => {
+    try {
+      await api("/api/config", { method: "PATCH", body: { web_only_approval: e.target.checked } });
+      toast(i18n.t("savedToast"));
+      await refreshAll();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+
+  document.getElementById("add-preset-btn").onclick = () => openPresetModal(null);
+  document.getElementById("new-project-btn").onclick = () => openNewProjectModal();
+
+  el.querySelectorAll("[data-test-preset]").forEach((btn) => {
+    btn.onclick = async () => {
+      const name = btn.dataset.testPreset;
+      btn.disabled = true;
+      btn.textContent = i18n.t("testing");
+      try {
+        const r = await api(`/api/presets/${encodeURIComponent(name)}/test`, { method: "POST" });
+        state.testResults[name] = {
+          ok: true,
+          text: i18n.t("testOk", { home: r.home || "-", slurm: r.has_slurm ? i18n.t("yes") : i18n.t("no") }),
+        };
+      } catch (e) {
+        state.testResults[name] = { ok: false, text: e.message };
+      }
+      renderSettings();
+    };
+  });
+
+  el.querySelectorAll("[data-edit-preset]").forEach((btn) => {
+    btn.onclick = () => {
+      const pr = presets.find((x) => x.name === btn.dataset.editPreset);
+      if (pr) openPresetModal(pr);
+    };
+  });
+
+  el.querySelectorAll("[data-del-preset]").forEach((btn) => {
+    btn.onclick = async () => {
+      const name = btn.dataset.delPreset;
+      try {
+        await api(`/api/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
+        toast(i18n.t("deletedToast", { name }));
+        await refreshAll();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    };
+  });
+
+  el.querySelectorAll("[data-attach-project]").forEach((btn) => {
+    btn.onclick = () => openAttachModal(btn.dataset.attachProject);
+  });
+
+  el.querySelectorAll("[data-snippet-tab]").forEach((btn) => {
+    btn.onclick = () => {
+      const [proj, agent] = btn.dataset.snippetTab.split("::");
+      state.activeSnippetTab[proj] = agent;
+      renderSettings();
+    };
+  });
+
+  el.querySelectorAll("[data-copy-snippet]").forEach((btn) => {
+    btn.onclick = async () => {
+      const [proj, agent] = btn.dataset.copySnippet.split("::");
+      const code = state.snippetsCache[proj]?.[agent]?.code || "";
+      try {
+        await navigator.clipboard.writeText(code);
+        toast(i18n.t("copiedToast"));
+      } catch {
+        toast("Clipboard unavailable", true);
+      }
+    };
+  });
+
+  el.querySelectorAll("[data-policy-form]").forEach((form) => {
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const proj = form.dataset.policyForm;
+      const fd = new FormData(form);
+      const changes = {
+        local_dir: (fd.get("local_dir") || "").toString().trim() || null,
+        submit: {
+          approval: form.querySelector('input[name="submit_approval"]').checked,
+          wait_s: parseFloat(fd.get("submit_wait_s")),
+        },
+        wake: {
+          default_wait_s: parseFloat(fd.get("wake_wait_s")),
+          fail_frac: parseFloat(fd.get("wake_fail_frac")),
+          timeout_h: parseFloat(fd.get("wake_timeout_h")),
+        },
+        gateway: {
+          transfer_max_gb: parseFloat(fd.get("gw_transfer_gb")),
+          max_background: parseInt(fd.get("gw_max_bg"), 10),
+        },
+      };
+      try {
+        await api(`/api/projects/${encodeURIComponent(proj)}`, {
+          method: "PATCH",
+          body: { changes, note: "updated via web ui" },
+        });
+        toast(i18n.t("savedToast"));
+        await refreshAll();
+      } catch (err) {
+        toast(err.message, true);
+      }
+    };
+  });
+}
+
+function renderProjectCard(p) {
+  const d = p.data || {};
+  const clusters = d.clusters || {};
+  const cnames = Object.keys(clusters);
+  const snips = state.snippetsCache[p.name] || {};
+  const agentKeys = Object.keys(snips);
+  const activeAgent = state.activeSnippetTab[p.name] || agentKeys[0] || "codex";
+  const activeSnip = snips[activeAgent] || {};
+  const labels = {
+    codex: "Codex",
+    opencode: "OpenCode",
+    antigravity: "Antigravity",
+    dsh: "DSH",
+    claude_code: "Claude Code",
+  };
+
+  return `
+    <div class="project-card">
+      <div class="flex-between" style="margin-bottom:12px">
+        <div>
+          <div class="flex-row" style="gap:8px">
+            <strong style="font-size:16px">${esc(p.name)}</strong>
+            <span class="mono muted text-xs">v${esc(p.version ?? 1)}</span>
+          </div>
+          <div class="muted text-xs mono" style="margin-top:2px">
+            ${esc(i18n.t("localDirLabel"))}: ${esc(d.local_dir || i18n.t("noLocalDir"))}
+          </div>
+        </div>
+        <button type="button" class="btn btn-soft btn-sm" data-attach-project="${esc(p.name)}">+ ${esc(i18n.t("attachServer"))}</button>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div class="text-xs muted" style="font-weight:600;margin-bottom:6px">${esc(i18n.t("attachedServers"))}</div>
+        ${!cnames.length ? `<div class="muted text-xs">${esc(i18n.t("noAttachedServers"))}</div>` : `
+          <div class="flex-row" style="gap:8px">
+            ${cnames.map((cn) => `
+              <div class="metric-chip" style="min-width:auto">
+                <span class="k">${esc(cn)}${clusters[cn].max_jobs ? ` (max ${clusters[cn].max_jobs})` : ""}</span>
+                <span class="mono text-xs">${esc(clusters[cn].root)}</span>
+              </div>
+            `).join("")}
+          </div>
+        `}
+      </div>
+
+      ${agentKeys.length ? `
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+          <div class="flex-between" style="margin-bottom:8px">
+            <span class="text-xs muted" style="font-weight:600">${esc(i18n.t("mcpSetupTitle"))}</span>
+            <button type="button" class="btn btn-subtle btn-xs" data-copy-snippet="${esc(p.name)}::${esc(activeAgent)}">
+              ${esc(i18n.t("copyConfig"))}
+            </button>
+          </div>
+          <div class="snippet-tabs">
+            ${agentKeys.map((k) => `
+              <button type="button" class="snippet-tab ${k === activeAgent ? "active" : ""}" data-snippet-tab="${esc(p.name)}::${esc(k)}">
+                ${esc(labels[k] || k)}
+              </button>
+            `).join("")}
+          </div>
+          <div class="muted text-xs" style="margin-bottom:4px">${esc(activeSnip.title || "")}</div>
+          <pre class="code-block" style="margin-top:0">${esc(activeSnip.code || "")}</pre>
+          ${activeSnip.http_note ? `<div class="muted text-xs mono" style="margin-top:6px">${esc(activeSnip.http_note)}</div>` : ""}
+        </div>
+      ` : ""}
+
+      <details style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+        <summary class="text-sm" style="cursor:pointer;font-weight:580;color:var(--text-secondary)">
+          ${esc(i18n.t("policiesTitle"))}
+        </summary>
+        <form data-policy-form="${esc(p.name)}" class="form-grid" style="margin-top:12px">
+          <label class="field-label form-full">${esc(i18n.t("fieldLocalDir"))}
+            <input type="text" name="local_dir" value="${esc(d.local_dir || "")}" placeholder="/Users/alice/my-project" />
+          </label>
+          <label class="checkbox-pill form-full" style="justify-content:space-between">
+            <span>${esc(i18n.t("policyApproval"))}</span>
+            <input type="checkbox" name="submit_approval"${(d.submit && d.submit.approval !== false) ? " checked" : ""} />
+          </label>
+          <label class="field-label">${esc(i18n.t("policySubmitWait"))}
+            <input type="number" step="1" min="0" max="180" name="submit_wait_s" value="${esc(d.submit?.wait_s ?? 180)}" />
+          </label>
+          <label class="field-label">${esc(i18n.t("policyWakeWait"))}
+            <input type="number" step="1" min="0" max="180" name="wake_wait_s" value="${esc(d.wake?.default_wait_s ?? 180)}" />
+          </label>
+          <label class="field-label">${esc(i18n.t("policyFailFrac"))}
+            <input type="number" step="0.05" min="0" max="1" name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.2)}" />
+          </label>
+          <label class="field-label">${esc(i18n.t("policyTimeoutH"))}
+            <input type="number" step="1" min="1" name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
+          </label>
+          <label class="field-label">${esc(i18n.t("policyTransferGb"))}
+            <input type="number" step="0.5" min="0" name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 2)}" />
+          </label>
+          <label class="field-label">${esc(i18n.t("policyMaxBg"))}
+            <input type="number" step="1" min="0" name="gw_max_bg" value="${esc(d.gateway?.max_background ?? 4)}" />
+          </label>
+          <div class="form-full">
+            <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t("savePolicies"))}</button>
+          </div>
+        </form>
+      </details>
+    </div>
+  `;
+}
+
+// ------------------------------------------------------------------ MODALS
+function openModal(title, bodyHtml) {
+  document.getElementById("modal-title").textContent = title;
+  document.getElementById("modal-body").innerHTML = bodyHtml;
+  document.getElementById("modal-backdrop").classList.remove("hidden");
+}
+
+function closeModal() {
+  document.getElementById("modal-backdrop").classList.add("hidden");
+}
+
+function openPresetModal(presetObj) {
+  const isEdit = Boolean(presetObj);
+  const d = (presetObj && presetObj.data) || {
+    connect: "ssh", scheduler: "slurm", max_jobs: 10, poll_interval_s: 120,
+    exec_timeout_s: 1800, python: "python3", partitions: [], extra_paths: [], gateway_allow: [],
+  };
+  let subTab = "form";
+
+  function renderBody() {
+    const title = isEdit ? i18n.t("presetModalEdit", { name: presetObj.name }) : i18n.t("presetModalNew");
+    const allowSet = new Set(d.gateway_allow || []);
+    const tabBar = isEdit ? `
+      <div class="snippet-tabs" style="margin-bottom:14px">
+        <button type="button" class="snippet-tab ${subTab === "form" ? "active" : ""}" id="pm-tab-form">${esc(i18n.t("tabForm"))}</button>
+        <button type="button" class="snippet-tab ${subTab === "yaml" ? "active" : ""}" id="pm-tab-yaml">${esc(i18n.t("tabYaml"))}</button>
+      </div>
+    ` : "";
+
+    const formHtml = `
+      <form id="preset-form" class="form-grid">
+        ${!isEdit ? `
+          <label class="field-label form-full">${esc(i18n.t("fieldName"))}
+            <input type="text" name="name" required placeholder="gpu01" />
+            <span class="field-hint">${esc(i18n.t("fieldNameHint"))}</span>
+          </label>
+        ` : ""}
+        <label class="field-label">${esc(i18n.t("fieldScheduler"))}
+          <select name="scheduler">
+            <option value="slurm"${d.scheduler === "slurm" ? " selected" : ""}>${esc(i18n.t("optSlurm"))}</option>
+            <option value="none"${d.scheduler === "none" ? " selected" : ""}>${esc(i18n.t("optNone"))}</option>
+          </select>
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldConnect"))}
+          <select name="connect">
+            <option value="ssh"${d.connect === "ssh" ? " selected" : ""}>${esc(i18n.t("optSsh"))}</option>
+            <option value="local"${d.connect === "local" ? " selected" : ""}>${esc(i18n.t("optLocal"))}</option>
+          </select>
+        </label>
+        <label class="field-label form-full">${esc(i18n.t("fieldHost"))}
+          <input type="text" name="host" value="${esc(d.host || "")}" placeholder="login.cluster.edu" />
+          <span class="field-hint">${esc(i18n.t("fieldHostHint"))}</span>
+        </label>
+        <label class="field-label form-full">${esc(i18n.t("fieldProjectsRoot"))}
+          <input type="text" name="projects_root" value="${esc(d.projects_root || "")}" placeholder="/scratch/alice/hpcport" />
+          <span class="field-hint">${esc(i18n.t("fieldProjectsRootHint"))}</span>
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldPartitions"))}
+          <input type="text" name="partitions" value="${esc((d.partitions || []).join(", "))}" placeholder="a100, cpu" />
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldMaxJobs"))}
+          <input type="number" min="1" name="max_jobs" value="${esc(d.max_jobs ?? 10)}" />
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldCoresPerNode"))}
+          <input type="number" min="1" name="cores_per_node" value="${esc(d.cores_per_node ?? "")}" />
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldPollInterval"))}
+          <input type="number" min="5" name="poll_interval_s" value="${esc(d.poll_interval_s ?? 120)}" />
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldExecTimeout"))}
+          <input type="number" min="10" name="exec_timeout_s" value="${esc(d.exec_timeout_s ?? 1800)}" />
+        </label>
+        <label class="field-label">${esc(i18n.t("fieldPython"))}
+          <input type="text" name="python" value="${esc(d.python || "python3")}" />
+        </label>
+        <label class="field-label form-full">${esc(i18n.t("fieldExtraPaths"))}
+          <textarea name="extra_paths" rows="2" placeholder="/tmp">${esc((d.extra_paths || []).join("\n"))}</textarea>
+        </label>
+        <div class="field-label form-full">
+          <span>${esc(i18n.t("fieldGatewayAllow"))}</span>
+          <div class="checkbox-grid">
+            ${ALLOWABLE_RULES.map((r) => `
+              <label class="checkbox-pill">
+                <input type="checkbox" name="gateway_allow" value="${r}"${allowSet.has(r) ? " checked" : ""} />
+                <span class="mono">${r}</span>
+              </label>
+            `).join("")}
+          </div>
+        </div>
+        <label class="field-label form-full">${esc(i18n.t("fieldGuide"))}
+          <textarea name="guide" rows="3" placeholder="module load cuda/12.2 ...">${esc(d.guide || "")}</textarea>
+        </label>
+        <label class="field-label form-full">${esc(i18n.t("fieldJobTemplate"))}
+          <textarea name="job_template" rows="3" class="mono" placeholder="#!/bin/bash&#10;#SBATCH --partition=a100">${esc(d.job_template || "")}</textarea>
+        </label>
+        <div class="modal-footer form-full">
+          <button type="button" class="btn btn-outline btn-sm" id="pm-cancel">${esc(i18n.t("cancelBtn"))}</button>
+          <button type="submit" class="btn btn-primary btn-sm">${esc(isEdit ? i18n.t("saveChanges") : i18n.t("createBtn"))}</button>
+        </div>
+      </form>
+    `;
+
+    const yamlHtml = isEdit ? `
+      <pre class="code-block" style="margin-top:0;max-height:360px">${esc(presetObj.yaml || "")}</pre>
+      <div style="margin-top:16px">
+        <div class="text-sm" style="font-weight:600;margin-bottom:8px">${esc(i18n.t("versionHistory"))}</div>
+        <div class="flex-row" style="gap:8px">
+          ${(presetObj.versions || []).slice().reverse().map((v) => `
+            <div class="metric-chip flex-row" style="min-width:auto;padding:5px 10px">
+              <span class="mono">v${v}</span>
+              ${v === presetObj.version ? `<span class="pill pill-green">Active</span>` :
+                `<button type="button" class="btn btn-subtle btn-xs" data-restore-v="${v}">${esc(i18n.t("restoreBtn"))}</button>`}
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    ` : "";
+
+    openModal(title, tabBar + (subTab === "form" ? formHtml : yamlHtml));
+
+    if (isEdit) {
+      document.getElementById("pm-tab-form").onclick = () => { subTab = "form"; renderBody(); };
+      document.getElementById("pm-tab-yaml").onclick = () => { subTab = "yaml"; renderBody(); };
+    }
+
+    const cancelBtn = document.getElementById("pm-cancel");
+    if (cancelBtn) cancelBtn.onclick = closeModal;
+
+    const form = document.getElementById("preset-form");
+    if (form) {
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const connect = fd.get("connect");
+        const scheduler = fd.get("scheduler");
+        const host = (fd.get("host") || "").toString().trim();
+        const projects_root = (fd.get("projects_root") || "").toString().trim();
+        const partitions = (fd.get("partitions") || "").toString().split(",").map((s) => s.trim()).filter(Boolean);
+        const extra_paths = (fd.get("extra_paths") || "").toString().split("\n").map((s) => s.trim()).filter(Boolean);
+        const gateway_allow = fd.getAll("gateway_allow").map(String);
+        const cpnRaw = (fd.get("cores_per_node") || "").toString().trim();
+        const guide = (fd.get("guide") || "").toString().trim();
+        const job_template = (fd.get("job_template") || "").toString();
+
+        const data = {
+          connect,
+          scheduler,
+          host: connect === "ssh" ? host : null,
+          projects_root: projects_root || null,
+          partitions,
+          max_jobs: parseInt(fd.get("max_jobs") || "10", 10),
+          cores_per_node: cpnRaw ? parseInt(cpnRaw, 10) : null,
+          poll_interval_s: parseInt(fd.get("poll_interval_s") || "120", 10),
+          exec_timeout_s: parseInt(fd.get("exec_timeout_s") || "1800", 10),
+          python: (fd.get("python") || "python3").toString().trim() || "python3",
+          extra_paths,
+          gateway_allow,
+          guide: guide || null,
+          job_template: job_template.trim() ? job_template : null,
+        };
+        if (!isEdit) {
+          // Remove null fields on create so preset_to_dict stays concise
+          for (const k of Object.keys(data)) {
+            if (data[k] === null || (Array.isArray(data[k]) && !data[k].length)) delete data[k];
+          }
+        }
+        try {
+          if (isEdit) {
+            await api(`/api/presets/${encodeURIComponent(presetObj.name)}`, {
+              method: "PATCH",
+              body: { changes: data, note: "edited in web ui" },
+            });
+          } else {
+            const name = (fd.get("name") || "").toString().trim();
+            await api("/api/presets", { method: "POST", body: { name, data } });
+          }
+          closeModal();
+          toast(i18n.t("savedToast"));
+          await refreshAll();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      };
+    }
+
+    document.querySelectorAll("[data-restore-v]").forEach((btn) => {
+      btn.onclick = async () => {
+        const v = Number(btn.dataset.restoreV);
+        try {
+          await api(`/api/presets/${encodeURIComponent(presetObj.name)}/restore`, {
+            method: "POST",
+            body: { version: v },
+          });
+          closeModal();
+          toast(i18n.t("restoredToast", { name: presetObj.name, v }));
+          await refreshAll();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      };
+    });
+  }
+
+  renderBody();
+}
+
+function openNewProjectModal() {
+  openModal(i18n.t("projectModalTitle"), `
+    <form id="new-project-form" class="form-grid">
+      <label class="field-label form-full">${esc(i18n.t("fieldProjectName"))}
+        <input type="text" name="name" required placeholder="my-research" />
+      </label>
+      <label class="field-label form-full">${esc(i18n.t("fieldLocalDir"))}
+        <input type="text" name="local_dir" placeholder="/Users/alice/projects/my-research" />
+        <span class="field-hint">${esc(i18n.t("fieldLocalDirHint"))}</span>
+      </label>
+      <div class="modal-footer form-full">
+        <button type="button" class="btn btn-outline btn-sm" id="np-cancel">${esc(i18n.t("cancelBtn"))}</button>
+        <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t("createBtn"))}</button>
+      </div>
+    </form>
+  `);
+  document.getElementById("np-cancel").onclick = closeModal;
+  document.getElementById("new-project-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const name = (fd.get("name") || "").toString().trim();
+    const local_dir = (fd.get("local_dir") || "").toString().trim() || null;
+    try {
+      await api("/api/projects", { method: "POST", body: { name, local_dir } });
+      closeModal();
+      toast(i18n.t("savedToast"));
+      await refreshAll();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
+function openAttachModal(projectName) {
+  const presets = (state.snapshot && state.snapshot.presets) || [];
+  openModal(i18n.t("attachModalTitle", { project: projectName }), `
+    <form id="attach-form" class="form-grid">
+      <label class="field-label form-full">${esc(i18n.t("fieldSelectServer"))}
+        <select name="cluster" required>
+          ${presets.map((pr) => `<option value="${esc(pr.name)}">${esc(pr.name)} (${esc(pr.data?.scheduler || "slurm")})</option>`).join("")}
+        </select>
+      </label>
+      <label class="field-label form-full">${esc(i18n.t("fieldRemoteRoot"))}
+        <input type="text" name="root" placeholder="/scratch/alice/hpcport/${esc(projectName)}" />
+        <span class="field-hint">${esc(i18n.t("fieldRemoteRootHint"))}</span>
+      </label>
+      <label class="field-label form-full">${esc(i18n.t("fieldOverrideMaxJobs"))}
+        <input type="number" min="1" name="max_jobs" placeholder="" />
+      </label>
+      <div class="modal-footer form-full">
+        <button type="button" class="btn btn-outline btn-sm" id="at-cancel">${esc(i18n.t("cancelBtn"))}</button>
+        <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t("attachConfirm"))}</button>
+      </div>
+    </form>
+  `);
+  document.getElementById("at-cancel").onclick = closeModal;
+  document.getElementById("attach-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const cluster = fd.get("cluster");
+    const root = (fd.get("root") || "").toString().trim() || null;
+    const mjRaw = (fd.get("max_jobs") || "").toString().trim();
+    const max_jobs = mjRaw ? parseInt(mjRaw, 10) : null;
+    try {
+      await api(`/api/projects/${encodeURIComponent(projectName)}/clusters`, {
+        method: "POST",
+        body: { cluster, root, max_jobs },
+      });
+      closeModal();
+      toast(i18n.t("attachedToast", { cluster, project: projectName }));
+      await refreshAll();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
+// ------------------------------------------------------------------ EVENT WIRING & INIT
+function wireEvents() {
+  // Navigation tabs
+  document.querySelectorAll(".nav-tab").forEach((btn) => {
+    btn.onclick = () => switchTab(btn.dataset.tab);
+  });
+
+  window.addEventListener("hashchange", () => {
+    const t = readHashTab();
+    if (t !== state.tab) switchTab(t, false);
+  });
+
+  // Project switcher
+  document.getElementById("project-select").onchange = (e) => {
+    state.project = e.target.value;
+    localStorage.setItem("hpcport_project", state.project);
+    refreshActiveTab();
+  };
+
+  // Manual Poll
+  document.getElementById("poll-btn").onclick = async () => {
+    const btn = document.getElementById("poll-btn");
+    const lbl = document.getElementById("poll-btn-label");
+    btn.disabled = true;
+    lbl.textContent = i18n.t("polling");
+    try {
+      await api("/api/poll", { method: "POST" });
+      toast(i18n.t("polledToast"));
+      await refreshAll();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      btn.disabled = false;
+      lbl.textContent = i18n.t("pollNow");
+    }
+  };
+
+  // Browser notification toggle
+  document.getElementById("notif-btn").onclick = async () => {
+    if (!("Notification" in window)) {
+      toast(i18n.t("alertsDeniedToast"), true);
+      return;
+    }
+    if (state.alertsEnabled) {
+      state.alertsEnabled = false;
+      localStorage.setItem("hpcport_alerts", "0");
+      applyStaticLabels();
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm === "granted") {
+      state.alertsEnabled = true;
+      localStorage.setItem("hpcport_alerts", "1");
+      applyStaticLabels();
+      toast(i18n.t("alertsEnabledToast"));
+    } else {
+      toast(i18n.t("alertsDeniedToast"), true);
+    }
+  };
+
+  // Theme toggle
+  document.getElementById("theme-btn").onclick = () => {
+    state.theme = state.theme === "dark" ? "light" : "dark";
+    applyTheme();
+  };
+
+  // Language pills (header + auth gate)
+  document.querySelectorAll(".lang-pill button").forEach((btn) => {
+    btn.onclick = () => setLanguage(btn.dataset.lang, true);
+  });
+
+  // PIN unlock form
+  document.getElementById("pin-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const pin = document.getElementById("pin-input").value.trim();
+    const errEl = document.getElementById("pin-error");
+    errEl.classList.add("hidden");
+    try {
+      const resp = await fetch("/api/auth/pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-HPCPort-UI": "1" },
+        body: JSON.stringify({ pin }),
+        credentials: "same-origin",
+      });
+      if (!resp.ok) {
+        errEl.textContent = i18n.t("unlockError");
+        errEl.classList.remove("hidden");
+        return;
+      }
+      document.getElementById("pin-input").value = "";
+      showAppShell();
+    } catch {
+      errEl.textContent = i18n.t("unlockError");
+      errEl.classList.remove("hidden");
+    }
+  };
+
+  // Drawer & Modal closing
+  document.getElementById("drawer-close").onclick = closeDrawer;
+  document.getElementById("drawer-backdrop").onclick = closeDrawer;
+  document.getElementById("drawer-refresh").onclick = loadDrawerData;
+  document.getElementById("modal-close").onclick = closeModal;
+  document.getElementById("modal-backdrop").onclick = (e) => {
+    if (e.target.id === "modal-backdrop") closeModal();
+  };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeModal();
+      closeDrawer();
+    }
+  });
+}
+
+async function boot() {
+  applyTheme();
+  wireEvents();
+  try {
+    const resp = await fetch("/api/auth/status", { credentials: "same-origin" });
+    const st = await resp.json();
+    if (!localStorage.getItem("hpcport_lang") && st.language) {
+      i18n.setLang(st.language);
+    } else {
+      i18n.setLang(i18n.lang);
+    }
+    state.tab = readHashTab();
+    if (st.authenticated) {
+      showAppShell();
+      switchTab(state.tab, false);
+    } else {
+      showAuthGate();
+    }
+  } catch {
+    showAuthGate();
+  }
+}
+
+boot();
