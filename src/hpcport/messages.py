@@ -185,8 +185,10 @@ def batch_line(s: dict) -> str:
     counts = ", ".join("%s:%d" % (k, v) for k, v in sorted(s["jobs"].items()))
     tag = " [%s]" % s["tag"] if s.get("tag") else ""
     state = "FINISHED" if s["finished"] else "ACTIVE"
-    return "%s (%s)%s [%s] %s — %s" % (
-        s["batch"], s["cluster"], tag, state, counts, s["desc"]
+    notes = (s.get("cancelled") or {}).get("notes") or []
+    note_part = " [cancel note: %s]" % "; ".join(notes) if notes else ""
+    return "%s (%s)%s [%s] %s — %s%s" % (
+        s["batch"], s["cluster"], tag, state, counts, s["desc"], note_part
     )
 
 
@@ -236,6 +238,8 @@ def batch_detail(s: dict, rows: list[dict]) -> str:
             parts.append("err=" + j["error"][:120])
         if j["cancel_by"]:
             parts.append("cancelled_by=" + j["cancel_by"])
+        if j.get("cancel_note"):
+            parts.append("note=" + j["cancel_note"][:120])
         lines.append("  - " + " | ".join(parts))
     return "\n".join(lines)
 
@@ -373,6 +377,17 @@ def format_notice(n: dict) -> str:
     if reason == "batch_done":
         summary = ", ".join("%s:%d" % (k, v) for k, v in sorted((b.get("jobs") or {}).items()))
         return tmpl.format(batch=b["batch"], cluster=b["cluster"], summary=summary)
+    if reason == "jobs_cancelled":
+        batches = b.get("batches") or []
+        target = ", ".join("batch `%s`" % x for x in batches) if batches else "this project"
+        parts = []
+        if b.get("cancelled"):
+            parts.append("cancelled: " + ", ".join(b["cancelled"]))
+        if b.get("ending"):
+            parts.append("cancelling: " + ", ".join(b["ending"]))
+        if b.get("elements"):
+            parts.append("elements: " + ", ".join(b["elements"]))
+        return tmpl.format(target=target, items="; ".join(parts) or "jobs", comment=comment)
     if reason == "op_ended":
         outcome = "stopped by user" if b.get("stop_by") == "user" else (
             "timed out" if b.get("timeout") else "exited with rc=%s" % b.get("rc")

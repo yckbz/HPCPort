@@ -138,6 +138,7 @@ NOTICES_SEP = "---"
 
 NOTICE_TEXTS = {
     "batch_done": "Batch `{batch}` on `{cluster}` finished ({summary}).",
+    "jobs_cancelled": "User cancelled job(s) in {target} ({items}).{comment}",
     "op_ended": "Background {kind} `op:{op}` on `{cluster}` {outcome}.",
     "submit_approved": "Approval #{approval} was approved ({batches}); jobs queued for submission.{comment}",
     "submit_refused": "Approval #{approval} was rejected ({batches}); jobs cancelled.{comment}",

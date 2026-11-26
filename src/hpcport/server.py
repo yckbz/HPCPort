@@ -737,14 +737,33 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
     async def cancel_api(request):
         d = await body(request)
+        comment = (d.get("comment") or "").strip()
 
         def then(r):
             daemon.submits.sweep()
+            for proj, info in (r.get("affected") or {}).items():
+                items = info["cancelled"] + info["ending"] + info["elements"]
+                if not items:
+                    continue
+                subject = "cancel:" + ",".join(info["batches"] or items)
+                daemon.waits.notify(
+                    proj,
+                    "jobs_cancelled",
+                    subject,
+                    {
+                        "batches": info["batches"],
+                        "cancelled": info["cancelled"],
+                        "ending": info["ending"],
+                        "elements": info["elements"],
+                        "comment": comment,
+                    },
+                )
+            daemon.waits.evaluate(render_result=lambda b: messages.wait_fired(b, daemon))
             return r
 
         r = await asyncio.to_thread(
             daemon.jobs.cancel, d.get("project"), d.get("batch"), d.get("job_ids"),
-            d.get("approval"), by="user", note=d.get("comment") or "", then=then,
+            d.get("approval"), by="user", note=comment, then=then,
             cluster=d.get("cluster"),
         )
         return JSONResponse({"text": messages.cancel_ok(r), "result": r})
@@ -766,6 +785,12 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
     async def op_stop(request):
         oid = request.path_params["id"]
         r = await asyncio.to_thread(daemon.gateway.stop, None, oid, by="user")
+
+        def _eval():
+            with daemon.lock:
+                daemon.waits.evaluate(render_result=lambda b: messages.wait_fired(b, daemon))
+
+        await asyncio.to_thread(_eval)
         return JSONResponse({"status": r["status"], "op": r["op"],
                              "text": messages.gateway_ok(r)})
 

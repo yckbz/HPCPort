@@ -850,6 +850,28 @@ class JobService:
                 for j in active
                 if not self.is_unfinished(j["project"], j["batch"])
             })
+            affected: dict[str, dict] = {}
+            for j in active:
+                entry = affected.setdefault(
+                    j["project"], {"batches": [], "cancelled": [], "ending": [], "elements": []},
+                )
+                if j["batch"] not in entry["batches"]:
+                    entry["batches"].append(j["batch"])
+                if state[j["id"]] == slurm.CANCELLED:
+                    entry["cancelled"].append(_label(j))
+                elif state[j["id"]] in slurm.ACTIVE:
+                    entry["ending"].append(_label(j))
+            for j in jobs:
+                ckey = (j["cluster"], j["slurm_id"])
+                if ckey in elements and j["state"] in slurm.IN_SLURM:
+                    entry = affected.setdefault(
+                        j["project"], {"batches": [], "cancelled": [], "ending": [], "elements": []},
+                    )
+                    if j["batch"] not in entry["batches"]:
+                        entry["batches"].append(j["batch"])
+                    for elem in elements[ckey]:
+                        if elem not in entry["elements"]:
+                            entry["elements"].append(elem)
             r = {
                 "requested": [_label(j) for j in active] + parts,
                 "cancelled": [_label(j) for j in active if state[j["id"]] == slurm.CANCELLED],
@@ -862,6 +884,7 @@ class JobService:
                 ),
                 "ended": [b for _, b in ended],
                 "ended_pairs": ended,
+                "affected": affected,
                 "errors": errors,
                 "approval": approval,
             }

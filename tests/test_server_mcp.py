@@ -609,3 +609,58 @@ def test_pin_auth_requires_ui_header_and_rate_limits(hpc_home, tmp_path):
             "/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"},
         )
         assert r_ok.status_code == 200
+
+
+def test_user_cancel_delivers_notice_and_shows_note(hpc_home, tmp_path):
+    now = [1000.0]
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    ex = FakeSlurmExecutor(tmp_path / "bin")
+    d = Daemon(executors={"gpu01": ex}, clock=lambda: now[0], browser_opener=lambda url: True)
+    d.cli_token = "secret-cli-token"
+    d.settings.create_preset("gpu01", {
+        "connect": "local", "scheduler": "slurm", "partitions": ["a100"],
+        "max_jobs": 4, "projects_root": str(remote),
+    })
+    d.settings.create_project("demo", local_dir=str(local_dir), data={"submit": {"approval": False}})
+    d.attach_cluster("demo", "gpu01", root=str(remote / "demo_slurm"))
+    app = build_app(d, start_loop=False)
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.post(
+            "/api/auth/pin", json={"pin": d.pairing_pin}, headers={"X-HPCPort-UI": "1"},
+        ).status_code == 200
+
+        sid = _mcp_init_legacy(client, "/p/demo/mcp")
+        wd = remote / "demo_slurm" / "run_cancel"
+        wd.mkdir(parents=True, exist_ok=True)
+        (wd / "train.sh").write_text(
+            "#!/bin/bash\n#SBATCH -p a100\n#SBATCH -n 2\n#SBATCH -t 01:00:00\necho go\n",
+            encoding="utf-8",
+        )
+        sub = d.jobs.submit("demo", "gpu01", str(wd), ["train.sh"], "train run", batch="b_note", wait_s=0)
+        assert sub["n_sent"] == 1
+        _mcp_call(client, "/p/demo/mcp", sid, 2, "tools/call", {"name": "jobs", "arguments": {}})
+
+        with d.lock:
+            w = d.waits.register("demo", sid, groups=[{"items": ["b_note"], "priority": 1}])
+
+        r_can = client.post(
+            "/api/cancel",
+            json={"project": "demo", "batch": "b_note", "comment": "lr too high, use 1e-4"},
+            headers={"X-HPCPort-UI": "1"},
+        )
+        assert r_can.status_code == 200
+        wrow = d.db.one("SELECT state FROM waits WHERE id = ?", (w["id"],))
+        assert wrow["state"] == "fired"
+
+        r_det = _mcp_call(client, "/p/demo/mcp", sid, 3, "tools/call", {
+            "name": "jobs", "arguments": {"id": "b_note"},
+        })
+        txt = r_det["result"]["content"][0]["text"]
+        assert "[HPCPort notices]" in txt
+        assert "lr too high, use 1e-4" in txt
+        assert "note=lr too high, use 1e-4" in txt
+        assert "cancel note: lr too high, use 1e-4" in txt
