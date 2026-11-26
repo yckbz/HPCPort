@@ -196,8 +196,8 @@ class Daemon:
             )
             active_ops = self.db.one(
                 "SELECT 1 FROM ops WHERE project = ? AND state = 'running' "
-                "AND (',' || cluster || ',') LIKE ? LIMIT 1",
-                (project, "%," + cluster_name + ",%"),
+                "AND instr(',' || cluster || ',', ?) > 0 LIMIT 1",
+                (project, "," + cluster_name + ","),
             )
             if active_jobs or active_ops:
                 from .settings import SettingError

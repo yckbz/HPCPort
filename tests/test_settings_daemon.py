@@ -188,3 +188,27 @@ def test_duplicate_daemon_does_not_clobber_token_or_running_daemon(hpc_home, tmp
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and stdio_bridge._daemon_alive(port):
             time.sleep(0.05)
+
+
+def test_detach_cluster_does_not_treat_underscore_as_like_wildcard(hpc_home, tmp_path):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    d = Daemon(browser_opener=lambda url: True)
+    d.settings.create_preset("gpu_1", {
+        "connect": "local", "scheduler": "none", "projects_root": str(remote),
+    })
+    d.settings.create_preset("gpu-1", {
+        "connect": "local", "scheduler": "none", "projects_root": str(remote),
+    })
+    d.settings.create_project("p1")
+    d.attach_cluster("p1", "gpu_1", root=str(remote / "p1_u"))
+    d.attach_cluster("p1", "gpu-1", root=str(remote / "p1_d"))
+
+    # Running op on gpu-1 must NOT block detaching gpu_1
+    op = d.gateway.exec("p1", "gpu-1", "sleep 20", background=True)
+    try:
+        res = d.detach_cluster("p1", "gpu_1")
+        assert res["cluster"] == "gpu_1"
+        assert "gpu_1" not in d.projects["p1"].clusters
+    finally:
+        d.gateway.stop("p1", op["op"]["id"], by="user")
