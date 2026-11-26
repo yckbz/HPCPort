@@ -17,6 +17,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import shutil
 import time
 
 from . import config, versions
@@ -85,7 +86,7 @@ class SettingsService:
                 self.presets[name] = parse_preset(name, data, str(vf.file))
                 key = "%s:%s" % (PRESET, name)
                 self.in_use[key] = cur[0]
-                self._stamps[key] = vf.stamp()
+                self._stamps[key] = vf.stamp() if vf.read() == cur[1] else None
 
         for name in list_project_names():
             vf = project_file(name)
@@ -102,7 +103,7 @@ class SettingsService:
                                                     presets=self.presets)
                 key = "%s:%s" % (PROJECT, name)
                 self.in_use[key] = cur[0]
-                self._stamps[key] = vf.stamp()
+                self._stamps[key] = vf.stamp() if vf.read() == cur[1] else None
 
     def _vf_and_kind(self, key: str) -> tuple[str, str, versions.VersionedFile]:
         kind, sep, name = key.partition(":")
@@ -153,11 +154,26 @@ class SettingsService:
         used_by = [p.name for p in self.projects.values() if name in p.clusters]
         if used_by:
             raise SettingError("preset_in_use", cluster=name, projects=", ".join(sorted(used_by)))
+        key = "%s:%s" % (PRESET, name)
+        for row in self.db.all(
+            "SELECT id, approval FROM proposals WHERE doc = ? AND state = 'pending'",
+            (key,),
+        ):
+            self.db.update("proposals", {"id": row["id"]}, state="cancelled",
+                           comment="preset deleted", decided=self.now())
+            if row["approval"]:
+                self.approvals.cancel(row["approval"], "preset %s deleted" % name)
         vf = preset_file(name)
         with vf.lock():
             if vf.file.exists():
                 vf.file.unlink()
-        key = "%s:%s" % (PRESET, name)
+            for v in vf.versions():
+                try:
+                    vf.path_of(v).unlink()
+                except FileNotFoundError:
+                    pass
+            shutil.rmtree(vf.history / "rejected", ignore_errors=True)
+        shutil.rmtree(vf.history, ignore_errors=True)
         old = self.presets.pop(name)
         self.in_use.pop(key, None)
         self._stamps.pop(key, None)
@@ -448,10 +464,17 @@ class SettingsService:
         pid = approval["detail"]["proposal_id"]
         prop = self.db.one("SELECT * FROM proposals WHERE id = ?", (pid,))
         if prop is None or prop["state"] != "pending":
-            raise ApprovalError("already_decided", id=approval["id"],
-                                state=prop["state"] if prop else "missing")
+            st = prop["state"] if prop else "missing"
+            self.approvals.cancel(approval["id"], "proposal already %s" % st)
+            raise ApprovalError("already_decided", id=approval["id"], state=st)
         key = prop["doc"]
         kind, name, vf = self._vf_and_kind(key)
+        target_exists = (name in self.presets) if kind == PRESET else (name in self.projects)
+        if not target_exists:
+            self.db.update("proposals", {"id": pid}, state="cancelled",
+                           comment="setting no longer exists", decided=self.now())
+            self.approvals.cancel(approval["id"], "setting %s no longer exists" % key)
+            raise ApprovalError("missing_setting", id=approval["id"], msg=key)
 
         if not approved:
             if prop["origin"] == "detected":
@@ -495,6 +518,9 @@ class SettingsService:
         with vf.lock():
             cur = vf.latest()
             if cur is None:
+                self.db.update("proposals", {"id": pid}, state="cancelled",
+                               comment="setting file missing", decided=self.now())
+                self.approvals.cancel(approval["id"], "setting file missing: %s" % key)
                 raise ApprovalError("missing_setting", id=approval["id"], msg=key)
             cur_v, cur_text = cur
             base_text = vf.text_of(prop["base_version"]) if prop["base_version"] else cur_text
@@ -504,9 +530,13 @@ class SettingsService:
             moved = [versions.name(f) for f in touched
                      if versions.get(base_data, f) != versions.get(cur_data, f)]
             if moved:
+                reason = "fields changed meanwhile: " + ", ".join(moved)
                 self.db.update("proposals", {"id": pid}, state="stale",
-                               comment="fields changed meanwhile: " + ", ".join(moved),
-                               decided=self.now())
+                               comment=reason, decided=self.now())
+                self.approvals.cancel(approval["id"], "stale: " + reason)
+                if prop["project"]:
+                    self.notify(prop["project"], "proposal_stale", "proposal:%d" % pid,
+                                {"proposal": pid, "doc": key, "moved": moved})
                 raise ApprovalError("stale", id=approval["id"],
                                     msg="fields changed since proposal: " + ", ".join(moved))
             new_data = versions.apply(cur_data, patch)

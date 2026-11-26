@@ -91,6 +91,63 @@ def test_web_auth_exchange_code_never_leaks_and_pin_works(hpc_home):
     assert pin_cookie is not None and d.verify_cookie(pin_cookie) is True
 
 
+def test_settings_stale_proposal_delete_preset_and_offline_disk_edit(hpc_home, tmp_path):
+    import pytest
+    from hpcport.approvals import ApprovalError
+
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    d = Daemon(browser_opener=lambda url: True)
+    d.settings.create_preset("c1", {
+        "connect": "local", "scheduler": "none", "projects_root": str(remote),
+        "guide": "v1 guide",
+    })
+    d.settings.create_project("p1")
+    d.attach_cluster("p1", "c1")
+
+    # 1. Stale proposal (moved field) cancels approval too -> no permanent zombie approval
+    prop = d.settings.propose_preset("p1", "c1", {"guide": "agent guide"}, "update guide")
+    aid = prop["approval"]
+    # Simulate out-of-band version advance on the same field without _refresh_pending_proposals
+    pf = config.preset_file("c1")
+    with pf.lock():
+        t2 = versions.edit(pf.read(), versions.apply(versions.load(pf.read()), {"guide": "v2"}))
+        pf.write(t2)
+        pf.add(t2)
+    with pytest.raises(ApprovalError) as exc:
+        with d.lock:
+            d.approvals.decide(aid, True, "approve stale")
+    assert exc.value.code == "stale"
+    assert d.approvals.get(aid)["state"] == "cancelled"
+    assert d.approvals.pending_count() == 0
+
+    # 2. Deleting a preset cancels pending proposals, cleans history, and prevents resurrection
+    prop2 = d.settings.propose_preset("p1", "c1", {"guide": "resurrect me"}, "before delete")
+    aid2 = prop2["approval"]
+    d.detach_cluster("p1", "c1")
+    d.settings.delete_preset("c1")
+    assert d.approvals.get(aid2)["state"] == "cancelled"
+    assert d.db.one("SELECT state FROM proposals WHERE id = ?", (prop2["id"],))["state"] == "cancelled"
+    assert not config.preset_file("c1").history.exists()
+    # Recreating same preset name starts cleanly at v1
+    created = d.settings.create_preset("c1", {
+        "connect": "local", "scheduler": "none", "exec_timeout_s": 500,
+    })
+    assert created["version"] == 1
+    assert config.preset_file("c1").versions() == [1]
+
+    # 3. Offline hand-edit on disk while daemon is stopped is detected on first scan() after restart
+    pf = config.preset_file("c1")
+    edited = versions.edit(pf.read(), versions.apply(versions.load(pf.read()), {"exec_timeout_s": 777}))
+    pf.write(edited)
+    d2 = Daemon(browser_opener=lambda url: True)
+    assert d2.presets["c1"].exec_timeout_s == 500
+    d2.settings.scan()
+    pending = [a for a in d2.approvals.list(pending_only=True) if a["kind"] == "proposal"]
+    assert len(pending) == 1
+    assert "exec_timeout_s" in pending[0]["summary"]
+
+
 def test_duplicate_daemon_does_not_clobber_token_or_running_daemon(hpc_home, tmp_path):
     import os
     import socket
