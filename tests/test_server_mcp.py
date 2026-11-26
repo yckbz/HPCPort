@@ -784,3 +784,35 @@ def test_stdio_bridge_preserves_id_on_404_and_skips_notifications():
     finally:
         srv.should_exit = True
         t.join(timeout=5)
+
+
+def test_server_auth_token_exchange_tab_and_audit_n_validation(hpc_home, tmp_path):
+    d, ex, app, opened, remote, _ = _make_app(hpc_home, tmp_path)
+    # 1. Dead "test-cli" token must never grant auth when cli_token is unset
+    d.cli_token = None
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.get("/api/state", headers={"Authorization": "Bearer test-cli"}).status_code == 401
+
+        # 2. /auth/exchange validates tab whitelist and preserves stored_tab when omitted/invalid
+        code1 = d.issue_exchange_code(tab="settings")
+        r_no_tab = client.get("/auth/exchange?code=%s" % code1, follow_redirects=False)
+        assert r_no_tab.status_code == 302
+        assert r_no_tab.headers["location"] == "/#settings"
+
+        code2 = d.issue_exchange_code(tab="jobs")
+        r_bad_tab = client.get("/auth/exchange?code=%s&tab=evil" % code2, follow_redirects=False)
+        assert r_bad_tab.status_code == 302
+        assert r_bad_tab.headers["location"] == "/#jobs"
+
+        # 3. /api/audit?n= rejects non-int with 400 and clamps <=0 to 1 (no SQLite LIMIT -1)
+        for i in range(3):
+            d.db.insert("audit", ts="2026-01-01T00:00:0%dZ" % i, project="demo",
+                        session_key="s", tool="jobs", args="{}", result="ok")
+        assert client.get("/api/audit?n=abc").status_code == 400
+        r_neg = client.get("/api/audit?n=-1")
+        assert r_neg.status_code == 200
+        assert len(r_neg.json()["audit"]) == 1
+        r_zero = client.get("/api/audit?n=0")
+        assert r_zero.status_code == 200
+        assert len(r_zero.json()["audit"]) == 1
+

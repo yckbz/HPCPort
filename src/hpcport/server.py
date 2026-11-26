@@ -13,6 +13,7 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ from .waits import WaitError, parse_op_item
 log = logging.getLogger("hpcport.server")
 ToolErrors = (JobError, WaitError, GatewayError, SettingError, ConfigError)
 COOKIE_NAME = "hpcport_session"
+VALID_TABS = ("approvals", "jobs", "audit", "settings")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
@@ -461,11 +463,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         if daemon.verify_cookie(cookie):
             return "web"
         tok = _bearer(request.headers)
-        if daemon.cli_token is None:
-            # Test mode without cli_token configured: allow CLI calls if explicit header or cookie
-            if tok == "test-cli":
-                return "cli"
-        elif tok and tok == daemon.cli_token:
+        if daemon.cli_token and tok and hmac.compare_digest(tok, daemon.cli_token):
             return "cli"
         return None
 
@@ -518,12 +516,17 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
     async def auth_exchange(request):
         code = request.query_params.get("code", "")
-        tab = request.query_params.get("tab", "approvals")
+        raw_tab = request.query_params.get("tab", "")
         res = daemon.redeem_exchange_code(code)
         if res is None:
             return RedirectResponse(url="/#unlock", status_code=302)
         cookie_val, stored_tab = res
-        target_tab = tab or stored_tab or "approvals"
+        if raw_tab in VALID_TABS:
+            target_tab = raw_tab
+        elif stored_tab in VALID_TABS:
+            target_tab = stored_tab
+        else:
+            target_tab = "approvals"
         resp = RedirectResponse(url="/#%s" % target_tab, status_code=302)
         resp.set_cookie(COOKIE_NAME, cookie_val, httponly=True, samesite="strict", path="/")
         return resp
@@ -832,7 +835,15 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                 conds.append("%s = ?" % key)
                 args.append(q[key])
         where = "WHERE " + " AND ".join(conds) if conds else ""
-        lim = min(int(q.get("n") or 50), 1000)
+        raw_n = q.get("n")
+        if raw_n is None or raw_n == "":
+            lim = 50
+        else:
+            try:
+                lim = int(raw_n)
+            except ValueError:
+                return fail(400, "invalid n parameter (expected integer)")
+        lim = max(1, min(lim, 1000))
         rows = daemon.db.all(
             "SELECT id, ts, project, session_key, tool, args, result FROM audit %s "
             "ORDER BY id DESC LIMIT ?" % where,
