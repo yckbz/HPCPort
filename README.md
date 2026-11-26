@@ -1,71 +1,209 @@
+<div align="center">
+
 # HPCPort
 
-Agent-agnostic execution gateway, Slurm job manager, resource-budget approval gate, and local Web dashboard for AI coding agents working on remote compute servers.
+**Agent-agnostic execution gateway, Slurm job manager, compute-budget approval gate, and local Web dashboard for AI coding agents working on remote compute servers.**
 
-## Key Capabilities
+**English** | [简体中文](README.zh-CN.md)
 
-- **Works with any MCP agent**: Codex CLI, OpenCode, Antigravity, DeepSeek Harness (DSH), Claude Code, and any Streamable HTTP or stdio MCP client.
-- **Slurm clusters & bare SSH servers**: Manage `sbatch`/`squeue`/`sacct` job batches on Slurm clusters (`scheduler: slurm`) and detached background tasks on standard SSH GPU/CPU servers (`scheduler: none`).
-- **Safety boundaries & approvals**:
-  - Remote workspace confinement inside each project's remote `root`
-  - Shell command guard (prevents `rm -rf` outside root, stray `sbatch`, destructive system commands, etc.)
-  - Per-project concurrency limits (`max_jobs`) and standing compute budgets (`core_hours`, `gpu_hours`, `total_jobs`, cumulative limits)
-  - Anti-self-approval Web UI: the daemon opens an authenticated browser session using a 60s single-use exchange code (never revealed to agents), with an optional `web_only_approval` lock and 6-digit PIN fallback for headless SSH forwarding.
+</div>
+
+---
+
+HPCPort sits safely between your AI coding agents (**Codex**, **OpenCode**, **Antigravity**, **DeepSeek Harness / DSH**, **Claude Code**, or any MCP client) and your remote **Slurm clusters** or **bare SSH GPU/CPU servers**.
+
+Instead of giving an agent raw, unguarded SSH access or polling loops, HPCPort provides:
+
+- **One global daemon for all projects**: Listens on `127.0.0.1:8765`, stores all presets, projects, SQLite state, and YAML version history cleanly under `~/.hpcport/` — zero clutter inside your code repositories.
+- **Slurm clusters & bare SSH servers**: Full `sbatch`/`squeue`/`sacct` batch lifecycle on Slurm clusters (`scheduler: slurm`) plus detached background execution (`remote_exec(..., background=True)`) on standard GPU/CPU servers without Slurm (`scheduler: none`).
+- **Workspace & command safety boundaries**: Confines remote operations inside each project's remote `root`, guards destructive or out-of-bounds shell commands, and enforces per-project concurrency limits (`max_jobs`) and standing compute budgets (`core_hours`, `gpu_hours`, `total_jobs`).
+- **Anti-self-approval local Web UI**: Modern, Apple-minimalist light/dark dashboard with **EN / 中文** toggle. Agents can open the dashboard for you (`open_dashboard`), but authentication uses an in-memory secret and single-use 60-second browser exchange codes that are never exposed to the agent — plus optional `web_only_approval` lock and 6-digit PIN unlock for headless SSH port forwarding.
 - **Smart waiting without brittle push hacks**:
-  - Protocol-level **MCP Tasks (`io.modelcontextprotocol/tasks`)** support for Tasks-capable clients
-  - 180-second short-wait with progress heartbeats + persistent background monitoring and automatic `[HPCPort notices]` prepended to subsequent tool results for all other clients
-- **Single global daemon, zero workspace clutter**: All presets, project configs, SQLite state, and YAML version histories live under `~/.hpcport/` (configurable via `$HPCPORT_HOME`).
-- **Apple-minimalist bilingual Web UI**: Light & dark modes, English / Chinese toggle, live SSE updates, approval diff inspection, job script/log viewer, preset editor with connection test and version restore, and one-click MCP setup snippets.
+  - Protocol-level **MCP Tasks (`io.modelcontextprotocol/tasks`)** support for Tasks-capable clients (e.g. Claude Code).
+  - 180-second short-wait with progress heartbeats + persistent background monitoring and automatic `[HPCPort notices]` prepended to subsequent MCP tool results for all other clients (Codex, OpenCode, Antigravity, DSH).
+- **Agent-proposed preset improvements (`propose_preset`)**: Agents can suggest cluster preset updates (like login-node usage notes or module guides) with field-level diffs, `[SAFETY]` flags, and comment-preserving YAML version rollback.
 
-## Quick Start
+---
+
+## Zero-Code Setup: Let Your AI Agent Install It
+
+If you prefer not to run terminal commands manually, simply share this repository URL (or the downloaded local folder path) with your AI agent (**Codex**, **OpenCode**, **Antigravity**, **DSH**, or **Claude Code**) and send:
+
+> Install HPCPort from `<repo-url-or-local-path>` following its README "Agent Self-Install Protocol", connect it to your MCP config, and open the Settings Web dashboard for me.
+
+<details>
+<summary><strong>Agent Self-Install Protocol (instructions for AI agents)</strong></summary>
+
+When a user asks you to install HPCPort from a local path or Git URL, perform these exact steps:
+
+1. **Install the `hpcport` package globally** (requires Python >= 3.10):
+   - Preferred if `uv` is installed:
+     ```bash
+     uv tool install "<repo-path-or-git+https-url>"
+     ```
+   - Or if `pipx` is installed:
+     ```bash
+     pipx install "<repo-path-or-git+https-url>"
+     ```
+   - Fallback (always works with standard Python):
+     ```bash
+     python3 -m venv ~/.hpcport/venv
+     ~/.hpcport/venv/bin/pip install "<repo-path-or-git+https-url>"
+     ```
+2. **Resolve the absolute executable path and verify it runs**:
+   ```bash
+   HPCPORT_BIN="$(command -v hpcport || echo "$HOME/.hpcport/venv/bin/hpcport")"
+   "$HPCPORT_BIN" --help
+   ```
+3. **Register `hpcport` in your own MCP configuration** using the **absolute path** `$HPCPORT_BIN` (important for GUI clients whose default `PATH` omits `~/.local/bin`):
+   - Generic stdio MCP config (auto-starts the global daemon and automatically matches the active project by working directory `cwd`):
+     ```json
+     {
+       "mcpServers": {
+         "hpcport": {
+           "command": "/ABSOLUTE/PATH/TO/hpcport",
+           "args": ["mcp"]
+         }
+       }
+     }
+     ```
+   - Or, if the user already named a project, pass `"args": ["mcp", "--project", "<project-name>"]` or point HTTP-native clients to `http://127.0.0.1:8765/p/<project-name>/mcp`.
+4. **Start the daemon and open the Settings dashboard in the user's browser**:
+   ```bash
+   "$HPCPORT_BIN" web --tab settings
+   ```
+5. **Hand off to the user**:
+   - Tell the user the Settings dashboard is open in their browser where they can click **Add Server** and **New Project** (or offer to add presets/projects for them if they share their SSH host / alias).
+   - Remind the user to **reload MCP / start a new chat session** once so your client loads the newly registered HPCPort MCP tools.
+   - **Security rule**: Never disable `web_only_approval` and never run `hpcport approve` on the user's behalf; approvals belong strictly to the user.
+
+</details>
+
+> **What still needs one quick human action?**
+> 1. Your agent may ask you to approve the install command and **reload MCP / open a new chat** so the newly added MCP tools become active.
+> 2. Ensure your machine can reach your remote server via passwordless SSH (SSH key or `~/.ssh/config`).
+
+---
+
+## Manual Quick Start
+
+### 1. Install
 
 ```bash
-# 1. Start the global daemon (127.0.0.1:8765) and open the Web dashboard
-hpcport daemon --open
+# Using uv (recommended)
+uv tool install .
+# Or directly from GitHub:
+# uv tool install git+https://github.com/<owner>/HPCPort.git
 
-# Or open the dashboard anytime when the daemon is already running:
-hpcport ui
+# Or using pip inside a virtual environment
+python3 -m venv ~/.hpcport/venv
+~/.hpcport/venv/bin/pip install .
 ```
 
-In the **Settings** tab of the Web dashboard (or via CLI):
+### 2. Open the Web Dashboard
 
 ```bash
-# Add a Slurm cluster preset (or bare SSH server with --scheduler none)
-hpcport preset add gpu01 --host login.cluster.edu --projects-root /scratch/alice/hpcport
+# Auto-starts the background daemon and opens the authenticated Web UI in your browser
+hpcport web --tab settings
 
-# Create a project bound to your local workspace and attach the server
-hpcport project add my-research --local-dir /path/to/my-research
-hpcport project attach my-research gpu01
-
-# Print MCP configuration snippets for Codex, OpenCode, Antigravity, DSH, Claude Code
-hpcport snippets my-research
+# Or run the daemon in the foreground
+hpcport daemon
 ```
 
-## Connecting Agents
+On a headless remote machine over SSH port forwarding (`ssh -L 8765:127.0.0.1:8765 ...`), print the 6-digit pairing PIN:
 
-### Stdio Bridge (auto-starts daemon & resolves project from cwd)
+```bash
+hpcport web --pin
+```
+
+### 3. Add a Server & Project (Web UI or CLI)
+
+You can configure everything visually in the **Settings** tab, or from the CLI (while the daemon is running):
+
+```bash
+# Add a Slurm cluster preset
+hpcport cluster add gpu01 \
+  --host login.cluster.edu \
+  --projects-root /scratch/alice/hpcport \
+  --partitions a100,cpu \
+  --max-jobs 10
+
+# Or add a bare SSH GPU/CPU server without Slurm
+hpcport cluster add lab-4090 \
+  --host lab-gpu.local \
+  --scheduler none \
+  --projects-root /data/alice/hpcport
+
+# Test SSH connectivity and Slurm detection
+hpcport cluster test gpu01
+
+# Register a project bound to your local folder and attach servers
+hpcport project init my-research --dir /path/to/my-research
+hpcport cluster attach my-research gpu01
+```
+
+---
+
+## Connecting AI Agents (MCP)
+
+HPCPort supports **both** a zero-daemon-setup stdio bridge (`hpcport mcp`, which auto-starts the daemon and auto-matches the project by `cwd`) and direct **Streamable HTTP** (`http://127.0.0.1:8765/p/<project>/mcp`).
+
+| Agent Client | Transport | Wait Behavior |
+|---|---|---|
+| **Codex CLI** | stdio (`hpcport mcp`) or HTTP | 180s short-wait + `[HPCPort notices]` |
+| **OpenCode** | Streamable HTTP or stdio | 180s short-wait + `[HPCPort notices]` |
+| **Antigravity** | stdio (`hpcport mcp`) | 180s short-wait + `[HPCPort notices]` |
+| **DeepSeek Harness (DSH)** | Streamable HTTP or stdio | 180s short-wait + `[HPCPort notices]` |
+| **Claude Code** | Streamable HTTP or stdio | Native **MCP Tasks** (`io.modelcontextprotocol/tasks`) |
+
+You can copy exact, pre-filled config snippets for all 5 clients inside **Settings → Projects → Connect Your Agent (MCP)** in the Web dashboard.
+
+Example stdio config (works across projects automatically via `cwd`):
 
 ```json
 {
   "mcpServers": {
     "hpcport": {
       "command": "hpcport",
-      "args": ["mcp", "--project", "my-research"]
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-### Direct Streamable HTTP
+---
 
-Point your MCP client to:
+## MCP Tools Exposed to Agents
 
-```text
-http://127.0.0.1:8765/p/<project>/mcp
-```
+| Tool | Purpose |
+|---|---|
+| `remote_exec` | Run shell commands inside a project's remote `root` (with guard checks & `background=True` support for bare SSH tasks) |
+| `transfer` | Transfer files/directories between local workspace and remote server via `rsync` (size-gated) |
+| `remote_stop` | Stop a running background exec or transfer operation (`op:<id>`) |
+| `submit` | Validate `#SBATCH` headers, estimate core/GPU-hours, enforce budget approvals, and submit Slurm batches |
+| `jobs` | Inspect batch summaries, individual job rows, background `ops`, and unregistered Slurm jobs |
+| `cancel` | Cancel Slurm batches, individual jobs, or pending unapproved submissions |
+| `wait_for` | Wait for Slurm batches or background `ops` (upgrades to native MCP Task when supported; otherwise 180s short-wait + notices) |
+| `propose_preset` | Propose field-level updates to a shared server preset for human review on the Web UI |
+| `open_dashboard` | Ask the daemon to open the authenticated Web dashboard in the user's browser (never exposes auth secrets to the agent) |
+
+---
+
+## Security & Architecture
+
+- **Data directory**: Everything lives under `~/.hpcport/` (override with `HPCPORT_HOME`):
+  - `config.yaml` — global port, `auto_open_dashboard`, `web_only_approval`, UI language
+  - `clusters/<name>.yaml` — shared compute server presets (with `.history/` versions)
+  - `projects/<name>.yaml` — per-project remote roots, `max_jobs` overrides, and policies
+  - `state.db` — SQLite WAL state for batches, jobs, background ops, approvals, waits, notices, and audit log
+- **Anti-self-approval**: Web cookies are minted only via an in-memory daemon secret redeemed through a 60s single-use browser redirect (`/auth/exchange?code=...`) or the 6-digit pairing PIN. All mutating Web endpoints require `X-HPCPort-UI: 1` (CSRF protection), and enabling `web_only_approval` in Settings disables CLI approvals completely.
+
+---
 
 ## Development
 
 ```bash
+uv venv --python 3.12
+uv pip install -e ".[dev]"
 PYTHONPATH=src .venv/bin/python -m pytest tests -v
 ```
