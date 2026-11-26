@@ -295,7 +295,7 @@ def _cmd_cluster(args) -> None:
             data["projects_root"] = args.projects_root
         if args.partitions:
             data["partitions"] = [x.strip() for x in args.partitions.split(",") if x.strip()]
-        if args.cores_per_node:
+        if args.cores_per_node is not None:
             data["cores_per_node"] = args.cores_per_node
         if args.gpus_per_node is not None:
             data["gpus_per_node"] = args.gpus_per_node
@@ -460,18 +460,24 @@ def build_parser() -> argparse.ArgumentParser:
     pdoc.add_argument("--json", action="store_true", help="Emit JSON output")
 
     pp = sub.add_parser("project", help="Manage projects")
+    add_port(pp)
     ps = pp.add_subparsers(dest="sub", required=True)
-    ps.add_parser("list")
+    pl = ps.add_parser("list")
+    add_port(pl)
     pi = ps.add_parser("init", aliases=["add"])
+    add_port(pi)
     pi.add_argument("name")
     pi.add_argument("--dir", "--local-dir", dest="dir", default=None,
                     help="Local workspace directory (default: cwd)")
 
     pc = sub.add_parser("cluster", aliases=["preset"],
                         help="Manage server presets and attachments")
+    add_port(pc)
     cs = pc.add_subparsers(dest="sub", required=True)
-    cs.add_parser("list")
+    cl = cs.add_parser("list")
+    add_port(cl)
     ca = cs.add_parser("add")
+    add_port(ca)
     ca.add_argument("name")
     ca.add_argument("--connect", default="ssh", choices=("ssh", "local"))
     ca.add_argument("--host", default=None)
@@ -484,21 +490,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="GPUs per node for --exclusive estimates (0 for CPU-only nodes)")
     ca.add_argument("--exec-timeout", type=int, default=3600)
     ct = cs.add_parser("test")
+    add_port(ct)
     ct.add_argument("name")
     cat = cs.add_parser("attach")
+    add_port(cat)
     cat.add_argument("project")
     cat.add_argument("cluster")
     cat.add_argument("--root", default=None)
     cat.add_argument("--max-jobs", type=int, default=None)
     cdet = cs.add_parser("detach")
+    add_port(cdet)
     cdet.add_argument("project")
     cdet.add_argument("cluster")
 
     pj = sub.add_parser("jobs", help="Show batches and jobs")
+    add_port(pj)
     pj.add_argument("batch", nargs="?", default=None)
     pj.add_argument("--project", "-p", default=None)
 
     px = sub.add_parser("cancel", help="Cancel Slurm jobs")
+    add_port(px)
     px.add_argument("--project", "-p", default=None)
     px.add_argument("--cluster", "-c", default=None, help="Disambiguate Slurm IDs by cluster")
     px.add_argument("--batch", default=None)
@@ -506,15 +517,18 @@ def build_parser() -> argparse.ArgumentParser:
     px.add_argument("-m", "--comment", default="")
 
     po = sub.add_parser("ops", help="List or stop background gateway operations")
+    add_port(po)
     po.add_argument("--project", "-p", default=None)
     po.add_argument("--all", action="store_true")
     po.add_argument("--stop", type=int, default=None)
 
     pa = sub.add_parser("approvals", help="List approvals")
+    add_port(pa)
     pa.add_argument("--project", "-p", default=None)
     pa.add_argument("--all", action="store_true")
 
     pap = sub.add_parser("approve", help="Approve a pending request")
+    add_port(pap)
     pap.add_argument("id", type=int)
     pap.add_argument("--always", action="store_true")
     pap.add_argument("--core-hours", dest="core_hours", type=float, default=None)
@@ -525,19 +539,23 @@ def build_parser() -> argparse.ArgumentParser:
     pap.add_argument("-m", "--comment", default="")
 
     prj = sub.add_parser("reject", help="Reject a pending request")
+    add_port(prj)
     prj.add_argument("id", type=int)
     prj.add_argument("-m", "--comment", default="")
 
     pst = sub.add_parser("standing", help="View or revoke project standing approval")
+    add_port(pst)
     pst.add_argument("project")
     pst.add_argument("--revoke", action="store_true")
 
     pau = sub.add_parser("audit", help="View audit log")
+    add_port(pau)
     pau.add_argument("--project", "-p", default=None)
     pau.add_argument("--tool", default=None)
     pau.add_argument("-n", type=int, default=30)
 
-    sub.add_parser("poll", help="Force immediate Slurm sync")
+    ppoll = sub.add_parser("poll", help="Force immediate Slurm sync")
+    add_port(ppoll)
     return p
 
 

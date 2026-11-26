@@ -816,3 +816,30 @@ def test_server_auth_token_exchange_tab_and_audit_n_validation(hpc_home, tmp_pat
         assert r_zero.status_code == 200
         assert len(r_zero.json()["audit"]) == 1
 
+
+def test_cli_port_flag_consistency_and_zero_cores_per_node(monkeypatch):
+    from hpcport import cli
+
+    p = cli.build_parser()
+    assert p.parse_args(["jobs", "--port", "9010"]).port == 9010
+    assert p.parse_args(["approvals", "--port", "9011"]).port == 9011
+    assert p.parse_args(["poll", "--port", "9012"]).port == 9012
+    assert p.parse_args(["project", "list", "--port", "9013"]).port == 9013
+    assert p.parse_args(["project", "--port", "9014", "init", "demo"]).port == 9014
+    assert p.parse_args(["cluster", "add", "c1", "--port", "9015", "--cores-per-node", "0"]).port == 9015
+    assert p.parse_args(["cluster", "attach", "demo", "c1", "--port", "9016"]).port == 9016
+
+    captured = {}
+    monkeypatch.setattr(cli.stdio_bridge, "ensure_daemon", lambda port=None: port or 8765)
+
+    def fake_api(port, method, path, payload=None):
+        captured["port"] = port
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"name": "c1", "version": 1}
+
+    monkeypatch.setattr(cli, "_api", fake_api)
+    args = p.parse_args(["cluster", "add", "c1", "--port", "9015", "--cores-per-node", "0"])
+    cli._cmd_cluster(args)
+    assert captured["port"] == 9015
+    assert captured["payload"]["data"]["cores_per_node"] == 0
