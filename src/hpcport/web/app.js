@@ -121,6 +121,17 @@ function fmtFailRate(rate) {
   return `${Math.round(pct)}%`;
 }
 
+function parseStrictNumber(raw, { integer = false, min = null, max = null } = {}) {
+  const s = String(raw ?? "").trim();
+  if (!s) return { ok: false, value: null };
+  const n = Number(s);
+  if (!Number.isFinite(n)) return { ok: false, value: null };
+  if (integer && !Number.isInteger(n)) return { ok: false, value: null };
+  if (min !== null && n < min) return { ok: false, value: null };
+  if (max !== null && n > max) return { ok: false, value: null };
+  return { ok: true, value: n };
+}
+
 function toast(msg, isError = false) {
   const root = document.getElementById("toast-root");
   const el = document.createElement("div");
@@ -225,10 +236,22 @@ function showAuthGate() {
   applyStaticLabels();
 }
 
+function applyActiveTabDom(tab) {
+  if (!VALID_TABS.has(tab)) tab = "approvals";
+  state.tab = tab;
+  document.querySelectorAll(".nav-tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  ["approvals", "jobs", "audit", "settings"].forEach((t) => {
+    document.getElementById(`view-${t}`).classList.toggle("hidden", t !== tab);
+  });
+}
+
 function showAppShell() {
   state.authenticated = true;
   document.getElementById("auth-gate").classList.add("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
+  applyActiveTabDom(state.tab);
   applyStaticLabels();
   connectSSE();
   refreshAll();
@@ -241,17 +264,10 @@ function readHashTab() {
 }
 
 function switchTab(tab, pushHash = true) {
-  if (!VALID_TABS.has(tab)) tab = "approvals";
-  state.tab = tab;
-  if (pushHash && location.hash !== `#${tab}`) {
-    history.replaceState(null, "", `#${tab}`);
+  applyActiveTabDom(tab);
+  if (pushHash && location.hash !== `#${state.tab}`) {
+    history.replaceState(null, "", `#${state.tab}`);
   }
-  document.querySelectorAll(".nav-tab").forEach((b) => {
-    b.classList.toggle("active", b.dataset.tab === tab);
-  });
-  ["approvals", "jobs", "audit", "settings"].forEach((t) => {
-    document.getElementById(`view-${t}`).classList.toggle("hidden", t !== tab);
-  });
   refreshActiveTab();
 }
 
@@ -862,7 +878,15 @@ function renderApprovals() {
         if (raw === "") {
           payload[inp.name] = null;
         } else {
-          payload[inp.name] = inp.name === "total_jobs" ? parseInt(raw, 10) : parseFloat(raw);
+          const parsed = parseStrictNumber(raw, {
+            integer: inp.name === "total_jobs",
+            min: 0,
+          });
+          if (!parsed.ok) {
+            toast(i18n.t("invalidNumber", { field: inp.name }), true);
+            return;
+          }
+          payload[inp.name] = parsed.value;
         }
       }
       btn.disabled = true;
@@ -1776,20 +1800,40 @@ function renderSettings() {
       e.preventDefault();
       const proj = form.dataset.policyForm;
       const fd = new FormData(form);
+      const subWait = parseStrictNumber(fd.get("submit_wait_s"), { min: 0, max: 180 });
+      const wakeWait = parseStrictNumber(fd.get("wake_wait_s"), { min: 0, max: 180 });
+      const failFrac = parseStrictNumber(fd.get("wake_fail_frac"), { min: 0, max: 1 });
+      const timeoutH = parseStrictNumber(fd.get("wake_timeout_h"), { min: 0.0001 });
+      const transferGb = parseStrictNumber(fd.get("gw_transfer_gb"), { min: 0 });
+      const maxBg = parseStrictNumber(fd.get("gw_max_bg"), { integer: true, min: 0 });
+      const checks = [
+        ["submit.wait_s", subWait],
+        ["wake.default_wait_s", wakeWait],
+        ["wake.fail_frac", failFrac],
+        ["wake.timeout_h", timeoutH],
+        ["gateway.transfer_max_gb", transferGb],
+        ["gateway.max_background", maxBg],
+      ];
+      for (const [field, res] of checks) {
+        if (!res.ok) {
+          toast(i18n.t("invalidNumber", { field }), true);
+          return;
+        }
+      }
       const changes = {
         local_dir: (fd.get("local_dir") || "").toString().trim() || null,
         submit: {
           approval: form.querySelector('input[name="submit_approval"]').checked,
-          wait_s: parseFloat(fd.get("submit_wait_s")),
+          wait_s: subWait.value,
         },
         wake: {
-          default_wait_s: parseFloat(fd.get("wake_wait_s")),
-          fail_frac: parseFloat(fd.get("wake_fail_frac")),
-          timeout_h: parseFloat(fd.get("wake_timeout_h")),
+          default_wait_s: wakeWait.value,
+          fail_frac: failFrac.value,
+          timeout_h: timeoutH.value,
         },
         gateway: {
-          transfer_max_gb: parseFloat(fd.get("gw_transfer_gb")),
-          max_background: parseInt(fd.get("gw_max_bg"), 10),
+          transfer_max_gb: transferGb.value,
+          max_background: maxBg.value,
         },
       };
       try {
@@ -1888,22 +1932,22 @@ function renderProjectCard(p) {
             <input type="checkbox" name="submit_approval"${(d.submit && d.submit.approval !== false) ? " checked" : ""} />
           </label>
           <label class="field-label">${esc(i18n.t("policySubmitWait"))}
-            <input type="number" step="1" min="0" max="180" name="submit_wait_s" value="${esc(d.submit?.wait_s ?? 180)}" />
+            <input type="number" step="1" min="0" max="180" required name="submit_wait_s" value="${esc(d.submit?.wait_s ?? 180)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyWakeWait"))}
-            <input type="number" step="1" min="0" max="180" name="wake_wait_s" value="${esc(d.wake?.default_wait_s ?? 180)}" />
+            <input type="number" step="1" min="0" max="180" required name="wake_wait_s" value="${esc(d.wake?.default_wait_s ?? 180)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyFailFrac"))}
-            <input type="number" step="0.05" min="0" max="1" name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.1)}" />
+            <input type="number" step="0.05" min="0" max="1" required name="wake_fail_frac" value="${esc(d.wake?.fail_frac ?? 0.1)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTimeoutH"))}
-            <input type="number" step="any" min="0.1" name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
+            <input type="number" step="any" min="0.1" required name="wake_timeout_h" value="${esc(d.wake?.timeout_h ?? 48)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyTransferGb"))}
-            <input type="number" step="0.5" min="0" name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 5)}" />
+            <input type="number" step="0.5" min="0" required name="gw_transfer_gb" value="${esc(d.gateway?.transfer_max_gb ?? 5)}" />
           </label>
           <label class="field-label">${esc(i18n.t("policyMaxBg"))}
-            <input type="number" step="1" min="0" name="gw_max_bg" value="${esc(d.gateway?.max_background ?? 4)}" />
+            <input type="number" step="1" min="0" required name="gw_max_bg" value="${esc(d.gateway?.max_background ?? 4)}" />
           </label>
           <div class="form-full">
             <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t("savePolicies"))}</button>
@@ -2072,17 +2116,35 @@ function openPresetModal(presetObj) {
         const guide = (fd.get("guide") || "").toString().trim();
         const job_template = (fd.get("job_template") || "").toString();
 
+        const maxJobs = parseStrictNumber((fd.get("max_jobs") || "10").toString(), { integer: true, min: 1 });
+        const pollInt = parseStrictNumber((fd.get("poll_interval_s") || "120").toString(), { integer: true, min: 1 });
+        const execTo = parseStrictNumber((fd.get("exec_timeout_s") || "3600").toString(), { integer: true, min: 1 });
+        const cpn = cpnRaw ? parseStrictNumber(cpnRaw, { integer: true, min: 1 }) : { ok: true, value: null };
+        const gpn = gpnRaw !== "" ? parseStrictNumber(gpnRaw, { integer: true, min: 0 }) : { ok: true, value: null };
+        for (const [field, res] of [
+          ["max_jobs", maxJobs],
+          ["poll_interval_s", pollInt],
+          ["exec_timeout_s", execTo],
+          ["cores_per_node", cpn],
+          ["gpus_per_node", gpn],
+        ]) {
+          if (!res.ok) {
+            toast(i18n.t("invalidNumber", { field }), true);
+            return;
+          }
+        }
+
         const data = {
           connect,
           scheduler,
           host: connect === "ssh" ? host : null,
           projects_root: projects_root || null,
           partitions,
-          max_jobs: parseInt(fd.get("max_jobs") || "10", 10),
-          cores_per_node: cpnRaw ? parseInt(cpnRaw, 10) : null,
-          gpus_per_node: gpnRaw !== "" ? parseInt(gpnRaw, 10) : null,
-          poll_interval_s: parseInt(fd.get("poll_interval_s") || "120", 10),
-          exec_timeout_s: parseInt(fd.get("exec_timeout_s") || "1800", 10),
+          max_jobs: maxJobs.value,
+          cores_per_node: cpn.value,
+          gpus_per_node: gpn.value,
+          poll_interval_s: pollInt.value,
+          exec_timeout_s: execTo.value,
           python: (fd.get("python") || "python3").toString().trim() || "python3",
           extra_paths,
           gateway_allow,
@@ -2231,6 +2293,10 @@ function wireEvents() {
 
   window.addEventListener("hashchange", () => {
     const t = readHashTab();
+    if (!state.authenticated) {
+      state.tab = t;
+      return;
+    }
     if (t !== state.tab) switchTab(t, false);
   });
 
@@ -2320,6 +2386,7 @@ function wireEvents() {
         return;
       }
       document.getElementById("pin-input").value = "";
+      state.tab = readHashTab();
       showAppShell();
     } catch {
       errEl.textContent = i18n.t("unlockError");
@@ -2357,7 +2424,6 @@ async function boot() {
     state.tab = readHashTab();
     if (st.authenticated) {
       showAppShell();
-      switchTab(state.tab, false);
     } else {
       showAuthGate();
     }

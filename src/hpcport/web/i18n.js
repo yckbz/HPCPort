@@ -201,6 +201,7 @@ export const MESSAGES = {
     prefLanguage: "Default Interface Language",
     prefPort: "Daemon Endpoint",
     savedToast: "Saved",
+    invalidNumber: "Invalid numeric value for {field}",
 
     presetsTitle: "Compute Server Presets",
     presetsDesc: "Shared across all projects. Supports both Slurm clusters and bare SSH GPU/CPU servers.",
@@ -484,6 +485,7 @@ export const MESSAGES = {
     prefLanguage: "默认界面语言",
     prefPort: "本地守护进程地址",
     savedToast: "已保存",
+    invalidNumber: "{field} 的数值无效",
 
     presetsTitle: "计算服务器预设（全局共享）",
     presetsDesc: "一次配置，多个项目复用。同时支持 Slurm 超算集群和无 Slurm 的普通 SSH GPU/CPU 服务器。",
