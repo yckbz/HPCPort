@@ -68,3 +68,16 @@ def test_attach_plan_make_root_and_record(hpc_home, tmp_path):
         attach.make_root(ex, cl, derived=True)
     # Explicit root may already hold files
     assert attach.make_root(ex, cl, derived=False) == real
+
+
+def test_ssh_control_path_stays_short_under_deep_home(tmp_path, monkeypatch):
+    from hpcport.executor import SshExecutor
+
+    deep = tmp_path / ("very_long_segment_" * 5) / "hpcport_home"
+    deep.mkdir(parents=True)
+    monkeypatch.setenv("HPCPORT_HOME", str(deep))
+    ex = SshExecutor("my-very-long-cluster-hostname.university.edu")
+    ctl = next(opt.split("=", 1)[1] for opt in ex._opts if opt.startswith("ControlPath="))
+    # Must stay well below macOS 104-byte sun_path limit (leaving room for OpenSSH temp suffix)
+    assert len(ctl.encode("utf-8")) <= 76
+    assert "%C" not in ctl

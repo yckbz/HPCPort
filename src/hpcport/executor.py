@@ -9,10 +9,12 @@ failure; callers must keep their state unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 
 from .config import run_dir
@@ -94,13 +96,35 @@ class LocalExecutor(Executor):
         return ["bash", "-c", script]
 
 
+def _ssh_control_path(host: str) -> str:
+    """Return a short private ControlPath staying well below macOS's 104-byte sun_path limit
+    (including OpenSSH's ~17-byte temporary suffix appended during bind)."""
+    rdir = str(run_dir())
+    os.makedirs(rdir, mode=0o700, exist_ok=True)
+    tag = hashlib.sha256(("%s\0%s" % (rdir, host)).encode("utf-8")).hexdigest()[:12]
+    cand = os.path.join(rdir, "s-" + tag)
+    if len(cand.encode("utf-8")) <= 76:
+        return cand
+    uid = getattr(os, "getuid", lambda: 0)()
+    short_dir = "/tmp/hpcp-%d" % uid
+    try:
+        os.makedirs(short_dir, mode=0o700, exist_ok=True)
+        st = os.lstat(short_dir)
+        if not os.path.isdir(short_dir) or os.path.islink(short_dir) or st.st_uid != uid:
+            short_dir = tempfile.mkdtemp(prefix="hpcp-")
+            os.chmod(short_dir, 0o700)
+    except OSError:
+        short_dir = tempfile.mkdtemp(prefix="hpcp-")
+        os.chmod(short_dir, 0o700)
+    return os.path.join(short_dir, "s-" + tag)
+
+
 class SshExecutor(Executor):
     shell = "bash -l"
 
     def __init__(self, host: str):
         self.host = host
-        ctl_dir = str(run_dir())
-        os.makedirs(ctl_dir, mode=0o700, exist_ok=True)
+        ctl_path = _ssh_control_path(host)
         self._opts = [
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=15",
@@ -108,7 +132,7 @@ class SshExecutor(Executor):
             "-o", "ServerAliveCountMax=3",
             "-o", "ControlMaster=auto",
             "-o", "ControlPersist=600",
-            "-o", "ControlPath=%s/hpcport-%%C" % ctl_dir,
+            "-o", "ControlPath=%s" % ctl_path,
         ]
 
     def _argv(self, script: str) -> list[str]:
