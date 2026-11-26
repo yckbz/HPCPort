@@ -12,6 +12,7 @@ Implements server-side async task execution for `wait_for` using the official
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from typing import Any, Literal
@@ -121,6 +122,15 @@ class TasksExtension(Extension):
             MethodBinding("tasks/result", TaskIdParams, self._handle_result),
         )
 
+    def _resolve_project(self, ctx: ServerRequestContext[Any, Any]) -> str | None:
+        project = _header(ctx, "x-hpcport-project")
+        if not project:
+            cwd = _header(ctx, "x-hpcport-cwd")
+            if cwd:
+                with self.daemon.lock:
+                    project = config.resolve_project_by_cwd(cwd, self.daemon.projects)
+        return project or None
+
     async def intercept_tool_call(
         self,
         params: CallToolRequestParams,
@@ -130,31 +140,23 @@ class TasksExtension(Extension):
         if params.name != "wait_for" or not client_supports_tasks(ctx):
             return await call_next(ctx)
 
-        project = _header(ctx, "x-hpcport-project")
-        if not project:
-            cwd = _header(ctx, "x-hpcport-cwd")
-            if cwd:
-                with self.daemon.lock:
-                    project = config.resolve_project_by_cwd(cwd, self.daemon.projects)
         session_key = _header(ctx, "mcp-session-id") or "default"
         args = dict(params.arguments or {})
-        if not project or project not in self.daemon.projects:
-            err = WaitError("unknown_project" if project else "unbound_project",
-                            project=project or "")
-            return CallToolResult(
-                content=[TextContent(type="text", text=messages.error(err))],
-                is_error=True,
-            )
 
-        try:
+        def _register():
+            project = self._resolve_project(ctx)
             with self.daemon.lock:
+                if not project or project not in self.daemon.projects:
+                    raise WaitError("unknown_project" if project else "unbound_project",
+                                    project=project or "")
+                self.daemon.waits.init_cursor(project, session_key)
                 wait = self.daemon.waits.register(
                     project,
                     session_key,
                     groups=args.get("groups"),
                     fail_frac=args.get("fail_frac"),
                     timeout_h=args.get("timeout_h"),
-                    note=args.get("note") or "",
+                    note=args.get("note") if args.get("note") is not None else "",
                 )
                 task = self.daemon.waits.create_task(project, wait["id"])
                 self.daemon.db.insert(
@@ -166,6 +168,10 @@ class TasksExtension(Extension):
                     args=json.dumps(args, ensure_ascii=False),
                     result="task:" + task["task_id"],
                 )
+                return task
+
+        try:
+            task = await asyncio.to_thread(_register)
         except WaitError as e:
             return CallToolResult(
                 content=[TextContent(type="text", text=messages.error(e))],
@@ -184,11 +190,20 @@ class TasksExtension(Extension):
 
     async def _handle_get(self, ctx: ServerRequestContext[Any, Any],
                           params: TaskIdParams) -> TaskGetResult:
-        with self.daemon.lock:
-            self.daemon.waits.evaluate(
-                render_result=lambda b: messages.wait_fired(b, self.daemon)
-            )
-        task = self.daemon.waits.get_task(params.task_id)
+        def _load():
+            project = self._resolve_project(ctx)
+            with self.daemon.lock:
+                self.daemon.waits.evaluate(
+                    render_result=lambda b: messages.wait_fired(b, self.daemon)
+                )
+                if not project:
+                    return None
+                task = self.daemon.waits.get_task(params.task_id)
+                if task is None or task["project"] != project:
+                    return None
+                return task
+
+        task = await asyncio.to_thread(_load)
         if task is None:
             return TaskGetResult(
                 task_id=params.task_id,
@@ -218,11 +233,20 @@ class TasksExtension(Extension):
 
     async def _handle_result(self, ctx: ServerRequestContext[Any, Any],
                              params: TaskIdParams) -> CallToolResult:
-        with self.daemon.lock:
-            self.daemon.waits.evaluate(
-                render_result=lambda b: messages.wait_fired(b, self.daemon)
-            )
-        task = self.daemon.waits.get_task(params.task_id)
+        def _load():
+            project = self._resolve_project(ctx)
+            with self.daemon.lock:
+                self.daemon.waits.evaluate(
+                    render_result=lambda b: messages.wait_fired(b, self.daemon)
+                )
+                if not project:
+                    return None
+                task = self.daemon.waits.get_task(params.task_id)
+                if task is None or task["project"] != project:
+                    return None
+                return task
+
+        task = await asyncio.to_thread(_load)
         if task is None:
             return CallToolResult(
                 content=[TextContent(type="text", text="Unknown or expired task ID.")],
@@ -242,7 +266,17 @@ class TasksExtension(Extension):
 
     async def _handle_cancel(self, ctx: ServerRequestContext[Any, Any],
                              params: TaskIdParams) -> TaskGetResult:
-        task = self.daemon.waits.cancel_task(params.task_id)
+        def _cancel():
+            project = self._resolve_project(ctx)
+            with self.daemon.lock:
+                if not project:
+                    return None
+                existing = self.daemon.waits.get_task(params.task_id)
+                if existing is None or existing["project"] != project:
+                    return None
+                return self.daemon.waits.cancel_task(params.task_id)
+
+        task = await asyncio.to_thread(_cancel)
         if task is None:
             return TaskGetResult(
                 task_id=params.task_id,

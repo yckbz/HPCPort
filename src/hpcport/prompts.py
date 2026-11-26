@@ -255,6 +255,7 @@ ERRORS = {
     "both_local": "At least one endpoint of `transfer` must be a remote `<server>:<path>`.",
     "no_source": "Transfer source `{path}` does not exist.",
     "bad_priority": "Invalid group priority `{priority}` (use 0, 1, or 2).",
+    "bad_groups": "Invalid `groups` argument (expected a list of `{items, priority}` objects).",
     "empty_group": "Each wait group must contain at least one item.",
     "item_twice": "Item `{item}` appears in more than one wait group.",
     "all_finished": "All specified items have already finished.",

@@ -220,3 +220,12 @@ def test_upload_and_transfer_block_symlink_escape_and_unsafe_cwd(hpc_home, tmp_p
         d.gateway.transfer("p1", "bare1:link_chain", "stolen2.txt")
     assert exc6.value.code == "remote_outside"
     assert not (local_dir / "stolen2.txt").exists()
+
+
+def test_pop_notices_initializes_head_for_new_session(hpc_home, tmp_path):
+    d, _, _, _ = _setup_gateway(hpc_home, tmp_path)
+    d.waits.notify("p1", "batch_done", "batch:old", {"batch": "old", "cluster": "slurm1", "jobs": {}})
+    assert d.waits.pop_notices("p1", "brand_new_session") == []
+    d.waits.notify("p1", "batch_done", "batch:new", {"batch": "new", "cluster": "slurm1", "jobs": {}})
+    got = d.waits.pop_notices("p1", "brand_new_session")
+    assert len(got) == 1 and got[0]["subject"] == "batch:new"

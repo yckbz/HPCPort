@@ -301,7 +301,8 @@ def build_mcp(daemon) -> MCPServer:
         def fn(p, s, tick):
             with daemon.lock:
                 w = daemon.waits.register(p, s, groups=plain, fail_frac=fail_frac,
-                                          timeout_h=timeout_h, note=note)
+                                          timeout_h=timeout_h, note=note,
+                                          replace_existing=True)
                 daemon.waits.arm_sync_wait(w["id"])
                 eff_wait = (daemon.projects[p].wake.default_wait_s if wait_s is None
                             else max(0.0, min(float(wait_s), 180.0)))

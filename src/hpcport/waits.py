@@ -17,6 +17,7 @@ automatic notice delivery on subsequent tool calls.
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import threading
 import time
@@ -85,24 +86,24 @@ class WaitService:
                 "SELECT last_notice_id FROM session_cursors WHERE session_key = ? AND project = ?",
                 (session_key, project),
             )
-            last_id = cur["last_notice_id"] if cur else 0
+            if cur is None:
+                # First contact of a brand-new session: initialize cursor at current head
+                head = self.db.one(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM notices WHERE project = ?",
+                    (project,),
+                )["m"]
+                self.db.run(
+                    "INSERT INTO session_cursors (session_key, project, last_notice_id, updated) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(session_key, project) DO NOTHING",
+                    (session_key, project, head, self.now()),
+                )
+                return []
             rows = self.db.all(
                 "SELECT id, reason, subject, body, created FROM notices "
                 "WHERE project = ? AND id > ? ORDER BY id",
-                (project, last_id),
+                (project, cur["last_notice_id"]),
             )
             if not rows:
-                if cur is None:
-                    # First contact of a brand-new session: initialize cursor at current head
-                    head = self.db.one(
-                        "SELECT COALESCE(MAX(id), 0) AS m FROM notices WHERE project = ?",
-                        (project,),
-                    )["m"]
-                    self.db.run(
-                        "INSERT INTO session_cursors (session_key, project, last_notice_id, updated) "
-                        "VALUES (?, ?, ?, ?) ON CONFLICT(session_key, project) DO NOTHING",
-                        (session_key, project, head, self.now()),
-                    )
                 return []
             newest = rows[-1]["id"]
             self.db.run(
@@ -150,15 +151,19 @@ class WaitService:
         return s is None or s["finished"]
 
     def _validate_group(self, project: str, g: dict) -> dict:
+        if not isinstance(g, dict):
+            raise WaitError("bad_groups")
         priority = g.get("priority", 1)
         if isinstance(priority, bool) or priority not in PRIORITIES:
             raise WaitError("bad_priority", priority=priority)
         items = g.get("items")
-        if not items:
-            raise WaitError("empty_group")
+        if not isinstance(items, (list, tuple)) or not items:
+            raise WaitError("empty_group" if isinstance(items, (list, tuple)) else "bad_groups")
         out = []
         for raw in items:
-            item = str(raw).strip()
+            if not isinstance(raw, str) or not raw.strip():
+                raise WaitError("bad_groups")
+            item = raw.strip()
             op_id = parse_op_item(item)
             if op_id is not None:
                 op = self.gateway.op(op_id)
@@ -173,18 +178,38 @@ class WaitService:
     # ------------------------------------------------------------------ register
     def register(self, project: str, session_key: str, groups: list[dict] | None = None,
                  fail_frac: float | None = None, timeout_h: float | None = None,
-                 note: str = "") -> dict:
+                 note: str = "", replace_existing: bool = False) -> dict:
         """Register a wait under state lock; returns wait row info."""
         p = self.projects.get(project)
         if p is None:
             raise WaitError("unknown_project", project=project)
-        fail_frac = p.fail_frac if fail_frac is None else float(fail_frac)
+        if fail_frac is None:
+            fail_frac = p.fail_frac
+        else:
+            if isinstance(fail_frac, bool):
+                raise WaitError("bad_fail_frac")
+            try:
+                fail_frac = float(fail_frac)
+            except (TypeError, ValueError):
+                raise WaitError("bad_fail_frac")
         if not 0.0 <= fail_frac <= 1.0:
             raise WaitError("bad_fail_frac")
         explicit_timeout = timeout_h is not None
-        timeout_h = p.timeout_h if timeout_h is None else float(timeout_h)
-        if not timeout_h > 0:
+        if timeout_h is None:
+            timeout_h = p.timeout_h
+        else:
+            if isinstance(timeout_h, bool):
+                raise WaitError("bad_timeout")
+            try:
+                timeout_h = float(timeout_h)
+            except (TypeError, ValueError):
+                raise WaitError("bad_timeout")
+        if not math.isfinite(timeout_h) or timeout_h <= 0:
             raise WaitError("bad_timeout")
+        if note is None:
+            note = ""
+        elif not isinstance(note, str):
+            note = str(note)
 
         if groups is None:
             items = self.jobs.unfinished_batches(project) + [
@@ -192,6 +217,8 @@ class WaitService:
             ]
             groups = [{"items": items, "priority": 1}] if items else []
         else:
+            if not isinstance(groups, (list, tuple)):
+                raise WaitError("bad_groups")
             groups = [self._validate_group(project, g) for g in groups]
 
         seen: list[str] = []
@@ -218,6 +245,20 @@ class WaitService:
         if not seen and not explicit_timeout:
             raise WaitError("nothing_to_wait")
 
+        if replace_existing:
+            old_waits = self.db.all(
+                "SELECT id FROM waits WHERE project = ? AND session_key = ? AND state = 'active' "
+                "AND NOT EXISTS (SELECT 1 FROM mcp_tasks t WHERE t.wait_id = waits.id)",
+                (project, session_key),
+            )
+            if old_waits:
+                for ow in old_waits:
+                    self.db.update("waits", {"id": ow["id"]}, state="cancelled")
+                with self._cond:
+                    for ow in old_waits:
+                        self._sync_waiters.pop(ow["id"], None)
+                    self._cond.notify_all()
+
         now = self.now()
         wid = self.db.insert(
             "waits",
@@ -227,7 +268,7 @@ class WaitService:
             fail_frac=fail_frac,
             timeout_at=now + timeout_h * 3600.0,
             timeout_h=timeout_h,
-            note=(note or "").strip(),
+            note=note.strip(),
             state="active",
             created=now,
         )
@@ -238,7 +279,7 @@ class WaitService:
             "fail_frac": fail_frac,
             "timeout_h": timeout_h,
             "timeout_at": now + timeout_h * 3600.0,
-            "note": (note or "").strip(),
+            "note": note.strip(),
         }
 
     # ------------------------------------------------------------------ evaluate
@@ -355,13 +396,17 @@ class WaitService:
                     self._sync_waiters.pop(wait_id, None)
                     return val
 
-            # 2. Check DB outside self._cond in case evaluate() fired before arm_sync_wait
+            # 2. Check DB outside self._cond in case evaluate() fired or wait was cancelled
             with self.lock:
                 w = self.db.one("SELECT state, result FROM waits WHERE id = ?", (wait_id,))
                 if w and w["state"] == "fired" and w["result"]:
                     with self._cond:
                         self._sync_waiters.pop(wait_id, None)
                     return json.loads(w["result"])
+                if w is None or w["state"] == "cancelled":
+                    with self._cond:
+                        self._sync_waiters.pop(wait_id, None)
+                    return None
 
             left = deadline - time.monotonic()
             if left <= 0:

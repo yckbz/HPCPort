@@ -664,3 +664,65 @@ def test_user_cancel_delivers_notice_and_shows_note(hpc_home, tmp_path):
         assert "lr too high, use 1e-4" in txt
         assert "note=lr too high, use 1e-4" in txt
         assert "cancel note: lr too high, use 1e-4" in txt
+
+
+def test_wait_for_replace_and_tasks_validation_isolation(hpc_home, tmp_path):
+    d, ex, app, opened, remote, local_dir = _make_app(hpc_home, tmp_path)
+    d.settings.create_project("other")
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        # 1. Non-Tasks wait_for replaces prior active non-Tasks wait (no notice storm)
+        sid = _mcp_init_legacy(client, "/p/demo/mcp")
+        op = d.gateway.exec("demo", "bare1", "sleep 20", background=True)
+        oid = op["op"]["id"]
+        _mcp_call(client, "/p/demo/mcp", sid, 2, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": [{"items": ["op:%d" % oid], "priority": 1}], "wait_s": 0.02},
+        })
+        _mcp_call(client, "/p/demo/mcp", sid, 3, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": [{"items": ["op:%d" % oid], "priority": 1}], "wait_s": 0.02},
+        })
+        # Invalid call must NOT cancel the active wait
+        r_bad = _mcp_call(client, "/p/demo/mcp", sid, 4, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": [{"items": ["nonexistent"], "priority": 1}], "wait_s": 0.02},
+        })
+        assert r_bad["result"]["isError"] is True
+        active_waits = d.db.all("SELECT id FROM waits WHERE project = 'demo' AND state = 'active'")
+        assert len(active_waits) == 1
+
+        # 2. TasksExtension invalid argument types return tool isError (not 500)
+        _, sid_t = _mcp_call_modern(client, "/p/demo/mcp", 10, "server/discover", {})
+        r_bad_g, sid_t = _mcp_call_modern(client, "/p/demo/mcp", 11, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": "op:1"},
+        }, sid=sid_t)
+        assert r_bad_g["result"]["isError"] is True
+        r_bad_ff, sid_t = _mcp_call_modern(client, "/p/demo/mcp", 12, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": [{"items": ["op:%d" % oid]}], "fail_frac": "not_a_num"},
+        }, sid=sid_t)
+        assert r_bad_ff["result"]["isError"] is True
+
+        # 3. TasksExtension isolates tasks across projects (and rejects unbound /mcp)
+        r_task, sid_t = _mcp_call_modern(client, "/p/demo/mcp", 13, "tools/call", {
+            "name": "wait_for",
+            "arguments": {"groups": [{"items": ["op:%d" % oid], "priority": 1}]},
+        }, sid=sid_t)
+        tid = r_task["result"]["taskId"]
+        _, sid_o = _mcp_call_modern(client, "/p/other/mcp", 20, "server/discover", {})
+        r_cross_get, _ = _mcp_call_modern(client, "/p/other/mcp", 21, "tasks/get",
+                                          {"taskId": tid}, sid=sid_o)
+        assert r_cross_get["result"]["status"] == "failed"
+        r_cross_cancel, _ = _mcp_call_modern(client, "/p/other/mcp", 22, "tasks/cancel",
+                                             {"taskId": tid}, sid=sid_o)
+        assert r_cross_cancel["result"]["status"] == "failed"
+        _, sid_u = _mcp_call_modern(client, "/mcp", 23, "server/discover", {})
+        r_unbound_get, _ = _mcp_call_modern(client, "/mcp", 24, "tasks/get",
+                                            {"taskId": tid}, sid=sid_u)
+        assert r_unbound_get["result"]["status"] == "failed"
+        # Original project still sees working task
+        r_own, _ = _mcp_call_modern(client, "/p/demo/mcp", 14, "tasks/get",
+                                    {"taskId": tid}, sid=sid_t)
+        assert r_own["result"]["status"] == "working"
+        d.gateway.stop("demo", oid, by="user")
