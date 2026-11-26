@@ -93,7 +93,7 @@ When a user asks you to install HPCPort from a local path or Git URL, perform th
 # Using uv (recommended)
 uv tool install .
 # Or directly from GitHub:
-# uv tool install git+https://github.com/<owner>/HPCPort.git
+# uv tool install git+https://github.com/yckbz/HPCPort.git
 
 # Or using pip inside a virtual environment
 python3 -m venv ~/.hpcport/venv

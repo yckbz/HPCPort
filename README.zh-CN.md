@@ -93,7 +93,7 @@ HPCPort 运行在任意支持 MCP 的 AI 编程 Agent 与远端 **Slurm 超算�
 # 推荐：使用 uv
 uv tool install .
 # 或直接从 GitHub 安装：
-# uv tool install git+https://github.com/<owner>/HPCPort.git
+# uv tool install git+https://github.com/yckbz/HPCPort.git
 
 # 或使用标准 Python 虚拟环境
 python3 -m venv ~/.hpcport/venv
