@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS batches (
   tag TEXT NOT NULL DEFAULT '',
   desc TEXT NOT NULL,
   fail_alerted INTEGER NOT NULL DEFAULT 0,
+  done_notified INTEGER NOT NULL DEFAULT 0,
   created REAL NOT NULL,
   PRIMARY KEY (project, batch)
 );
@@ -55,7 +56,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   run_s REAL,
   cancel_by TEXT,
   cancel_at REAL,
-  cancel_note TEXT
+  cancel_note TEXT,
+  dispatch_token TEXT,
+  dispatch_attempted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_proj_batch ON jobs(project, batch);
 CREATE INDEX IF NOT EXISTS jobs_cluster_state ON jobs(cluster, state);
@@ -192,15 +195,34 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-MIGRATIONS: dict[int, list] = {}
-
-
 def add_column(table: str, column: str):
     def step(con):
         cols = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
         if cols and column.split()[0] not in cols:
             con.execute("ALTER TABLE %s ADD COLUMN %s" % (table, column))
     return step
+
+
+def _init_done_notified(con):
+    con.execute(
+        "UPDATE batches SET done_notified = 1 "
+        "WHERE EXISTS ("
+        "  SELECT 1 FROM jobs j WHERE j.project = batches.project AND j.batch = batches.batch"
+        ") AND NOT EXISTS ("
+        "  SELECT 1 FROM jobs j WHERE j.project = batches.project AND j.batch = batches.batch "
+        "  AND j.state IN ('unapproved', 'held', 'queued', 'running')"
+        ")"
+    )
+
+
+MIGRATIONS: dict[int, list] = {
+    1: [
+        add_column("batches", "done_notified INTEGER NOT NULL DEFAULT 0"),
+        add_column("jobs", "dispatch_token TEXT"),
+        add_column("jobs", "dispatch_attempted INTEGER NOT NULL DEFAULT 0"),
+        _init_done_notified,
+    ],
+}
 
 
 class DB:

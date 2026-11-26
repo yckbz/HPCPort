@@ -357,7 +357,7 @@ def resources(header: Header, cores_per_node: int | None = None,
 
 
 def wrapper_script(header: Header, script_abs: str, hook_dir: str,
-                   env: dict[str, str]) -> str:
+                   env: dict[str, str], sid_file: str | None = None) -> str:
     """Generate a batch wrapper that forwards signals and records start/end/exit hooks."""
     q = shlex.quote
     out = ["#!/bin/bash"]
@@ -369,6 +369,16 @@ def wrapper_script(header: Header, script_abs: str, hook_dir: str,
         '__hpcp_id="${SLURM_ARRAY_JOB_ID:+${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"',
         '__hpcp_id="${__hpcp_id:-${SLURM_JOB_ID:-nojob}}"',
         'mkdir -p "$__hpcp_dir" && echo "$(date +%s) $(hostname)" > "$__hpcp_dir/$__hpcp_id.start"',
+    ]
+    if sid_file:
+        out += [
+            '__hpcp_job="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-}}"',
+            '__hpcp_sid=%s' % q(sid_file),
+            '[ -n "$__hpcp_job" ] && [ ! -s "$__hpcp_sid" ] && '
+            '{ printf \'%s\\n\' "$__hpcp_job" > "$__hpcp_sid.$$.tmp" '
+            '&& mv "$__hpcp_sid.$$.tmp" "$__hpcp_sid"; } 2>/dev/null || true',
+        ]
+    out += [
         "__hpcp_pid=",
         "for __s in TERM INT HUP USR1 USR2; do",
         '  trap "[ -n \\"\\$__hpcp_pid\\" ] && kill -$__s \\"\\$__hpcp_pid\\" 2>/dev/null" $__s',

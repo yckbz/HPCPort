@@ -90,11 +90,13 @@ def test_parse_squeue_sacct_scontrol_and_hooks():
 def test_wrapper_script_contents():
     h = slurm.parse_header("#!/bin/bash\n#SBATCH -p a01\n")
     text = slurm.wrapper_script(h, "/work/p/run.sh", "/work/p/.hpcport",
-                                {"HPCPORT_PROJECT": "demo", "HPCPORT_BATCH": "b001"})
+                                {"HPCPORT_PROJECT": "demo", "HPCPORT_BATCH": "b001"},
+                                sid_file="/work/p/.hpcport/job1_abc.sid")
     assert "HPCPORT_PROJECT=demo" in text
     assert "HPCPORT_BATCH=b001" in text
     assert "hpcport wrapper" in text
     assert "trap " in text
+    assert "job1_abc.sid" in text
 
 
 def test_gpu_per_socket_tres_and_sub_hour_formatting():

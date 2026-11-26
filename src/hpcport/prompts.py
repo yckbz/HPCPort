@@ -278,5 +278,6 @@ ERRORS = {
     "stale": "Proposal in approval #{id} is stale: {msg}",
     "changed": "Disk file changed since approval #{id} was created: {msg}",
     "ambiguous_batch": "Batch `{batch}` exists in multiple projects ({projects}); specify `project`.",
+    "batch_cluster_mismatch": "Batch `{batch}` already belongs to cluster `{existing}` and cannot mix jobs from `{cluster}`; use a different batch label.",
     "cluster_busy": "Cannot detach `{cluster}` from `{project}` while active jobs or background operations are running.",
 }

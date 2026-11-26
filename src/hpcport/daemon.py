@@ -104,18 +104,9 @@ class Daemon:
         self._sync_failures: dict[str, int] = {}
         self._sync_errors: dict[str, str] = {}
         self._cycling = threading.Lock()
-        self._known_finished_batches: set[tuple[str, str]] = self._load_finished_batches()
 
     def _notify(self, project: str, reason: str, subject: str, body: dict) -> int:
         return self.waits.notify(project, reason, subject, body)
-
-    def _load_finished_batches(self) -> set[tuple[str, str]]:
-        done = set()
-        for b in self.db.all("SELECT project, batch FROM batches"):
-            s = self.jobs.summary(b["project"], b["batch"])
-            if s and s["finished"]:
-                done.add((b["project"], b["batch"]))
-        return done
 
     # ------------------------------------------------------------------ config callbacks
     def _on_preset_changed(self, name: str, old: ClusterPreset | None,
@@ -387,11 +378,16 @@ class Daemon:
                 self.submits.recheck()
                 # Emit batch_done notices for newly finished batches
                 for proj, batch in changed:
-                    if (proj, batch) in self._known_finished_batches:
+                    brow = self.db.one(
+                        "SELECT done_notified FROM batches WHERE project = ? AND batch = ?",
+                        (proj, batch),
+                    )
+                    if not brow or brow["done_notified"]:
                         continue
                     s = self.jobs.summary(proj, batch)
                     if s and s["finished"]:
-                        self._known_finished_batches.add((proj, batch))
+                        self.db.update("batches", {"project": proj, "batch": batch},
+                                       done_notified=1)
                         self.waits.notify(
                             proj, "batch_done", "batch:" + batch,
                             {"batch": batch, "cluster": s["cluster"], "jobs": s["jobs"],

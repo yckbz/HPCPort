@@ -71,6 +71,10 @@ def _label(job: dict) -> str:
     return job["slurm_id"] or "#%d" % job["id"]
 
 
+def _job_stem(job_id: int, token: str | None) -> str:
+    return "job%d_%s" % (job_id, token) if token else "job%d" % job_id
+
+
 def _total(values) -> float | None:
     values = list(values)
     return None if any(v is None for v in values) else float(sum(values))
@@ -173,9 +177,19 @@ class JobService:
         with self.lock:
             self._check_duplicates(project, cluster, wd, files)
             if batch is None:
-                batch = "b%03d" % self.db.next_counter("batch:" + project)
+                while True:
+                    cand = "b%03d" % self.db.next_counter("batch:" + project)
+                    if self.db.one(
+                        "SELECT 1 FROM batches WHERE project = ? AND batch = ?",
+                        (project, cand),
+                    ) is None:
+                        batch = cand
+                        break
             row = self.db.one("SELECT * FROM batches WHERE project = ? AND batch = ?",
                               (project, batch))
+            if row is not None and row["cluster"] != cluster:
+                raise JobError("batch_cluster_mismatch", batch=batch,
+                               existing=row["cluster"], cluster=cluster)
             sub = self._submission(project, batch, cluster, wd, tag, desc.strip(),
                                    asked, previews)
             approval = self.gate(project, sub) if self.gate is not None else None
@@ -184,7 +198,11 @@ class JobService:
             submit_no = self.db.next_counter("submit_no")
             if row is None:
                 self.db.insert("batches", project=project, batch=batch, cluster=cluster,
-                               workdir=wd, tag=tag, desc=desc.strip(), created=now)
+                               workdir=wd, tag=tag, desc=desc.strip(),
+                               done_notified=0, created=now)
+            else:
+                self.db.update("batches", {"project": project, "batch": batch},
+                               done_notified=0)
             env = {
                 "HPCPORT_PROJECT": project,
                 "HPCPORT_BATCH": batch,
@@ -194,6 +212,7 @@ class JobService:
             ids, wrappers = [], {}
             for f in files:
                 h = headers[f]
+                token = secrets.token_hex(6)
                 jid = self.db.insert(
                     "jobs",
                     project=project,
@@ -212,11 +231,15 @@ class JobService:
                     gpu_hours=asked[f].gpu_hours,
                     cores=asked[f].cores,
                     gpus=asked[f].gpus,
+                    dispatch_token=token,
+                    dispatch_attempted=0,
                 )
                 ids.append(jid)
                 self._preparing[jid] = submit_no
-                wrappers[jid] = slurm.wrapper_script(
-                    h, "%s/%s" % (real, f), "%s/%s" % (real, HOOK_DIR), env
+                stem = _job_stem(jid, token)
+                wrappers[stem] = slurm.wrapper_script(
+                    h, "%s/%s" % (real, f), "%s/%s" % (real, HOOK_DIR), env,
+                    sid_file="%s/%s/%s.sid" % (real, HOOK_DIR, stem),
                 )
 
         # Step 2: write wrappers outside lock
@@ -420,13 +443,13 @@ class JobService:
             raise JobError("missing_scripts", workdir=wd, scripts=", ".join(files))
         return texts
 
-    def _write_wrappers(self, ex, wd, wrappers: dict[int, str]) -> None:
+    def _write_wrappers(self, ex, wd, wrappers: dict[str, str]) -> None:
         q = shlex.quote
         parts = ["cd -- %s && mkdir -p %s || exit 1" % (q(wd), HOOK_DIR)]
-        for jid, text in wrappers.items():
+        for stem, text in wrappers.items():
             eof = "HPCP_EOF_%s" % secrets.token_hex(6)
-            parts.append("cat > %s/job%d.sh <<'%s' || exit 1\n%s%s"
-                         % (HOOK_DIR, jid, eof, text, eof))
+            parts.append("cat > %s/%s.sh <<'%s' || exit 1\n%s%s"
+                         % (HOOK_DIR, stem, eof, text, eof))
         r = ex.run("bash -s", input="\n".join(parts) + "\n")
         if r.rc != 0:
             raise TransportError("cannot write job wrappers in %s: %s"
@@ -450,16 +473,44 @@ class JobService:
                     j = self._next_held(project, cluster, cl.max_jobs, only)
                     if j is None:
                         return None
+                    was_attempted = bool(j.get("dispatch_attempted"))
+                    if not was_attempted:
+                        self.db.update("jobs", {"id": j["id"]}, dispatch_attempted=1)
+                        j["dispatch_attempted"] = 1
                     sent = self._sending[j["id"]] = threading.Event()
                 try:
-                    sid_file = "%s/job%d.sid" % (HOOK_DIR, j["id"])
+                    stem = _job_stem(j["id"], j.get("dispatch_token"))
+                    wrapper_rel = "%s/%s.sh" % (HOOK_DIR, stem)
+                    sid_rel = "%s/%s.sid" % (HOOK_DIR, stem)
+                    lock_rel = "%s/%s.lock" % (HOOK_DIR, stem)
+                    squeue_check = ""
+                    if was_attempted:
+                        squeue_check = (
+                            "__sq=$(squeue -h -u \"$USER\" -o \"%%F|%%o\" 2>/dev/null "
+                            "| awk -F'|' -v pat=%s 'index($2, pat) > 0 {print $1; exit}'); "
+                            "if [ -n \"$__sq\" ]; then "
+                            "printf '%%s\\n' \"$__sq\" > %s.tmp && mv %s.tmp %s && "
+                            "printf '%%s\\n' \"$__sq\"; return 0; fi; "
+                            % (q(stem + ".sh"), q(sid_rel), q(sid_rel), q(sid_rel))
+                        )
                     cmd = (
-                        "cd -- %s && if [ -s %s ]; then cat %s; "
-                        "else trap '' HUP; sid=$(sbatch --parsable %s/job%d.sh) || exit $?; "
-                        "printf '%%s\\n' \"$sid\" > %s.tmp && mv %s.tmp %s "
-                        "&& printf '%%s\\n' \"$sid\"; fi"
-                        % (q(j["workdir"]), sid_file, sid_file, HOOK_DIR, j["id"],
-                           sid_file, sid_file, sid_file)
+                        "cd -- %s && ("
+                        "trap '' HUP; "
+                        "__hpcp_sub() { "
+                        "if [ -s %s ]; then cat %s; return 0; fi; "
+                        "%s"
+                        "__sid=$(sbatch --parsable %s); __rc=$?; "
+                        "if [ \"$__rc\" -eq 0 ]; then "
+                        "printf '%%s\\n' \"$__sid\" > %s.tmp && mv %s.tmp %s && "
+                        "printf '%%s\\n' \"$__sid\"; return 0; fi; "
+                        "return \"$__rc\"; "
+                        "}; "
+                        "if command -v flock >/dev/null 2>&1; then "
+                        "( flock -x 9 && __hpcp_sub ) 9>%s; "
+                        "else __hpcp_sub; fi"
+                        ")"
+                        % (q(j["workdir"]), q(sid_rel), q(sid_rel), squeue_check,
+                           q(wrapper_rel), q(sid_rel), q(sid_rel), q(sid_rel), q(lock_rel))
                     )
                     r = ex.run(cmd)
                     sid = slurm.parse_sbatch(r.out) if r.rc == 0 else None
@@ -654,7 +705,78 @@ class JobService:
             jobs, elements = self._named(project, job_ids, cluster=cluster)
         return jobs, elements
 
+    def _reconcile_uncertain(self, cluster: str, unc_jobs: list[dict]) -> dict[int, str]:
+        """Check remote .sid files and squeue for attempted jobs lacking a recorded slurm_id."""
+        ex = self.ex.get(cluster)
+        if ex is None:
+            raise TransportError("unknown cluster %s" % cluster)
+        q = shlex.quote
+        mark = "@@HPCP_REC_%s" % secrets.token_hex(6)
+        lines: list[str] = []
+        for j in unc_jobs:
+            stem = _job_stem(j["id"], j.get("dispatch_token"))
+            hook_abs = "%s/%s" % (j["workdir"], HOOK_DIR)
+            sid_path = "%s/%s.sid" % (hook_abs, stem)
+            lock_path = "%s/%s.lock" % (hook_abs, stem)
+            lines.append(
+                "__check_%d() {\n"
+                "  local __s=''\n"
+                "  if [ -s %s ]; then\n"
+                "    __s=$(cat %s 2>/dev/null)\n"
+                "  else\n"
+                "    __s=$(squeue -h -u \"$USER\" -o \"%%F|%%o\" 2>/dev/null "
+                "| awk -F'|' -v pat=%s 'index($2, pat) > 0 {print $1; exit}')\n"
+                "  fi\n"
+                "  [ -n \"$__s\" ] && printf '%s %d %%s\\n' \"$__s\"\n"
+                "}\n"
+                "if command -v flock >/dev/null 2>&1 && [ -d %s ]; then\n"
+                "  ( flock -x 9 && __check_%d ) 9>%s\n"
+                "else\n"
+                "  __check_%d\n"
+                "fi"
+                % (
+                    j["id"], q(sid_path), q(sid_path), q(stem + ".sh"),
+                    mark, j["id"], q(hook_abs), j["id"], q(lock_path), j["id"],
+                )
+            )
+        with self._cluster_lock(cluster):
+            r = ex.run("bash -s", input="\n".join(lines) + "\n", timeout=SYNC_TIMEOUT)
+        found: dict[int, str] = {}
+        for line in r.out.splitlines():
+            if line.startswith(mark + " "):
+                rest = line[len(mark) + 1:].strip().split(None, 1)
+                if len(rest) == 2 and rest[0].isdigit():
+                    sid = slurm.parse_sbatch(rest[1])
+                    if sid is not None:
+                        found[int(rest[0])] = sid
+        return found
+
     def _cancel(self, jobs, elements, active, unsent, approval, by, note, then):
+        local_unsent = list(unsent)
+        uncertain_by_cluster: dict[str, list[dict]] = {}
+        for j in active:
+            if j["state"] in slurm.NOT_SENT and j.get("dispatch_attempted"):
+                uncertain_by_cluster.setdefault(j["cluster"], []).append(j)
+        for cluster, unc_jobs in uncertain_by_cluster.items():
+            try:
+                found_sids = self._reconcile_uncertain(cluster, unc_jobs)
+            except TransportError as e:
+                raise JobError("unreachable", cluster=cluster, script=None, error=str(e),
+                               n_sent=0, n_unsent=0, ids="")
+            if found_sids:
+                with self.lock:
+                    now = self.now()
+                    for j in unc_jobs:
+                        sid = found_sids.get(j["id"])
+                        if sid is not None:
+                            self.db.update("jobs", {"id": j["id"]}, state=slurm.QUEUED,
+                                           slurm_id=sid, slurm_state="PENDING",
+                                           t_submit=now, changed=now)
+                            j["slurm_id"] = sid
+                            j["state"] = slurm.QUEUED
+                            if j["id"] in local_unsent:
+                                local_unsent.remove(j["id"])
+
         ask: dict[str, tuple[list[dict], list[str]]] = {}
         for j in jobs:
             if j["state"] in slurm.IN_SLURM:
@@ -679,7 +801,7 @@ class JobService:
         with self.lock:
             self._record_scancel(answers, by, note_clean)
             now = self.now()
-            for i in unsent:
+            for i in local_unsent:
                 cur = self.db.one("SELECT state FROM jobs WHERE id = ?", (i,))
                 if cur and cur["state"] in slurm.NOT_SENT:
                     self.db.update("jobs", {"id": i}, state=slurm.CANCELLED, source="registry",
