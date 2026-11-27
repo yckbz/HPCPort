@@ -513,8 +513,11 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                 return await handler(request)
             except (ApprovalError, AttachError, ConfigError) + ToolErrors as e:
                 msg = messages.error(e) if hasattr(e, "code") and e.code in P.ERRORS else str(e)
-                if isinstance(e, SettingError) and e.code == "project_retired":
-                    return JSONResponse({"error": msg, "code": e.code}, status_code=409)
+                code = getattr(e, "code", None)
+                if isinstance(e, SettingError) and code == "project_retired":
+                    return JSONResponse({"error": msg, "code": code}, status_code=409)
+                if isinstance(code, str):
+                    return JSONResponse({"error": msg, "code": code}, status_code=400)
                 return fail(400, msg)
             except KeyError as e:
                 return fail(404, "not found: %s" % e)
@@ -634,6 +637,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                         "language": daemon.global_cfg.language,
                     },
                     "projects": projs,
+                    "budgets": {n: daemon.submits.status(n) for n in sorted(daemon.projects)},
                     "retired_projects": sorted(daemon.settings.retired_projects),
                     "presets": presets,
                     "health": daemon.cluster_health(),
@@ -769,7 +773,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
             if project and project in daemon.projects:
                 for cname in daemon.projects[project].clusters:
                     usage[cname] = daemon.jobs.cluster_usage(project, cname)
-            standing = daemon.submits.status(project) if project and not retired else None
+            standing = (daemon.submits.status(project, history=True)
+                        if project in daemon.projects else None)
         return JSONResponse({
             "text": messages.jobs_overview(batches, ops, unreg),
             "batches": batches,
@@ -888,11 +893,24 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
     async def standing_get(request):
         proj = request.path_params["project"]
-        return JSONResponse(daemon.submits.status(proj))
+        with daemon.lock:
+            return JSONResponse(daemon.submits.status(proj, history=True))
+
+    async def standing_set(request):
+        proj = request.path_params["project"]
+        d = await body(request)
+        origin = auth_kind(request)
+
+        def run():
+            daemon._require_active_project(proj)
+            return daemon.submits.set_standing(proj, d.get("mode"), d.get("limits"), origin)
+
+        return JSONResponse(await locked(run))
 
     async def standing_revoke(request):
         proj = request.path_params["project"]
-        return JSONResponse({"revoked": await locked(daemon.submits.revoke, proj)})
+        origin = auth_kind(request)
+        return JSONResponse({"revoked": await locked(daemon.submits.revoke, proj, origin)})
 
     async def audit_list(request):
         q = request.query_params
@@ -1018,6 +1036,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         r_get("/api/approvals", approvals_list),
         r_mut("/api/approvals/{id:int}/{action}", approval_decide, "POST", approval_action=True),
         r_get("/api/standing/{project}", standing_get),
+        r_mut("/api/standing/{project}", standing_set, "PUT", approval_action=True),
         r_mut("/api/standing/{project}", standing_revoke, "DELETE", approval_action=True),
         r_get("/api/audit", audit_list),
         Route("/p/{project}/mcp", endpoint=project_mcp_asgi, methods=["GET", "POST", "DELETE"]),

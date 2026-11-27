@@ -11,13 +11,28 @@ import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PROJECT_RETIREMENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS retired_projects (
   name TEXT PRIMARY KEY,
   retired_at REAL NOT NULL
 );
+"""
+
+STANDING_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS standing_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL,
+  ts REAL NOT NULL,
+  action TEXT NOT NULL,               -- granted | adjusted | revoked
+  limits TEXT,                        -- JSON limits after the change (NULL when revoked)
+  previous TEXT,                      -- JSON limits before the change (NULL when granted)
+  used TEXT,                          -- JSON usage totals at the time of the change
+  approval INTEGER,                   -- submission approval that carried the change, if any
+  origin TEXT NOT NULL                -- approval | web | cli | retire
+);
+CREATE INDEX IF NOT EXISTS standing_events_proj ON standing_events(project, id);
 """
 
 SCHEMA = """
@@ -201,7 +216,7 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
-""" + PROJECT_RETIREMENTS_SCHEMA
+""" + PROJECT_RETIREMENTS_SCHEMA + STANDING_EVENTS_SCHEMA
 
 
 def read_retired_project_names(path: Path) -> set[str]:
@@ -242,6 +257,7 @@ MIGRATIONS: dict[int, list] = {
         _init_done_notified,
     ],
     2: [PROJECT_RETIREMENTS_SCHEMA],
+    3: [sql for sql in STANDING_EVENTS_SCHEMA.split(";") if sql.strip()],
 }
 
 

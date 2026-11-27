@@ -425,9 +425,68 @@ def test_retire_project_checks_durable_blockers_and_rolls_back_on_failure(hpc_ho
             d.retire_project("demo", preview["binding"])
     assert d.submits.standing("demo") == standing
     assert d.db.one("SELECT 1 FROM retired_projects WHERE name = 'demo'") is None
+    assert d.submits.history("demo") == []
     assert "demo" in d.projects and "demo" in config.list_project_names()
     assert d.retire_project("demo", preview["binding"]) == {"retired": "demo"}
     assert d.submits.standing("demo") is None
+    assert [(e["action"], e["origin"]) for e in d.submits.history("demo")] == [("revoked", "retire")]
+    assert d.db.one("SELECT 1 FROM notices WHERE reason = 'standing_changed'") is None
+
+
+
+def test_web_standing_budget_api(hpc_home, tmp_path):
+    d, ex, app, opened, remote, _ = _make_app(hpc_home, tmp_path)
+    limits = {"core_hours": 50, "gpu_hours": None, "total_jobs": 10,
+              "total_core_hours": 500, "total_gpu_hours": None}
+    ui = {"X-HPCPort-UI": "1"}
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        d.open_dashboard(tab="jobs")
+        client.get(opened[-1].split("127.0.0.1:8765")[1], follow_redirects=False)
+
+        budget = client.get("/api/state").json()["budgets"]["demo"]
+        assert budget["standing"] is None and budget["approval"] is True
+        assert budget["defaults"]["total_jobs"] == 500
+
+        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": limits}, headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "standing_missing"
+        r = client.put("/api/standing/demo", json={"mode": "grant", "limits": limits}, headers=ui)
+        assert r.status_code == 200, r.text
+        assert r.json()["standing"]["limits"] == limits
+        r = client.put("/api/standing/demo", json={"mode": "grant", "limits": limits}, headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "standing_exists"
+        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": {"total_jobs": 3}},
+                       headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "bad_limits"
+
+        # Web users adjust without resetting; the history says who changed what
+        r = client.put("/api/standing/demo", json={"mode": "adjust",
+                                                   "limits": dict(limits, total_jobs=20)},
+                       headers=ui)
+        assert r.json()["changed"] is True
+        hist = client.get("/api/standing/demo").json()["history"]
+        assert [(h["action"], h["origin"]) for h in hist] == [("adjusted", "web"), ("granted", "web")]
+        assert client.get("/api/jobs?project=demo").json()["standing"]["history"] == hist
+        state_budget = client.get("/api/state").json()["budgets"]["demo"]
+        assert state_budget["standing"]["limits"]["total_jobs"] == 20
+
+        cli = TestClient(app)
+        cli_hdr = {"Authorization": "Bearer secret-cli-token"}
+        r = cli.put("/api/standing/demo", json={"mode": "adjust", "limits": limits},
+                    headers=cli_hdr)
+        assert r.status_code == 200 and d.submits.history("demo")[0]["origin"] == "cli"
+
+        # With web_only_approval, the CLI token (reachable by local agents) cannot grant budget
+        client.patch("/api/config", json={"web_only_approval": True}, headers=ui)
+        for call in (lambda: cli.put("/api/standing/demo", json={"mode": "adjust",
+                                                                 "limits": limits},
+                                     headers=cli_hdr),
+                     lambda: cli.delete("/api/standing/demo", headers=cli_hdr)):
+            assert call().status_code == 403
+        assert client.delete("/api/standing/demo", headers=ui).json() == {"revoked": True}
+        assert d.submits.history("demo")[0]["action"] == "revoked"
+
+        r = client.put("/api/standing/ghost", json={"mode": "grant", "limits": limits}, headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "unknown_project"
 
 
 def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):

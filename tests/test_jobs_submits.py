@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -123,6 +124,116 @@ def test_dynamic_recheck_auto_releases_when_budget_frees(hpc_home, tmp_path):
     rows_c = d.jobs.job_rows("projA", r3["batch"])
     assert rows_c[0]["slurm_id"] is not None
     assert d.approvals.get(r3["approval"])["state"] == "cancelled"
+
+
+
+def _events(d, project):
+    return [(e["action"], e["origin"]) for e in reversed(d.submits.history(project))]
+
+
+def test_approval_adjusts_existing_budget_without_resetting_usage(hpc_home, tmp_path):
+    from hpcport import messages
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    wd = remote / "projA" / "adjust"
+    for name in ("a.sh", "b.sh", "c.sh", "d.sh"):
+        _write_script(wd / name, ntasks=4, gpus=0, time_s="01:00:00")
+
+    r1 = d.jobs.submit("projA", "gpu01", str(wd), ["a.sh"], desc="a", wait_s=0)
+    with d.lock:
+        d.approvals.decide(r1["approval"], True, always=True, total_core_hours=5.0)
+    granted = d.submits.standing("projA")
+    assert granted["approval"] == r1["approval"]
+
+    r2 = d.jobs.submit("projA", "gpu01", str(wd), ["b.sh"], desc="b", wait_s=0)
+    assert r2["approval"] is None
+    r3 = d.jobs.submit("projA", "gpu01", str(wd), ["c.sh"], desc="c", wait_s=0)
+    assert r3["approval"] is not None
+
+    # Approving with new limits only raises the cap: the starting point and usage are kept
+    with d.lock:
+        res = d.approvals.decide(r3["approval"], True, always=True, total_core_hours=20.0)
+    assert res["standing"]["total_core_hours"] == 20.0
+    adjusted = d.submits.standing("projA")
+    assert adjusted["after_job"] == granted["after_job"]
+    assert adjusted["created"] == granted["created"]
+    assert adjusted["limits"] == dict(granted["limits"], total_core_hours=20.0)
+    assert d.submits.status("projA")["used"]["core_hours"] == 8.0      # b.sh + c.sh
+
+    r4 = d.jobs.submit("projA", "gpu01", str(wd), ["d.sh"], desc="d", wait_s=0)
+    assert r4["approval"] is None                                    # 12 <= 20
+
+    assert _events(d, "projA") == [("granted", "approval"), ("adjusted", "approval")]
+    last = d.submits.history("projA")[0]
+    assert last["previous"]["total_core_hours"] == 5.0
+    assert last["limits"]["total_core_hours"] == 20.0
+    assert last["approval"] == r3["approval"]
+
+    rows = d.db.all("SELECT reason, body FROM notices WHERE project = 'projA' "
+                    "AND reason = 'standing_changed' ORDER BY id")
+    texts = [messages.format_notice(dict(r, body=json.loads(r["body"]))) for r in rows]
+    assert texts[0].startswith("The user granted this project's standing budget (now: ")
+    assert "adjusted the limits of" in texts[1]
+    assert "total_core_hours=20" in texts[1] and "total_gpu_hours=1000" in texts[1]
+
+
+def test_direct_grant_adjust_and_revoke(hpc_home, tmp_path):
+    from hpcport.approvals import ApprovalError
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    wd = remote / "projA" / "direct"
+    _write_script(wd / "a.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    _write_script(wd / "b.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    r1 = d.jobs.submit("projA", "gpu01", str(wd), ["a.sh"], desc="a", wait_s=0)
+    assert d.submits.status("projA")["pending"] == 1
+
+    limits = {"core_hours": 10.0, "gpu_hours": None, "total_jobs": 5,
+              "total_core_hours": 100.0, "total_gpu_hours": None}
+    with d.lock:
+        out = d.submits.set_standing("projA", "grant", limits, "web")
+    # The waiting submission fits the new budget and is released right away
+    assert out["changed"] is True and out["released"] == [r1["batch"]]
+    assert d.approvals.get(r1["approval"])["state"] == "cancelled"
+    assert out["standing"]["limits"] == limits and out["standing"]["approval"] is None
+    assert out["used"]["jobs"] == 1 and out["pending"] == 0
+    assert d.submits.status("projB")["standing"] is None            # projects stay independent
+
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.submits.set_standing("projA", "grant", limits, "web")
+    assert exc.value.code == "standing_exists"
+    for bad, code in ((dict(limits, total_jobs=1.5), "bad_limit"),
+                      (dict(limits, core_hours=-1), "bad_limit"),
+                      ({"core_hours": 1}, "bad_limits"),
+                      (dict(limits, extra=1), "bad_limits")):
+        with d.lock, pytest.raises(ApprovalError) as exc:
+            d.submits.set_standing("projA", "adjust", bad, "web")
+        assert exc.value.code == code
+    with d.lock, pytest.raises(ApprovalError):
+        d.submits.set_standing("projA", "replace", limits, "web")
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.submits.set_standing("nope", "grant", limits, "web")
+    assert exc.value.code == "unknown_project"
+
+    # Saving the same limits changes nothing and records nothing
+    with d.lock:
+        assert d.submits.set_standing("projA", "adjust", limits, "cli")["changed"] is False
+    # Lowering below usage keeps the counted usage and gates later submissions
+    with d.lock:
+        out = d.submits.set_standing("projA", "adjust", dict(limits, total_jobs=1), "cli")
+    assert out["changed"] is True and out["used"]["jobs"] == 1
+    r2 = d.jobs.submit("projA", "gpu01", str(wd), ["b.sh"], desc="b", wait_s=0)
+    assert [w["code"] for w in d.approvals.get(r2["approval"])["detail"]["why"]] == ["total"]
+
+    with d.lock:
+        assert d.submits.revoke("projA", origin="web") is True
+        assert d.submits.revoke("projA", origin="web") is False
+    assert _events(d, "projA") == [("granted", "web"), ("adjusted", "cli"), ("revoked", "web")]
+    revoked = d.submits.history("projA")[0]
+    assert revoked["limits"] is None and revoked["previous"]["total_jobs"] == 1
+    assert revoked["used"]["jobs"] == 2
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.submits.set_standing("projA", "adjust", limits, "web")
+    assert exc.value.code == "standing_missing"
 
 
 def test_cancel_and_not_slurm_rejection(hpc_home, tmp_path):
@@ -516,6 +627,7 @@ def test_db_migration_preserves_legacy_job_state(tmp_path):
         ver = db._con.execute("PRAGMA user_version").fetchone()[0]
         assert ver == SCHEMA_VERSION
         assert db.all("SELECT name FROM retired_projects") == []
+        assert db.all("SELECT id FROM standing_events") == []
         b_done = db.one("SELECT done_notified FROM batches WHERE batch = 'b_done'")
         b_open = db.one("SELECT done_notified FROM batches WHERE batch = 'b_open'")
         assert b_done["done_notified"] == 1

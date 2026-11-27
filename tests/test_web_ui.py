@@ -51,3 +51,20 @@ assert.equal(
 """
         subprocess.run([node, "--input-type=module", "-e", script],
                        cwd=WEB_DIR, check=True, timeout=10)
+
+
+def test_i18n_languages_share_keys_and_budget_copy():
+    node = shutil.which("node")
+    if node:
+        script = """
+import assert from "node:assert/strict";
+import { MESSAGES } from "./i18n.js";
+assert.deepEqual(Object.keys(MESSAGES.zh).sort(), Object.keys(MESSAGES.en).sort());
+for (const f of ["core_hours", "gpu_hours", "total_jobs", "total_core_hours", "total_gpu_hours"]) {
+  assert.ok(MESSAGES.en["limField_" + f] && MESSAGES.en["limName_" + f], f);
+}
+for (const k of ["granted", "adjusted", "revoked"]) assert.ok(MESSAGES.en["budgetEvent_" + k], k);
+for (const k of ["approval", "web", "cli", "retire"]) assert.ok(MESSAGES.en["budgetOrigin_" + k], k);
+"""
+        subprocess.run([node, "--input-type=module", "-e", script],
+                       cwd=WEB_DIR, check=True, timeout=10)

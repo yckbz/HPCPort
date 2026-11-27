@@ -508,10 +508,10 @@ function renderAll() {
 function renderReasonChip(r) {
   const code = r.code || r.rule || "";
   if (code === "over") {
-    return `<span class="pill pill-amber">${esc(i18n.t("reason_over"))}: ${esc(r.what)} ${fmtNum(r.asked)} &gt; ${fmtNum(r.limit)}</span>`;
+    return `<span class="pill pill-amber">${esc(i18n.t("reason_over"))}: ${esc(i18n.t("limField_" + r.what))} ${fmtNum(r.asked)} &gt; ${fmtNum(r.limit)}</span>`;
   }
   if (code === "total") {
-    return `<span class="pill pill-amber">${esc(i18n.t("reason_total"))}: ${esc(r.what)} ${fmtNum(r.reached)} &gt; ${fmtNum(r.limit)}</span>`;
+    return `<span class="pill pill-amber">${esc(i18n.t("reason_total"))}: ${esc(i18n.t("limField_" + (TOTAL_LIMIT_KEY[r.what] || r.what)))} ${fmtNum(r.reached)} &gt; ${fmtNum(r.limit)}</span>`;
   }
   if (code === "unknown") {
     return `<span class="pill pill-amber">${esc(i18n.t("reason_unknown"))} (${esc((r.scripts || []).join(", "))})</span>`;
@@ -561,10 +561,13 @@ function renderApprovalCard(a) {
     const scriptNames = Object.keys(scripts);
     const scriptsOpen = state.openScripts.has(a.id);
     const standingOpen = state.openStanding.has(a.id);
-    const projInfo = ((state.snapshot && state.snapshot.projects) || []).find((p) => p.name === a.project);
-    const defaults = (projInfo && projInfo.data && projInfo.data.submit) || {};
+    const budget = budgetOf(a.project);
+    const budgetActive = budgetMode(budget) === "active";
+    const baseLimits = budgetActive ? budget.standing.limits : (budget?.defaults || {});
     const sd = state.standingDrafts[a.id] || {};
-    const limVal = (k) => (Object.prototype.hasOwnProperty.call(sd, k) ? sd[k] : (defaults[k] ?? ""));
+    const limValues = Object.fromEntries(LIMIT_FIELDS.map((f) => [
+      f.key, Object.prototype.hasOwnProperty.call(sd, f.key) ? sd[f.key] : baseLimits[f.key],
+    ]));
 
     bodyHtml = `
       <div class="muted text-sm">
@@ -579,6 +582,7 @@ function renderApprovalCard(a) {
         <div class="metric-chip" title="${esc(fmtHoursHint(sub.gpu_hours))}"><span class="k">${esc(i18n.t("metricGpuH"))}</span><span class="v">${fmtNum(sub.gpu_hours)}</span></div>
       </div>
       ${why.length ? `<div class="reason-row">${why.map(renderReasonChip).join("")}</div>` : ""}
+      ${renderBudgetContext(budget)}
       ${scriptNames.length ? `
         <div style="margin-top:8px">
           <button type="button" class="btn btn-subtle btn-xs" data-toggle-scripts="${a.id}">
@@ -594,26 +598,14 @@ function renderApprovalCard(a) {
       ` : ""}
       ${standingOpen ? `
         <div class="standing-drawer" data-standing-box="${a.id}">
-          <div class="text-sm" style="font-weight:600">${esc(i18n.t("standingFormTitle"))}</div>
-          <div class="standing-grid">
-            <label class="field-label">${esc(i18n.t("limCoreH"))}
-              <input type="number" step="any" min="0" name="core_hours" value="${esc(limVal("core_hours"))}" />
-            </label>
-            <label class="field-label">${esc(i18n.t("limGpuH"))}
-              <input type="number" step="any" min="0" name="gpu_hours" value="${esc(limVal("gpu_hours"))}" />
-            </label>
-            <label class="field-label">${esc(i18n.t("limTotalJobs"))}
-              <input type="number" step="1" min="0" name="total_jobs" value="${esc(limVal("total_jobs"))}" />
-            </label>
-            <label class="field-label">${esc(i18n.t("limTotalCoreH"))}
-              <input type="number" step="any" min="0" name="total_core_hours" value="${esc(limVal("total_core_hours"))}" />
-            </label>
-            <label class="field-label">${esc(i18n.t("limTotalGpuH"))}
-              <input type="number" step="any" min="0" name="total_gpu_hours" value="${esc(limVal("total_gpu_hours"))}" />
-            </label>
+          <div class="text-sm" style="font-weight:600">${esc(i18n.t(budgetActive ? "standingAdjustTitle" : "standingFormTitle"))}</div>
+          <div class="muted text-xs" style="margin-top:4px">
+            ${esc(i18n.t(budgetActive ? "standingAdjustNote" : "standingGrantNote"))}
+            ${esc(i18n.t("budgetBlankHint"))}
           </div>
+          ${renderLimitInputs(limValues, { used: budgetActive ? budget.used : null, needs: budgetActive ? limitNeeds(why) : {} })}
           <div class="flex-row">
-            <button type="button" class="btn btn-primary btn-sm" data-decide-standing="${a.id}">${esc(i18n.t("confirmGrant"))}</button>
+            <button type="button" class="btn btn-primary btn-sm" data-decide-standing="${a.id}">${esc(i18n.t(budgetActive ? "confirmAdjust" : "confirmGrant"))}</button>
             <button type="button" class="btn btn-outline btn-sm" data-toggle-standing="${a.id}">${esc(i18n.t("cancelBtn"))}</button>
           </div>
         </div>
@@ -621,7 +613,7 @@ function renderApprovalCard(a) {
     `;
     actionButtons = `
       <button type="button" class="btn btn-primary btn-sm" data-decide="approve" data-id="${a.id}">${esc(i18n.t("approveOnce"))}</button>
-      <button type="button" class="btn btn-soft btn-sm" data-toggle-standing="${a.id}">${esc(i18n.t("approveAndStand"))}</button>
+      ${budget && budget.approval ? `<button type="button" class="btn btn-soft btn-sm" data-toggle-standing="${a.id}">${esc(i18n.t(budgetActive ? "approveAndAdjust" : "approveAndStand"))}</button>` : ""}
       <button type="button" class="btn btn-danger btn-sm" data-decide="reject" data-id="${a.id}">${esc(i18n.t("reject"))}</button>
     `;
   } else if (a.kind === "permission") {
@@ -831,6 +823,7 @@ function renderApprovals() {
   });
   el.querySelectorAll("[data-standing-box]").forEach((box) => {
     const id = box.dataset.standingBox;
+    bindLimitInputs(box);
     box.querySelectorAll("input[name]").forEach((inp) => {
       inp.oninput = () => {
         const bag = state.standingDrafts[id] || (state.standingDrafts[id] = {});
@@ -911,23 +904,9 @@ function renderApprovals() {
       const id = Number(btn.dataset.decideStanding);
       const box = el.querySelector(`[data-standing-box="${id}"]`);
       const comment = (el.querySelector(`[data-comment-for="${id}"]`)?.value || "").trim();
-      const payload = { always: true, comment };
-      for (const inp of box.querySelectorAll("input[name]")) {
-        const raw = inp.value.trim();
-        if (raw === "") {
-          payload[inp.name] = null;
-        } else {
-          const parsed = parseStrictNumber(raw, {
-            integer: inp.name === "total_jobs",
-            min: 0,
-          });
-          if (!parsed.ok) {
-            toast(i18n.t("invalidNumber", { field: inp.name }), true);
-            return;
-          }
-          payload[inp.name] = parsed.value;
-        }
-      }
+      const limits = readLimitInputs(box);
+      if (!limits) return;
+      const payload = { always: true, comment, ...limits };
       btn.disabled = true;
       try {
         await api(`/api/approvals/${id}/approve`, { method: "POST", body: payload });
@@ -954,101 +933,519 @@ function renderStatePill(st) {
   return `<span class="pill pill-gray">${esc(st)}</span>`;
 }
 
-function renderStandingCard(standing) {
-  if (!state.project) {
-    return `
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">${esc(i18n.t("standingTitle"))}</h2>
-        </div>
-        <p class="muted text-sm" style="margin:0">${esc(i18n.t("standingSelectHint"))}</p>
-      </div>
-    `;
-  }
-  if (!standing) return "";
-  if (!standing.approval) {
-    return `
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
-          <span class="pill pill-green">${esc(i18n.t("standingAuto"))}</span>
-        </div>
-      </div>
-    `;
-  }
-  const st = standing.standing;
-  const used = standing.used;
-  if (!st) {
-    return `
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
-          <span class="pill pill-gray">${esc(i18n.t("standingOff"))}</span>
-        </div>
-        <p class="muted text-sm" style="margin:0">${esc(i18n.t("standingNone"))}</p>
-      </div>
-    `;
-  }
-  const lims = st.limits || {};
-  const bars = [
-    { label: i18n.t("limTotalJobs"), key: "jobs", limit: lims.total_jobs },
-    { label: i18n.t("limTotalCoreH"), key: "core_hours", limit: lims.total_core_hours },
-    { label: i18n.t("limTotalGpuH"), key: "gpu_hours", limit: lims.total_gpu_hours },
-  ];
+// ------------------------------------------------------------------ Standing budget (shared)
+const LIMIT_GROUPS = [
+  { title: "limGroupPerSubmit", fields: [
+    { key: "core_hours" },
+    { key: "gpu_hours" },
+  ] },
+  { title: "limGroupTotal", fields: [
+    { key: "total_jobs", used: "jobs", integer: true },
+    { key: "total_core_hours", used: "core_hours" },
+    { key: "total_gpu_hours", used: "gpu_hours" },
+  ] },
+];
+const LIMIT_FIELDS = LIMIT_GROUPS.flatMap((g) => g.fields);
+const TOTAL_LIMIT_KEY = { jobs: "total_jobs", core_hours: "total_core_hours", gpu_hours: "total_gpu_hours" };
+const USAGE_ROWS = [
+  { key: "jobs", label: "budgetUsedJobs", limit: "total_jobs" },
+  { key: "core_hours", label: "budgetUsedCoreH", limit: "total_core_hours" },
+  { key: "gpu_hours", label: "budgetUsedGpuH", limit: "total_gpu_hours" },
+];
 
-  return `
-    <div class="card">
-      <div class="card-header">
-        <div>
-          <h2 class="card-title">${esc(i18n.t("standingTitle"))} &middot; ${esc(state.project)}</h2>
-          <div class="muted text-xs" style="margin-top:2px">
-            ${esc(i18n.t("perSubmitCaps"))}:
-            ${esc(i18n.t("metricCoreH"))} ${lims.core_hours ?? i18n.t("unlimited")} &middot;
-            ${esc(i18n.t("metricGpuH"))} ${lims.gpu_hours ?? i18n.t("unlimited")}
-          </div>
-        </div>
-        <button type="button" class="btn btn-danger btn-sm" id="revoke-standing-btn">
-          ${esc(i18n.t("revokeStanding"))}
-        </button>
-      </div>
-      <div class="budget-grid">
-        ${bars.map((b) => {
-          const total = used ? (used[b.key] || 0) : 0;
-          const done = (used && used.measured && used.measured[b.key]) || 0;
-          const wait = (used && used.waiting && used.waiting[b.key]) || 0;
-          const active = (used && used.active && used.active[b.key] !== undefined)
-            ? used.active[b.key]
-            : Math.max(0, total - done - wait);
-          const denom = b.limit && b.limit > 0 ? b.limit : Math.max(total, 1);
-          const pDone = Math.min(100, (done / denom) * 100);
-          const pAct = Math.min(100 - pDone, (active / denom) * 100);
-          const pWait = Math.min(100 - pDone - pAct, (wait / denom) * 100);
-          const sDone = done > 0 ? `width:${pDone}%;min-width:4px` : "width:0%";
-          const sAct = active > 0 ? `width:${pAct}%;min-width:4px` : "width:0%";
-          const sWait = wait > 0 ? `width:${pWait}%;min-width:4px` : "width:0%";
-          const hint = b.key === "jobs" ? "" : fmtHoursHint(total);
+function budgetOf(project) {
+  return state.snapshot?.budgets?.[project] || null;
+}
+
+// "off" (approval gate disabled), "none" (no budget yet), or "active"
+function budgetMode(b) {
+  if (!b) return null;
+  if (!b.approval) return "off";
+  return b.standing ? "active" : "none";
+}
+
+// Budgets only matter for projects that can submit Slurm jobs (or have no server yet).
+function projectUsesSlurm(project) {
+  const p = (state.snapshot?.projects || []).find((x) => x.name === project);
+  const names = Object.keys(p?.data?.clusters || {});
+  if (!names.length) return true;
+  const presets = state.snapshot?.presets || [];
+  return names.some((n) => (presets.find((pr) => pr.name === n)?.data?.scheduler || "slurm") === "slurm");
+}
+
+function fmtLimit(v) {
+  return v === null || v === undefined ? i18n.t("unlimited") : fmtNum(v);
+}
+
+function budgetModePill(mode) {
+  if (mode === "active") return `<span class="pill pill-green">${esc(i18n.t("standingActive"))}</span>`;
+  if (mode === "off") return `<span class="pill pill-gray">${esc(i18n.t("standingAuto"))}</span>`;
+  return `<span class="pill pill-gray">${esc(i18n.t("standingOff"))}</span>`;
+}
+
+// One line such as "Jobs 12 / 500 · Core-h 820 / 100000 · GPU-h 3 / Unlimited"
+function budgetUsageLine(b) {
+  const lims = b.standing?.limits || {};
+  return USAGE_ROWS.map((r) => {
+    const used = b.used?.[r.key] || 0;
+    const limit = lims[r.limit];
+    const over = limit !== null && limit !== undefined && used >= limit;
+    return `<span class="${over ? "budget-over" : ""}">${esc(i18n.t(r.label))} ${fmtNum(used)} / ${esc(fmtLimit(limit))}</span>`;
+  }).join(" &middot; ");
+}
+
+function budgetActionButton(project, mode, size = "btn-sm") {
+  if (mode === "active") {
+    return `<button type="button" class="btn btn-soft ${size}" data-budget-open="${esc(project)}">${esc(i18n.t("adjustBudget"))}</button>`;
+  }
+  if (mode === "none") {
+    return `<button type="button" class="btn btn-primary ${size}" data-budget-open="${esc(project)}">${esc(i18n.t("grantBudget"))}</button>`;
+  }
+  return "";
+}
+
+function bindBudgetButtons(el) {
+  el.querySelectorAll("[data-budget-open]").forEach((btn) => {
+    btn.onclick = () => openBudgetModal(btn.dataset.budgetOpen);
+  });
+}
+
+function usedHintText(used, raw) {
+  const s = String(raw ?? "").trim();
+  const limit = s === "" ? null : Number(s);
+  if (limit !== null && Number.isFinite(limit) && limit < used) {
+    return { text: i18n.t("usedOverHint", { n: fmtNum(used) }), warn: true };
+  }
+  return { text: i18n.t("usedHint", { n: fmtNum(used) }), warn: false };
+}
+
+// Limit inputs grouped as "per submission" and "cumulative". Blank means unlimited.
+// `used` adds a live "Used N" hint under cumulative fields; `needs` marks the limits a
+// waiting submission is blocked by.
+function renderLimitInputs(values, { used = null, needs = {} } = {}) {
+  return LIMIT_GROUPS.map((g) => `
+    <div class="limit-group">
+      <div class="limit-group-title">${esc(i18n.t(g.title))}</div>
+      <div class="standing-grid">
+        ${g.fields.map((f) => {
+          const raw = values?.[f.key];
+          const value = raw === null || raw === undefined ? "" : raw;
+          const need = needs[f.key];
+          const u = !need && used && f.used ? (used[f.used] || 0) : null;
+          const hint = u === null ? null : usedHintText(u, value);
+          const needText = need
+            ? i18n.t(need.total ? "limitNeedTotal" : "limitNeedOver", { need: fmtNum(need.need), limit: fmtNum(need.limit) })
+            : "";
           return `
-            <div class="budget-item" title="${esc(hint)}">
-              <div class="budget-item-top tabular">
-                <span>${esc(b.label)}</span>
-                <span>${fmtNum(total)} / ${b.limit == null ? esc(i18n.t("unlimited")) : fmtNum(b.limit)}</span>
-              </div>
-              <div class="progress-track">
-                <div class="progress-seg-done" style="${sDone}"></div>
-                <div class="progress-seg-active" style="${sAct}"></div>
-                <div class="progress-seg-wait" style="${sWait}"></div>
-              </div>
-              <div class="muted text-xs tabular" style="margin-top:6px">
-                ${esc(i18n.t("budgetMeasured"))} ${fmtNum(done)} &middot;
-                ${esc(i18n.t("budgetActive"))} ${fmtNum(active)} &middot;
-                ${esc(i18n.t("budgetWaiting"))} ${fmtNum(wait)}
-              </div>
-            </div>
+            <label class="field-label">${esc(i18n.t("limField_" + f.key))}
+              <input type="number" step="${f.integer ? "1" : "any"}" min="0" name="${f.key}"
+                value="${esc(value)}" placeholder="${esc(i18n.t("unlimited"))}"${u === null ? "" : ` data-used="${u}"`}${need ? ` data-need="${need.need}"` : ""} />
+              ${hint ? `<span class="field-hint${hint.warn ? " warn" : ""}" data-used-hint="${f.key}">${esc(hint.text)}</span>` : ""}
+              ${need ? `<span class="field-hint warn" data-need-hint="${f.key}"${needResolved(need.need, value) ? " hidden" : ""}>${esc(needText)}</span>` : ""}
+            </label>
           `;
         }).join("")}
       </div>
     </div>
+  `).join("");
+}
+
+function needResolved(need, raw) {
+  const s = String(raw ?? "").trim();
+  return s === "" || (Number.isFinite(Number(s)) && Number(s) >= need);
+}
+
+// Keep usage and "needed" hints live while typing; onChange lets callers react.
+function bindLimitInputs(container, onChange = null) {
+  container.querySelectorAll("input[data-need]").forEach((inp) => {
+    const hintEl = container.querySelector(`[data-need-hint="${inp.name}"]`);
+    inp.addEventListener("input", () => {
+      if (hintEl) hintEl.hidden = needResolved(Number(inp.dataset.need), inp.value);
+    });
+  });
+  container.querySelectorAll("input[data-used]").forEach((inp) => {
+    const hintEl = container.querySelector(`[data-used-hint="${inp.name}"]`);
+    inp.addEventListener("input", () => {
+      if (!hintEl) return;
+      const h = usedHintText(Number(inp.dataset.used), inp.value);
+      hintEl.textContent = h.text;
+      hintEl.classList.toggle("warn", h.warn);
+    });
+  });
+  if (onChange) {
+    container.querySelectorAll("input[name]").forEach((inp) => {
+      inp.addEventListener("input", () => onChange());
+    });
+  }
+}
+
+// Returns the five limits (null = unlimited), or null after reporting the first invalid field.
+function readLimitInputs(container, { report = true } = {}) {
+  const out = {};
+  for (const f of LIMIT_FIELDS) {
+    const inp = container.querySelector(`input[name="${f.key}"]`);
+    const raw = (inp?.value || "").trim();
+    if (raw === "") {
+      out[f.key] = null;
+      continue;
+    }
+    const parsed = parseStrictNumber(raw, { integer: Boolean(f.integer), min: 0 });
+    if (!parsed.ok) {
+      if (report) {
+        toast(i18n.t("invalidNumber", { field: i18n.t("limName_" + f.key) }), true);
+        inp?.focus();
+      }
+      return null;
+    }
+    out[f.key] = parsed.value;
+  }
+  return out;
+}
+
+function sameLimits(a, b) {
+  return LIMIT_FIELDS.every((f) => (a?.[f.key] ?? null) === (b?.[f.key] ?? null));
+}
+
+// Which limits a waiting submission is blocked by, keyed by limit name.
+function limitNeeds(why) {
+  const needs = {};
+  for (const r of why || []) {
+    if (r.code === "over" && (r.what === "core_hours" || r.what === "gpu_hours")) {
+      needs[r.what] = { need: r.asked, limit: r.limit, total: false };
+    }
+    if (r.code === "total" && TOTAL_LIMIT_KEY[r.what]) {
+      needs[TOTAL_LIMIT_KEY[r.what]] = { need: r.reached, limit: r.limit, total: true };
+    }
+  }
+  return needs;
+}
+
+function renderBudgetBars(b) {
+  const lims = b.standing?.limits || {};
+  const used = b.used;
+  return `
+    <div class="budget-grid">
+      ${USAGE_ROWS.map((r) => {
+        const limit = lims[r.limit];
+        const total = used ? (used[r.key] || 0) : 0;
+        const done = used?.measured?.[r.key] || 0;
+        const wait = used?.waiting?.[r.key] || 0;
+        const active = used?.active?.[r.key] !== undefined ? used.active[r.key] : Math.max(0, total - done - wait);
+        const denom = limit && limit > 0 ? limit : Math.max(total, 1);
+        const pDone = Math.min(100, (done / denom) * 100);
+        const pAct = Math.min(100 - pDone, (active / denom) * 100);
+        const pWait = Math.min(100 - pDone - pAct, (wait / denom) * 100);
+        const seg = (v, p) => (v > 0 ? `width:${p}%;min-width:4px` : "width:0%");
+        const hint = r.key === "jobs" ? "" : fmtHoursHint(total);
+        const over = limit !== null && limit !== undefined && total >= limit;
+        return `
+          <div class="budget-item" title="${esc(hint)}">
+            <div class="budget-item-top tabular">
+              <span>${esc(i18n.t("limName_" + r.limit))}</span>
+              <span class="${over ? "budget-over" : ""}">${fmtNum(total)} / ${esc(fmtLimit(limit))}</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-seg-done" style="${seg(done, pDone)}"></div>
+              <div class="progress-seg-active" style="${seg(active, pAct)}"></div>
+              <div class="progress-seg-wait" style="${seg(wait, pWait)}"></div>
+            </div>
+            <div class="muted text-xs tabular" style="margin-top:6px">
+              ${esc(i18n.t("budgetMeasured"))} ${fmtNum(done)} &middot;
+              ${esc(i18n.t("budgetActive"))} ${fmtNum(active)} &middot;
+              ${esc(i18n.t("budgetWaiting"))} ${fmtNum(wait)}
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
   `;
+}
+
+function budgetGrantedLine(st) {
+  if (!st) return "";
+  return st.approval
+    ? i18n.t("standingGrantedVia", { time: fmtTime(st.created), id: st.approval })
+    : i18n.t("standingGrantedAt", { time: fmtTime(st.created) });
+}
+
+function fmtLimitList(lims) {
+  return LIMIT_FIELDS.map((f) => `${i18n.t("limName_" + f.key)} ${fmtLimit(lims?.[f.key])}`).join(" · ");
+}
+
+function fmtUsageList(used) {
+  return USAGE_ROWS.map((r) => `${i18n.t(r.label)} ${fmtNum(used?.[r.key] || 0)}`).join(" · ");
+}
+
+function renderBudgetHistory(history) {
+  if (!history || !history.length) return "";
+  return `
+    <details class="budget-history">
+      <summary>${esc(i18n.t("budgetHistory", { n: history.length }))}</summary>
+      <ul>
+        ${history.map((ev) => {
+          let detail = "";
+          if (ev.action === "granted") detail = fmtLimitList(ev.limits);
+          if (ev.action === "adjusted") {
+            detail = LIMIT_FIELDS
+              .filter((f) => (ev.previous?.[f.key] ?? null) !== (ev.limits?.[f.key] ?? null))
+              .map((f) => `${i18n.t("limName_" + f.key)} ${fmtLimit(ev.previous?.[f.key])} → ${fmtLimit(ev.limits?.[f.key])}`)
+              .join(" · ");
+          }
+          if (ev.action === "revoked" && ev.used) {
+            detail = i18n.t("budgetUsedAtRevoke", { usage: fmtUsageList(ev.used) });
+          }
+          const origin = i18n.t("budgetOrigin_" + ev.origin, { id: ev.approval ?? "" });
+          return `
+            <li>
+              <div class="flex-row" style="gap:8px">
+                <strong class="text-sm">${esc(i18n.t("budgetEvent_" + ev.action))}</strong>
+                <span class="muted text-xs">${esc(origin)}</span>
+                <span class="muted text-xs tabular" style="margin-left:auto">${esc(fmtTime(ev.ts))}</span>
+              </div>
+              ${detail ? `<div class="muted text-xs tabular">${esc(detail)}</div>` : ""}
+            </li>
+          `;
+        }).join("")}
+      </ul>
+    </details>
+  `;
+}
+
+// Jobs page: the selected project's budget card, or a table of all projects.
+function renderStandingCard(standing) {
+  if (!state.project) return renderBudgetOverview();
+  if (!standing || !projectUsesSlurm(state.project)) return "";
+  const mode = budgetMode(standing);
+  const st = standing.standing;
+  let body = "";
+  if (mode === "off") {
+    body = `<p class="muted text-sm" style="margin:0">${esc(i18n.t("standingAutoDesc"))}</p>`;
+  } else if (mode === "none") {
+    body = `<p class="muted text-sm" style="margin:0">${esc(i18n.t("standingNone"))}</p>`;
+  } else {
+    body = `
+      <div class="muted text-xs tabular">
+        ${esc(i18n.t("limGroupPerSubmit"))}:
+        ${esc(i18n.t("limField_core_hours"))} ${esc(fmtLimit(st.limits.core_hours))} &middot;
+        ${esc(i18n.t("limField_gpu_hours"))} ${esc(fmtLimit(st.limits.gpu_hours))}
+      </div>
+      ${renderBudgetBars(standing)}
+    `;
+  }
+  return `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="flex-row" style="gap:8px">
+            <h2 class="card-title">${esc(i18n.t("standingTitle"))}</h2>
+            ${budgetModePill(mode)}
+          </div>
+          ${mode === "active" ? `<div class="muted text-xs" style="margin-top:2px">${esc(budgetGrantedLine(st))}</div>` : ""}
+        </div>
+        ${budgetActionButton(state.project, mode)}
+      </div>
+      ${body}
+    </div>
+  `;
+}
+
+function renderBudgetOverview() {
+  const names = (state.snapshot?.projects || []).map((p) => p.name).filter(projectUsesSlurm);
+  if (!names.length) return "";
+  return `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">${esc(i18n.t("standingTitle"))}</h2>
+          <div class="muted text-xs" style="margin-top:2px">${esc(i18n.t("budgetOverviewDesc"))}</div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>${esc(i18n.t("colProject"))}</th>
+              <th>${esc(i18n.t("colStatus"))}</th>
+              ${USAGE_ROWS.map((r) => `<th>${esc(i18n.t("limName_" + r.limit))}</th>`).join("")}
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${names.map((name) => {
+              const b = budgetOf(name);
+              const mode = budgetMode(b);
+              const lims = b?.standing?.limits || {};
+              return `
+                <tr>
+                  <td><strong>${esc(name)}</strong></td>
+                  <td>${budgetModePill(mode)}</td>
+                  ${USAGE_ROWS.map((r) => {
+                    if (mode !== "active") return `<td class="muted">—</td>`;
+                    const used = b.used?.[r.key] || 0;
+                    const limit = lims[r.limit];
+                    const over = limit !== null && limit !== undefined && used >= limit;
+                    return `<td class="tabular ${over ? "budget-over" : ""}">${fmtNum(used)} / ${esc(fmtLimit(limit))}</td>`;
+                  }).join("")}
+                  <td style="text-align:right">${budgetActionButton(name, mode, "btn-xs")}</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// Settings page: one-line budget summary inside each project card.
+function renderProjectBudgetRow(project) {
+  if (!projectUsesSlurm(project)) return "";
+  const b = budgetOf(project);
+  if (!b) return "";
+  const mode = budgetMode(b);
+  const text = mode === "active"
+    ? `<span class="text-sm tabular">${budgetUsageLine(b)}</span>`
+    : `<span class="muted text-sm">${esc(i18n.t(mode === "off" ? "budgetSummaryOff" : "budgetSummaryNone"))}</span>`;
+  return `
+    <div style="margin-bottom:14px">
+      <div class="text-xs muted" style="font-weight:600;margin-bottom:6px">${esc(i18n.t("standingTitle"))}</div>
+      <div class="budget-summary">
+        ${budgetModePill(mode)}
+        ${text}
+        <span style="margin-left:auto">${budgetActionButton(project, mode, "btn-xs")}</span>
+      </div>
+    </div>
+  `;
+}
+
+// Approvals page: the active budget's usage as context for a waiting submission.
+// Without a budget the "no standing budget" reason chip already says so.
+function renderBudgetContext(b) {
+  if (budgetMode(b) !== "active") return "";
+  return `
+    <div class="budget-context">
+      <span class="muted">${esc(i18n.t("budgetContextLabel"))}</span>
+      ${budgetUsageLine(b)}
+    </div>
+  `;
+}
+
+// The single place to grant, adjust, or revoke a project's standing budget.
+async function openBudgetModal(project) {
+  const url = `/api/standing/${encodeURIComponent(project)}`;
+  const title = i18n.t("budgetModalTitle", { project });
+  const backdrop = document.getElementById("modal-backdrop");
+  const showing = (element) => element.isConnected && !backdrop.classList.contains("hidden");
+  openModal(title, `<p id="budget-loading" role="status">${esc(i18n.t("budgetLoading"))}</p>`);
+  const loading = document.getElementById("budget-loading");
+
+  async function reload(notice = "") {
+    const b = await api(url);
+    render(b, notice);
+  }
+
+  function renderRevokeConfirm(b) {
+    openModal(title, `
+      <form id="budget-revoke-form">
+        <p>${esc(i18n.t("revokeConfirmBody", { project }))}</p>
+        <p class="muted text-sm">${esc(i18n.t("revokeConfirmNote"))}</p>
+        <div class="modal-footer">
+          <button type="button" id="budget-revoke-back" class="btn btn-outline btn-sm">${esc(i18n.t("backBtn"))}</button>
+          <button type="submit" class="btn btn-danger btn-sm">${esc(i18n.t("revokeConfirmBtn"))}</button>
+        </div>
+      </form>
+    `);
+    const form = document.getElementById("budget-revoke-form");
+    const back = document.getElementById("budget-revoke-back");
+    back.onclick = () => render(b);
+    back.focus();
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const btn = form.querySelector('[type="submit"]');
+      btn.disabled = true;
+      try {
+        await api(url, { method: "DELETE" });
+        if (showing(form)) closeModal();
+        toast(i18n.t("revokedToast", { project }));
+        await refreshAll();
+      } catch (err) {
+        toast(err.message, true);
+        btn.disabled = false;
+      }
+    };
+  }
+
+  function render(b, notice = "") {
+    const st = b.standing;
+    const mode = st ? "adjust" : "grant";
+    const values = st ? st.limits : b.defaults;
+    openModal(title, `
+      <form id="budget-form" novalidate>
+        ${notice ? `<p class="alert-banner" role="status">${esc(notice)}</p>` : ""}
+        ${!b.approval ? `<p class="alert-banner">${esc(i18n.t("standingAutoDesc"))}</p>` : ""}
+        ${st ? `<div class="muted text-xs" style="margin-bottom:6px">${esc(budgetGrantedLine(st))}</div>` : ""}
+        <p class="text-sm" style="margin-top:0">${esc(i18n.t(mode === "adjust" ? "budgetAdjustIntro" : "budgetGrantIntro"))}</p>
+        ${mode === "grant" && b.pending ? `<p class="text-sm" style="margin-top:0">${esc(i18n.t("budgetGrantPending", { n: b.pending }))}</p>` : ""}
+        <div class="muted text-xs">${esc(i18n.t("budgetBlankHint"))}</div>
+        ${renderLimitInputs(values, { used: st ? b.used : null })}
+        ${renderBudgetHistory(b.history)}
+        <div class="modal-footer">
+          ${st ? `<button type="button" id="budget-revoke" class="btn btn-danger btn-sm footer-left">${esc(i18n.t("revokeStanding"))}</button>` : ""}
+          <button type="button" id="budget-cancel" class="btn btn-outline btn-sm">${esc(i18n.t("cancelBtn"))}</button>
+          <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t(mode === "adjust" ? "budgetSaveAdjust" : "budgetSaveGrant"))}</button>
+        </div>
+      </form>
+    `);
+    const form = document.getElementById("budget-form");
+    const save = form.querySelector('[type="submit"]');
+    document.getElementById("budget-cancel").onclick = closeModal;
+    const revoke = document.getElementById("budget-revoke");
+    if (revoke) revoke.onclick = () => renderRevokeConfirm(b);
+    // Adjusting is only meaningful once something differs from the current limits.
+    const syncSave = () => {
+      if (mode !== "adjust") return;
+      const now = readLimitInputs(form, { report: false });
+      save.disabled = now !== null && sameLimits(now, st.limits);
+    };
+    bindLimitInputs(form, syncSave);
+    syncSave();
+    form.querySelector("input[name]")?.focus();
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const limits = readLimitInputs(form);
+      if (!limits) return;
+      save.disabled = true;
+      try {
+        const r = await api(url, { method: "PUT", body: { mode, limits } });
+        if (showing(form)) closeModal();
+        let msg = i18n.t(mode === "adjust" ? "budgetAdjustedToast" : "budgetGrantedToast", { project });
+        if (r.released && r.released.length) msg += i18n.t("budgetReleasedToast", { n: r.released.length });
+        toast(msg);
+        await refreshAll();
+      } catch (err) {
+        if (["standing_exists", "standing_missing"].includes(err.data?.code) && showing(form)) {
+          try {
+            await reload(i18n.t("budgetStale"));
+          } catch (e) {
+            toast(e.message, true);
+          }
+        } else {
+          toast(err.message, true);
+          save.disabled = false;
+        }
+      }
+    };
+  }
+
+  try {
+    const b = await api(url);
+    if (showing(loading)) render(b);
+  } catch (err) {
+    if (showing(loading)) {
+      closeModal();
+      toast(err.message, true);
+    }
+  }
 }
 
 function renderJobs() {
@@ -1337,18 +1734,7 @@ function renderJobs() {
 
   el.innerHTML = html;
 
-  const revokeBtn = document.getElementById("revoke-standing-btn");
-  if (revokeBtn) {
-    revokeBtn.onclick = async () => {
-      try {
-        await api(`/api/standing/${encodeURIComponent(state.project)}`, { method: "DELETE" });
-        toast(i18n.t("revokedToast", { project: state.project }));
-        await refreshAll();
-      } catch (e) {
-        toast(e.message, true);
-      }
-    };
-  }
+  bindBudgetButtons(el);
 
   const cf = document.getElementById("batch-cluster-filter");
   if (cf) {
@@ -1788,6 +2174,8 @@ function renderSettings() {
     btn.onclick = () => openAttachModal(btn.dataset.attachProject);
   });
 
+  bindBudgetButtons(el);
+
   el.querySelectorAll("[data-retire-project]").forEach((btn) => {
     btn.onclick = () => openProjectRetirementModal(btn.dataset.retireProject);
   });
@@ -1863,11 +2251,15 @@ function renderSettings() {
           return;
         }
       }
+      const defaultsBox = form.querySelector("[data-policy-defaults]");
+      const defaultLimits = defaultsBox ? readLimitInputs(defaultsBox) : {};
+      if (!defaultLimits) return;
       const changes = {
         local_dir: (fd.get("local_dir") || "").toString().trim() || null,
         submit: {
           approval: form.querySelector('input[name="submit_approval"]').checked,
           wait_s: subWait.value,
+          ...defaultLimits,
         },
         wake: {
           default_wait_s: wakeWait.value,
@@ -1944,6 +2336,8 @@ function renderProjectCard(p) {
         `}
       </div>
 
+      ${renderProjectBudgetRow(p.name)}
+
       ${agentKeys.length ? `
         <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
           <div class="flex-between" style="margin-bottom:8px">
@@ -1995,6 +2389,13 @@ function renderProjectCard(p) {
           <label class="field-label">${esc(i18n.t("policyMaxBg"))}
             <input type="number" step="1" min="0" required name="gw_max_bg" value="${esc(d.gateway?.max_background ?? 4)}" />
           </label>
+          ${projectUsesSlurm(p.name) ? `
+            <div class="form-full policy-defaults" data-policy-defaults>
+              <div class="text-sm" style="font-weight:600">${esc(i18n.t("policyDefaultsTitle"))}</div>
+              <div class="field-hint">${esc(i18n.t("policyDefaultsHint"))}</div>
+              ${renderLimitInputs(d.submit || {})}
+            </div>
+          ` : ""}
           <div class="form-full">
             <button type="submit" class="btn btn-primary btn-sm">${esc(i18n.t("savePolicies"))}</button>
           </div>

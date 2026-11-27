@@ -2,7 +2,10 @@
 
 Each project has its own standing approval (stored in meta under
 `standing:<project>`) with single-submission and cumulative limits on jobs,
-core-hours, and GPU-hours.
+core-hours, and GPU-hours. Usage counts from the moment the budget is granted;
+adjusting the limits later (from the Web budget editor or while approving a
+submission) keeps that starting point, so usage is never silently reset. Every
+grant, adjustment, and revocation is recorded in `standing_events`.
 
 When a submission needs approval, gate() registers an approval and arms an
 in-memory waiter so submit() can wait up to `submit.wait_s` (default 180s) for
@@ -27,6 +30,7 @@ RELEASED = "released without a decision: the reasons it waited for no longer hol
 LIMITS = {"core_hours": "core_hours", "gpu_hours": "gpu_hours"}
 TOTALS = {"total_jobs": "jobs", "total_core_hours": "core_hours", "total_gpu_hours": "gpu_hours"}
 TICK_S = 15.0
+HISTORY_N = 20
 assert set(LIMITS) | set(TOTALS) == set(SUBMIT_LIMITS)
 
 
@@ -40,7 +44,7 @@ def _limit_ok(key: str, v) -> bool:
 
 class SubmitApprovals:
     def __init__(self, projects: dict, db, approvals, notify, jobs, lock,
-                 describe=None, clock=time.time):
+                 describe=None, clock=time.time, on_change=None):
         self.projects = projects        # project_name -> Project
         self.db = db
         self.approvals = approvals
@@ -49,6 +53,7 @@ class SubmitApprovals:
         self.lock = lock
         self.describe = describe or (lambda proj, sub, why: "submit %s" % sub["batch"])
         self.now = clock
+        self.on_change = on_change or (lambda project: None)
         self.conditions: list = []
         self._cond = threading.Condition()
         self._waiting: dict[int, dict | None] = {}
@@ -73,23 +78,124 @@ class SubmitApprovals:
             tuple(standing.get("waiting", ())),
         )
 
-    def status(self, project: str) -> dict:
+    def _pending_ids(self, project: str, but: int | None = None) -> list[int]:
+        return [a["id"] for a in self.approvals.list(pending_only=True, project=project)
+                if a["kind"] == APPROVAL_KIND and a["project"] == project and a["id"] != but]
+
+    def status(self, project: str, history: bool = False) -> dict:
         p = self.projects.get(project)
         st = self.standing(project)
-        return {
+        out = {
             "project": project,
             "approval": p.submit.approval if p else True,
             "defaults": {k: getattr(p.submit, k) for k in SUBMIT_LIMITS} if p else {},
             "standing": st,
             "used": self.used(project, st) if st else None,
+            "pending": len(self._pending_ids(project)),
         }
+        if history:
+            out["history"] = self.history(project)
+        return out
 
-    def revoke(self, project: str) -> bool:
-        had = self.standing(project) is not None
+    def history(self, project: str, n: int = HISTORY_N) -> list[dict]:
+        rows = self.db.all(
+            "SELECT id, ts, action, limits, previous, used, approval, origin "
+            "FROM standing_events WHERE project = ? ORDER BY id DESC LIMIT ?",
+            (project, n),
+        )
+        for r in rows:
+            for k in ("limits", "previous", "used"):
+                r[k] = json.loads(r[k]) if r[k] else None
+        return rows
+
+    def _record(self, project: str, action: str, limits: dict | None, previous: dict | None,
+                used: dict | None, origin: str, approval: int | None = None,
+                notify: bool = True) -> None:
+        totals = {k: used[k] for k in ("jobs", "core_hours", "gpu_hours")} if used else None
+        self.db.insert(
+            "standing_events",
+            project=project,
+            ts=self.now(),
+            action=action,
+            limits=json.dumps(limits) if limits is not None else None,
+            previous=json.dumps(previous) if previous is not None else None,
+            used=json.dumps(totals) if totals is not None else None,
+            approval=approval,
+            origin=origin,
+        )
+        if notify:
+            self.notify(project, "standing_changed", "standing",
+                        {"action": action, "limits": limits})
+        self.on_change(project)
+
+    @staticmethod
+    def _check_limits(limits, complete: bool) -> dict:
+        if not isinstance(limits, dict):
+            raise ApprovalError("bad_limits", names=", ".join(SUBMIT_LIMITS))
+        keys = set(limits)
+        if keys - set(SUBMIT_LIMITS) or (complete and keys != set(SUBMIT_LIMITS)):
+            raise ApprovalError("bad_limits", names=", ".join(SUBMIT_LIMITS))
+        for k, v in limits.items():
+            if not _limit_ok(k, v):
+                raise ApprovalError("bad_limit", name=k)
+        return dict(limits)
+
+    def _grant(self, project: str, limits: dict, origin: str,
+               approval: int | None = None) -> dict:
+        st = {
+            "approval": approval,
+            "created": self.now(),
+            "after_job": self.jobs.last_job_id(project),
+            "waiting": self._pending_ids(project, but=approval),
+            "limits": limits,
+        }
+        self.db.set_meta(self._meta_key(project), json.dumps(st))
+        self._record(project, "granted", limits, None, self.used(project, st), origin, approval)
+        return st
+
+    def _adjust(self, project: str, st: dict, limits: dict, origin: str,
+                approval: int | None = None) -> bool:
+        previous = st["limits"]
+        new = dict(previous, **limits)
+        if new == previous:
+            return False
+        st = dict(st, limits=new)
+        self.db.set_meta(self._meta_key(project), json.dumps(st))
+        self._record(project, "adjusted", new, previous, self.used(project, st), origin, approval)
+        return True
+
+    def set_standing(self, project: str, mode: str, limits, origin: str) -> dict:
+        """Grant a new standing budget or adjust the limits of the current one.
+
+        `mode` states what the user saw: "grant" fails if a budget appeared meanwhile and
+        "adjust" fails if it was revoked, so a stale editor never overwrites a change."""
+        if project not in self.projects:
+            raise ApprovalError("unknown_project", project=project)
+        limits = self._check_limits(limits, complete=True)
+        st = self.standing(project)
+        if mode == "grant":
+            if st is not None:
+                raise ApprovalError("standing_exists", project=project)
+            self._grant(project, limits, origin)
+            changed = True
+        elif mode == "adjust":
+            if st is None:
+                raise ApprovalError("standing_missing", project=project)
+            changed = self._adjust(project, st, limits, origin)
+        else:
+            raise ApprovalError("bad_option", msg="mode must be 'grant' or 'adjust'")
+        released = [b for _, b in self.recheck(project)] if changed else []
+        return dict(self.status(project, history=True), changed=changed, released=released)
+
+    def revoke(self, project: str, origin: str = "web", notify: bool = True) -> bool:
+        st = self.standing(project)
+        if st is None:
+            return False
+        used = self.used(project, st)
         self.db.delete_meta(self._meta_key(project))
-        if had:
-            self.recheck(project)
-        return had
+        self._record(project, "revoked", None, st["limits"], used, origin, notify=notify)
+        self.recheck(project)
+        return True
 
     # ------------------------------------------------------------------ gate
     def reasons(self, project: str, sub: dict, apart: tuple[int, ...] = ()) -> list[dict]:
@@ -232,11 +338,9 @@ class SubmitApprovals:
     def on_decision(self, approval: dict, approved: bool, comment: str, options: dict) -> dict:
         aid = approval["id"]
         project = approval["project"]
-        limits = {k: options[k] for k in SUBMIT_LIMITS if k in options}
+        limits = self._check_limits({k: options[k] for k in SUBMIT_LIMITS if k in options},
+                                    complete=False)
         always = bool(options.get("always"))
-        for k, v in limits.items():
-            if not _limit_ok(k, v):
-                raise ApprovalError("bad_limit", name=k)
         if limits and not (approved and always):
             raise ApprovalError("limits_without_always", names=", ".join(limits))
 
@@ -254,20 +358,16 @@ class SubmitApprovals:
 
         result: dict = {"batches": None, "jobs": "released"}
         if always and project:
-            p = self.projects.get(project)
-            defaults = {k: getattr(p.submit, k) for k in SUBMIT_LIMITS} if p else {}
-            other_waiting = [
-                a["id"] for a in self.approvals.list(pending_only=True, project=project)
-                if a["kind"] == APPROVAL_KIND and a["id"] != aid and a["project"] == project
-            ]
-            st = {
-                "approval": aid,
-                "created": self.now(),
-                "after_job": self.jobs.last_job_id(project),
-                "waiting": other_waiting,
-                "limits": dict(defaults, **limits),
-            }
-            self.db.set_meta(self._meta_key(project), json.dumps(st))
+            st = self.standing(project)
+            if st is None:
+                # A new budget counts from here on: this submission is approved on its own.
+                p = self.projects.get(project)
+                defaults = {k: getattr(p.submit, k) for k in SUBMIT_LIMITS} if p else {}
+                st = self._grant(project, dict(defaults, **limits), "approval", aid)
+            else:
+                # An existing budget keeps its usage; only the limits change.
+                self._adjust(project, st, limits, "approval", aid)
+                st = self.standing(project)
             result["standing"] = st["limits"]
 
         batches = self.jobs.release(aid, want=False)

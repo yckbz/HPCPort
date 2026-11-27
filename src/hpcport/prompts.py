@@ -150,7 +150,12 @@ NOTICE_TEXTS = {
     "wait_done": "Background wait #{wait_id} completed ({finished}).",
     "wait_fail": "Background wait #{wait_id} alert: batch `{batch}` failure rate {pct}% exceeded {thresh}%.",
     "wait_timeout": "Background wait #{wait_id} timed out after {timeout_h}h.",
+    "standing_changed": "The user {action} this project's standing budget{limits}. Call `info` for current usage.",
 }
+
+STANDING_ACTIONS = {"granted": "granted", "adjusted": "adjusted the limits of", "revoked": "revoked"}
+STANDING_LIMITS = " (now: {limits})"
+STANDING_UNLIMITED = "unlimited"
 
 SUBMIT_OK = "Submitted batch `{batch}` on `{cluster}` ({n} job(s): {sent_part}{held_part}{res_part})."
 SUBMIT_PENDING = (
@@ -277,6 +282,9 @@ ERRORS = {
     "bad_option": "{msg}",
     "bad_limit": "Invalid budget limit for `{name}` (must be a non-negative number or null).",
     "limits_without_always": "Budget limits ({names}) can only be supplied together with standing approval (`always=true`).",
+    "bad_limits": "Budget limits must be a mapping with exactly these keys: {names}.",
+    "standing_exists": "Project `{project}` already has a standing budget; adjust its limits instead.",
+    "standing_missing": "Project `{project}` has no standing budget to adjust.",
     "invalid_setting": "Invalid setting in approval #{id}: {msg}",
     "missing_setting": "Setting file missing for approval #{id}: {msg}",
     "stale": "Proposal in approval #{id} is stale: {msg}",

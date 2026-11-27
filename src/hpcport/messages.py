@@ -418,6 +418,15 @@ def format_notice(n: dict) -> str:
                            pct="%.1f" % (b["rate"] * 100), thresh="%.1f" % (b["threshold"] * 100))
     if reason == "wait_timeout":
         return tmpl.format(wait_id=b["wait_id"], timeout_h=b["timeout_h"])
+    if reason == "standing_changed":
+        lims = b.get("limits")
+        text = ""
+        if lims:
+            text = P.STANDING_LIMITS.format(limits=", ".join(
+                "%s=%s" % (k, P.STANDING_UNLIMITED if v is None else fmt_qty(v))
+                for k, v in lims.items()))
+        return tmpl.format(action=P.STANDING_ACTIONS.get(b.get("action"), b.get("action")),
+                           limits=text)
     return "%s: %s" % (reason, json.dumps(b, ensure_ascii=False))
 
 

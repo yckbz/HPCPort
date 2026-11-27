@@ -84,6 +84,7 @@ class Daemon:
         self.submits = SubmitApprovals(
             self.projects, self.db, self.approvals, self.waits.notify,
             self.jobs, self.lock, describe=messages.submit_approval_summary, clock=clock,
+            on_change=lambda project: self.broadcast("settings_changed", {"project": project}),
         )
         self.jobs.wait_approval = self.submits.wait_decision
         self.settings = SettingsService(
@@ -182,7 +183,7 @@ class Daemon:
                 return {"code": "project_busy", "preview": preview}
             with self.db.transaction():
                 self.db.insert("retired_projects", name=name, retired_at=self.now())
-                self.submits.revoke(name)
+                self.submits.revoke(name, origin="retire", notify=False)
                 self.jobs.clear_roots(project=name)
             self.settings.deactivate_project(name)
             return {"retired": name}
