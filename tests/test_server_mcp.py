@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
+import socket
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from threading import Event, Thread
 
 import pytest
+import uvicorn
 from starlette.testclient import TestClient
 
 from hpcport import config
@@ -683,6 +690,120 @@ def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):
         assert client.get("/api/audit?project=demo").status_code == 200
 
 
+@contextmanager
+def _live_mcp_server(app):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        cfg = uvicorn.Config(app, log_level="error", timeout_graceful_shutdown=2)
+        server = uvicorn.Server(cfg)
+        thread = Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while not server.started and thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert server.started, "MCP test server did not start"
+            yield port
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "MCP test server did not stop"
+
+
+@asynccontextmanager
+async def _stdio_process(port, hpc_home):
+    source_dir = Path(__file__).resolve().parents[1] / "src"
+    env = dict(os.environ, PYTHONPATH=str(source_dir), HPCPORT_HOME=str(hpc_home))
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "hpcport.cli", "mcp", "--project", "demo", "--port", str(port),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, env=env,
+    )
+    try:
+        yield proc
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+async def _stdio_send(proc, **message):
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", **message}).encode() + b"\n")
+    await proc.stdin.drain()
+
+
+async def _stdio_receive(proc):
+    line = await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+    assert line, "stdio bridge closed before replying"
+    return json.loads(line)
+
+
+async def _stdio_close(proc):
+    proc.stdin.close()
+    assert await asyncio.wait_for(proc.wait(), timeout=5) == 0
+    assert await proc.stdout.read() == b""
+
+
+def test_stdio_bridge_modern_subscription_lifecycle(hpc_home, tmp_path, monkeypatch):
+    from mcp.server.subscriptions import ListenHandler
+
+    _, _, app, _, _, _ = _make_app(hpc_home, tmp_path)
+    closed = {1: Event(), "1": Event()}
+    listen = ListenHandler.__call__
+
+    async def observe_listen(self, ctx, params):
+        try:
+            return await listen(self, ctx, params)
+        finally:
+            closed[ctx.request_id].set()
+
+    monkeypatch.setattr(ListenHandler, "__call__", observe_listen)
+    meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+
+    async def subscribe(proc, request_id):
+        await _stdio_send(proc, id=request_id, method="subscriptions/listen",
+                          params={"_meta": meta, "notifications": {"toolsListChanged": True}})
+        ack = await _stdio_receive(proc)
+        assert ack["method"] == "notifications/subscriptions/acknowledged"
+        assert ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == request_id
+        assert ack["params"]["notifications"]["toolsListChanged"] is True
+
+    async def list_tools(proc, request_id):
+        await _stdio_send(proc, id=request_id, method="tools/list", params={"_meta": meta})
+        reply = await _stdio_receive(proc)
+        assert reply["id"] == request_id
+        assert any(tool["name"] == "info" for tool in reply["result"]["tools"])
+
+    async def exercise(port):
+        # DSH discovers capabilities in a disposable bridge process.
+        async with _stdio_process(port, hpc_home) as probe:
+            await _stdio_send(probe, id=0, method="server/discover", params={"_meta": meta})
+            reply = await _stdio_receive(probe)
+            assert reply["id"] == 0
+            assert reply["result"]["capabilities"]["tools"]["listChanged"] is True
+            await _stdio_close(probe)
+
+        async with _stdio_process(port, hpc_home) as proc:
+            await subscribe(proc, 1)
+            await list_tools(proc, 2)
+            assert not closed[1].is_set()
+
+            await subscribe(proc, "1")
+            await _stdio_send(proc, method="notifications/cancelled", params={"requestId": "1"})
+            assert await asyncio.to_thread(closed["1"].wait, 5)
+            assert not closed[1].is_set()
+            await list_tools(proc, 3)
+
+            await _stdio_close(proc)
+            assert await asyncio.to_thread(closed[1].wait, 5)
+
+    with _live_mcp_server(app) as port:
+        asyncio.run(exercise(port))
+
+
 def test_stdio_bridge_concurrent_ping_not_blocked_by_wait_for(hpc_home, tmp_path):
     """Real `hpcport mcp` stdio bridge must answer `ping` immediately while `wait_for` runs."""
     import os
@@ -920,61 +1041,56 @@ def test_wait_for_replace_and_tasks_validation_isolation(hpc_home, tmp_path):
         d.gateway.stop("demo", oid, by="user")
 
 
-def test_stdio_bridge_preserves_id_on_404_and_skips_notifications():
-    import asyncio
-    import io
-    import socket
-    import threading
-    import time
-    import httpx
-    import uvicorn
+def test_stdio_bridge_preserves_id_on_404_and_skips_notifications(hpc_home):
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
     from starlette.routing import Route
-    from hpcport import stdio_bridge
+
+    received = []
+
+    async def health(request):
+        return JSONResponse({"ok": True})
 
     async def fake_mcp(request):
+        msg = await request.json()
+        received.append((msg["method"], request.headers.get("mcp-session-id")))
+        if msg["method"] == "initialize":
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": msg["id"], "result": {}},
+                headers={"Mcp-Session-Id": "test-session"},
+            )
         return JSONResponse(
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Session not found"}},
             status_code=404,
         )
 
-    fake_app = Starlette(routes=[Route("/p/demo/mcp", fake_mcp, methods=["POST"])])
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        fport = s.getsockname()[1]
-    srv = uvicorn.Server(uvicorn.Config(fake_app, host="127.0.0.1", port=fport, log_level="error"))
-    t = threading.Thread(target=srv.run, daemon=True)
-    t.start()
-    try:
-        deadline = time.monotonic() + 5.0
-        with httpx.Client(trust_env=False, timeout=0.5) as hc:
-            while time.monotonic() < deadline:
-                try:
-                    hc.post("http://127.0.0.1:%d/p/demo/mcp" % fport, content=b"{}")
-                    break
-                except Exception:
-                    time.sleep(0.05)
+    fake_app = Starlette(routes=[
+        Route("/api/health", health),
+        Route("/p/demo/mcp", fake_mcp, methods=["POST"]),
+    ])
 
-        fake_in = io.StringIO(
-            json.dumps({"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}}) + "\n"
-            + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
-        )
-        fake_out = io.StringIO()
-        orig_in, orig_out = sys.stdin, sys.stdout
-        sys.stdin, sys.stdout = fake_in, fake_out
-        try:
-            asyncio.run(stdio_bridge._run_bridge("http://127.0.0.1:%d/p/demo/mcp" % fport))
-        finally:
-            sys.stdin, sys.stdout = orig_in, orig_out
-        lines = [ln for ln in fake_out.getvalue().splitlines() if ln.strip()]
-        assert len(lines) == 1
-        resp = json.loads(lines[0])
-        assert resp["id"] == 42
-        assert "Session not found" in resp["error"]["message"]
-    finally:
-        srv.should_exit = True
-        t.join(timeout=5)
+    async def exercise(port):
+        async with _stdio_process(port, hpc_home) as proc:
+            await _stdio_send(proc, id=41, method="initialize")
+            await _stdio_send(proc, id=42, method="tools/list")
+            assert (await _stdio_receive(proc))["id"] == 41
+            reply = await _stdio_receive(proc)
+            assert reply["id"] == 42
+            assert reply["error"]["message"] == "Session not found"
+
+            await _stdio_send(proc, method="notifications/initialized")
+            await _stdio_send(proc, id=43, method="tools/list")
+            assert (await _stdio_receive(proc))["id"] == 43
+            await _stdio_close(proc)
+
+    with _live_mcp_server(fake_app) as port:
+        asyncio.run(exercise(port))
+    assert received == [
+        ("initialize", None),
+        ("tools/list", "test-session"),
+        ("notifications/initialized", None),
+        ("tools/list", None),
+    ]
 
 
 def test_server_auth_token_exchange_tab_and_audit_n_validation(hpc_home, tmp_path):

@@ -21,11 +21,15 @@ import secrets
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import httpx
 
 from . import config
+
+
+_MODERN_PROTOCOL_VERSION = "2026-07-28"
 
 
 def _daemon_alive(port: int) -> bool:
@@ -98,8 +102,16 @@ def resolve_target(project: str | None = None, cwd: str | None = None) -> str | 
     return config.resolve_project_by_cwd(Path(cwd or os.getcwd()), projects)
 
 
+def _parse_message(raw: str) -> dict:
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def build_forward_headers(
-    raw_json: str,
+    raw_json: str | dict,
     session_id: str | None = None,
     protocol_version: str | None = None,
     cwd: str | None = None,
@@ -118,28 +130,24 @@ def build_forward_headers(
         headers["X-HPCPort-Client"] = client_id
     detected_version = protocol_version
     method: str | None = None
-    try:
-        payload = json.loads(raw_json)
-    except ValueError:
-        payload = None
+    payload = _parse_message(raw_json) if isinstance(raw_json, str) else raw_json
     _NAME_KEYS = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
     name_val: str | None = None
-    if isinstance(payload, dict):
-        m = payload.get("method")
-        if isinstance(m, str) and m:
-            method = m
-        params = payload.get("params")
-        if isinstance(params, dict):
-            if method in _NAME_KEYS:
-                nv = params.get(_NAME_KEYS[method])
-                if isinstance(nv, str) and nv:
-                    name_val = nv
-            meta = params.get("_meta")
-            if isinstance(meta, dict):
-                pv = meta.get("io.modelcontextprotocol/protocolVersion")
-                if isinstance(pv, str) and pv:
-                    detected_version = pv
-    if detected_version == "2026-07-28":
+    m = payload.get("method")
+    if isinstance(m, str) and m:
+        method = m
+    params = payload.get("params")
+    if isinstance(params, dict):
+        if method in _NAME_KEYS:
+            nv = params.get(_NAME_KEYS[method])
+            if isinstance(nv, str) and nv:
+                name_val = nv
+        meta = params.get("_meta")
+        if isinstance(meta, dict):
+            pv = meta.get("io.modelcontextprotocol/protocolVersion")
+            if isinstance(pv, str) and pv:
+                detected_version = pv
+    if detected_version == _MODERN_PROTOCOL_VERSION:
         headers["MCP-Protocol-Version"] = detected_version
         if method:
             headers["MCP-Method"] = method
@@ -152,57 +160,45 @@ def build_forward_headers(
 
 async def _run_bridge(url: str, cwd: str | None = None) -> None:
     session_id: str | None = None
-    protocol_version: str | None = None
+    legacy_version: str | None = None
     client_id = "stdio-" + secrets.token_hex(8)
-    seen_any = False
     write_lock = asyncio.Lock()
-    in_flight: set[asyncio.Task] = set()
+    in_flight: set[asyncio.Task[None]] = set()
+    modern_requests: dict[int | str, asyncio.Task[None]] = {}
+    handshake: asyncio.Task[None] | None = None
 
     async def emit(payload: str) -> None:
         async with write_lock:
             sys.stdout.write(payload.strip() + "\n")
             sys.stdout.flush()
 
-    def is_handshake(raw: str) -> bool:
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            return False
-        if not isinstance(payload, dict):
-            return False
-        return payload.get("method") in (
-            "initialize",
-            "notifications/initialized",
-            "server/discover",
-        )
-
-    async def forward_one(client: httpx.AsyncClient, raw: str) -> None:
-        nonlocal session_id, protocol_version, seen_any
-        try:
-            req_obj = json.loads(raw)
-        except ValueError:
-            req_obj = None
-        has_id = isinstance(req_obj, dict) and "id" in req_obj
-        req_id = req_obj["id"] if has_id else None
-
-        headers, det_ver = build_forward_headers(
-            raw, session_id=session_id, protocol_version=protocol_version,
-            cwd=cwd, client_id=client_id,
-        )
-        if det_ver:
-            protocol_version = det_ver
+    async def forward_one(
+        client: httpx.AsyncClient,
+        raw: str,
+        message: dict,
+        headers: dict[str, str],
+        modern: bool,
+        after_handshake: asyncio.Task[None] | None,
+    ) -> None:
+        nonlocal session_id, legacy_version
+        if after_handshake is not None:
+            await asyncio.shield(after_handshake)
+        has_id = "id" in message
+        req_id = message.get("id")
+        if not modern:
+            if session_id is not None:
+                headers["Mcp-Session-Id"] = session_id
+            if legacy_version is not None:
+                headers.setdefault("MCP-Protocol-Version", legacy_version)
         try:
             async with client.stream("POST", url, content=raw.encode("utf-8"),
                                      headers=headers) as resp:
-                if resp.status_code == 404:
-                    session_id = None
-                    seen_any = False
-                sid = resp.headers.get("mcp-session-id")
-                if sid:
-                    session_id = sid
-                pv_hdr = resp.headers.get("mcp-protocol-version")
-                if pv_hdr:
-                    protocol_version = pv_hdr
+                if not modern:
+                    if resp.status_code == 404 and session_id == headers.get("Mcp-Session-Id"):
+                        session_id = None
+                    elif message.get("method") == "initialize" and resp.is_success:
+                        session_id = resp.headers.get("mcp-session-id")
+                        legacy_version = resp.headers.get("mcp-protocol-version")
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace").strip()
                     if not has_id:
@@ -265,30 +261,49 @@ async def _run_bridge(url: str, cwd: str | None = None) -> None:
                     "error": {"code": -32603, "message": "HPCPort bridge error: %s" % e},
                 }))
 
+    def request_done(task: asyncio.Task[None], request_id: int | str | None) -> None:
+        in_flight.discard(task)
+        if request_id is not None and modern_requests.get(request_id) is task:
+            del modern_requests[request_id]
+
     async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        loop = asyncio.get_running_loop()
+        try:
+            while line := await asyncio.to_thread(sys.stdin.readline):
+                raw = line.strip()
+                if not raw:
+                    continue
+                message = _parse_message(raw)
+                headers, version = build_forward_headers(message, cwd=cwd, client_id=client_id)
+                modern = version == _MODERN_PROTOCOL_VERSION
+                method = message.get("method")
 
-        def read_line() -> str:
-            return sys.stdin.readline()
+                if method == "notifications/cancelled":
+                    params = message.get("params")
+                    target_id = params.get("requestId") if isinstance(params, dict) else None
+                    if type(target_id) in (int, str) and target_id in modern_requests:
+                        # Modern HTTP cancels by closing the response stream.
+                        modern_requests[target_id].cancel()
+                        continue
+                    if modern or session_id is None:
+                        continue
 
-        while True:
-            line = await loop.run_in_executor(None, read_line)
-            if not line:
-                break
-            raw = line.strip()
-            if not raw:
-                continue
-            if is_handshake(raw) or (session_id is None and not seen_any):
-                seen_any = True
-                await forward_one(client, raw)
-            else:
-                seen_any = True
-                task = asyncio.create_task(forward_one(client, raw))
+                # Only legacy requests depend on the ordered handshake.
+                task = asyncio.create_task(
+                    forward_one(client, raw, message, headers, modern, None if modern else handshake)
+                )
+                if not modern and method in ("initialize", "notifications/initialized"):
+                    handshake = task
                 in_flight.add(task)
-                task.add_done_callback(in_flight.discard)
-
-        if in_flight:
-            await asyncio.gather(*in_flight, return_exceptions=True)
+                req_id = message.get("id")
+                tracked_id = req_id if modern and type(req_id) in (int, str) else None
+                if tracked_id is not None:
+                    modern_requests[tracked_id] = task
+                task.add_done_callback(partial(request_done, request_id=tracked_id))
+        finally:
+            tasks = tuple(in_flight)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def serve_stdio(project: str | None = None, port: int | None = None) -> int:
