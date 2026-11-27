@@ -283,5 +283,6 @@ ERRORS = {
     "changed": "Disk file changed since approval #{id} was created: {msg}",
     "ambiguous_batch": "Batch `{batch}` exists in multiple projects ({projects}); specify `project`.",
     "batch_cluster_mismatch": "Batch `{batch}` already belongs to cluster `{existing}` and cannot mix jobs from `{cluster}`; use a different batch label.",
-    "cluster_busy": "Cannot detach `{cluster}` from `{project}` while active jobs or background operations are running.",
+    "cluster_busy": "Cannot detach `{cluster}` from `{project}` or change its remote root while active jobs or background operations are running.",
+    "preset_busy": "Cannot change {fields} of server preset `{cluster}` while it has active jobs or background operations.",
 }

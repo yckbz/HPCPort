@@ -254,3 +254,69 @@ def test_update_project_preserves_null_submit_limits_and_blocks_busy_cluster_pat
     d.settings.update_project("p1", {"clusters": {"bare1": None}})
     assert "bare1" not in d.projects["p1"].clusters
     assert d.jobs._real_root("p1", "bare1") is None
+
+
+def test_busy_checks_cover_disk_edits_restores_and_preset_proposals(hpc_home, tmp_path):
+    import pytest
+
+    from hpcport import slurm
+    from hpcport.settings import SettingError
+    from tests.test_jobs_submits import _setup_two_projects, _write_script
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    # An idle-time version with another scheduler, to restore later
+    d.settings.update_preset("gpu01", {"scheduler": "none"})
+    none_v = d.settings.in_use["cluster_preset:gpu01"]
+    d.settings.update_preset("gpu01", {"scheduler": "slurm"})
+    d.settings.update_project("projA", {"submit": {"approval": False}})
+    _write_script(remote / "projA" / "r1" / "a.sh")
+    res = d.jobs.submit("projA", "gpu01", "r1", ["a.sh"], desc="busy", wait_s=0)
+    assert res["n_sent"] == 1
+
+    # 1. Approving a disk edit that drops a busy cluster is refused and stays pending
+    vf = config.project_file("projA")
+    data = versions.load(vf.read())
+    data["clusters"] = {}
+    vf.file.write_text(versions.dump(data), encoding="utf-8")
+    with d.lock:
+        d.settings.scan()
+    pend = [a for a in d.approvals.list(pending_only=True, project="projA")
+            if a["kind"] == "proposal"]
+    assert len(pend) == 1
+    with d.lock, pytest.raises(SettingError) as e1:
+        d.approvals.decide(pend[0]["id"], True, "ok")
+    assert e1.value.code == "cluster_busy"
+    assert "gpu01" in d.projects["projA"].clusters
+    assert d.approvals.get(pend[0]["id"])["state"] == "pending"
+    with d.lock:
+        d.approvals.decide(pend[0]["id"], False, "keep the cluster")
+    assert "gpu01" in (versions.load(vf.read()).get("clusters") or {})
+
+    # 2. Preset changes that would strand the job are refused on every path
+    with pytest.raises(SettingError) as e2:
+        d.settings.update_preset("gpu01", {"scheduler": "none"})
+    assert e2.value.code == "preset_busy" and e2.value.params["fields"] == "scheduler"
+    with pytest.raises(SettingError) as e3:
+        d.settings.restore_version("cluster_preset:gpu01", none_v)
+    assert e3.value.code == "preset_busy"
+    prop = d.settings.propose_preset("projA", "gpu01", {"host": "elsewhere", "connect": "ssh"},
+                                     "move to another host")
+    with d.lock, pytest.raises(SettingError) as e4:
+        d.approvals.decide(prop["approval"], True, "")
+    assert e4.value.code == "preset_busy"
+    assert d.approvals.get(prop["approval"])["state"] == "pending"
+    assert (d.presets["gpu01"].connect, d.presets["gpu01"].scheduler) == ("local", "slurm")
+    d.settings.update_preset("gpu01", {"guide": "unrelated fields still change"})
+    assert d.presets["gpu01"].guide == "unrelated fields still change"
+    with d.lock:
+        d.approvals.decide(prop["approval"], False, "")
+
+    # 3. Once the job has ended, the same changes go through
+    d.jobs.cancel("projA", batch=res["batch"], by="user")
+    for _ in range(5):
+        if not d.jobs.is_unfinished("projA", res["batch"]):
+            break
+        d.jobs.sync("gpu01")
+    assert d.db.one("SELECT state FROM jobs WHERE project = 'projA'")["state"] == slurm.CANCELLED
+    d.settings.restore_version("cluster_preset:gpu01", none_v)
+    assert d.presets["gpu01"].scheduler == "none"

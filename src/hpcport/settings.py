@@ -20,7 +20,7 @@ import logging
 import shutil
 import time
 
-from . import config, versions
+from . import config, slurm, versions
 from .approvals import ApprovalError
 from .config import (
     PRESET_KEYS, PRESET_SAFETY, PROJECT_KEYS, PROJECT_PROPOSABLE, PROJECT_SAFETY,
@@ -34,6 +34,8 @@ log = logging.getLogger("hpcport.settings")
 PRESET = "cluster_preset"
 PROJECT = "project_config"
 APPROVAL_KIND = "proposal"
+# Preset fields that move a server's jobs and operations out of reach when changed.
+BUSY_PRESET_FIELDS = ("connect", "host", "scheduler")
 
 
 class SettingError(Exception):
@@ -119,6 +121,22 @@ class SettingsService:
     def _keep_none(self, kind: str, path: tuple) -> bool:
         return kind == PROJECT and len(path) == 2 and path[0] == "submit" and path[1] in SUBMIT_LIMITS
 
+    def _cluster_active(self, cluster: str, project: str | None = None) -> bool:
+        """True if the cluster has unfinished jobs or running operations (optionally per project)."""
+        only = "" if project is None else "project = ? AND "
+        args = () if project is None else (project,)
+        if self.db.one(
+            "SELECT 1 FROM jobs WHERE %scluster = ? AND state IN (%s) LIMIT 1"
+            % (only, slurm.marks(slurm.ACTIVE)),
+            args + (cluster,) + slurm.ACTIVE,
+        ):
+            return True
+        return self.db.one(
+            "SELECT 1 FROM ops WHERE %sstate = 'running' "
+            "AND instr(',' || cluster || ',', ?) > 0 LIMIT 1" % only,
+            args + ("," + cluster + ",",),
+        ) is not None
+
     def _check_project_cluster_changes(self, project: str, old_data: dict, new_data: dict) -> None:
         old_clusters = old_data.get("clusters") or {}
         new_clusters = new_data.get("clusters") or {}
@@ -128,19 +146,23 @@ class SettingsService:
             new_spec = new_clusters.get(cname)
             old_root = (old_spec.get("root") or "").rstrip("/") if isinstance(old_spec, dict) else ""
             new_root = (new_spec.get("root") or "").rstrip("/") if isinstance(new_spec, dict) else ""
-            if new_spec is None or old_root != new_root:
-                active_jobs = self.db.one(
-                    "SELECT 1 FROM jobs WHERE project = ? AND cluster = ? "
-                    "AND state IN ('unapproved', 'held', 'queued', 'running') LIMIT 1",
-                    (project, cname),
-                )
-                active_ops = self.db.one(
-                    "SELECT 1 FROM ops WHERE project = ? AND state = 'running' "
-                    "AND instr(',' || cluster || ',', ?) > 0 LIMIT 1",
-                    (project, "," + cname + ","),
-                )
-                if active_jobs or active_ops:
-                    raise SettingError("cluster_busy", cluster=cname, project=project)
+            if (new_spec is None or old_root != new_root) and self._cluster_active(cname, project):
+                raise SettingError("cluster_busy", cluster=cname, project=project)
+
+    def _check_preset_changes(self, name: str, new: ClusterPreset) -> None:
+        old = self.presets.get(name)
+        if old is None:
+            return
+        moved = [f for f in BUSY_PRESET_FIELDS if getattr(old, f) != getattr(new, f)]
+        if moved and self._cluster_active(name):
+            raise SettingError("preset_busy", cluster=name, fields=", ".join(moved))
+
+    def _check_busy(self, kind: str, name: str, old_data: dict, new_data: dict, parsed) -> None:
+        """Refuse a new approved version that would strand active jobs or operations."""
+        if kind == PROJECT:
+            self._check_project_cluster_changes(name, old_data, new_data)
+        else:
+            self._check_preset_changes(name, parsed)
 
     def _safety(self, kind: str, path: tuple) -> bool:
         if not path:
@@ -266,8 +288,7 @@ class SettingsService:
                 old_data, patch, keep_none=lambda p: self._keep_none(kind, p),
             )
             parsed = self._parse(kind, name, new_data)
-            if kind == PROJECT:
-                self._check_project_cluster_changes(name, old_data, new_data)
+            self._check_busy(kind, name, old_data, new_data, parsed)
             if new_data == old_data:
                 return {"key": key, "version": cur[0], "changed": False}
             new_text = versions.edit(cur[1], new_data)
@@ -287,6 +308,8 @@ class SettingsService:
             text = vf.text_of(version)
             data = versions.load(text)
             parsed = self._parse(kind, name, data)
+            cur = vf.latest()
+            self._check_busy(kind, name, versions.load(cur[1]) if cur else {}, data, parsed)
             vf.write(text)
             v = vf.add(text)
         self._activate(kind, name, v, parsed, vf.stamp(), proposer_project=None)
@@ -552,6 +575,8 @@ class SettingsService:
                     parsed = self._parse(kind, name, data)
                 except (ValueError, ConfigError) as e:
                     raise ApprovalError("invalid_setting", id=approval["id"], msg=str(e))
+                cur = vf.latest()
+                self._check_busy(kind, name, versions.load(cur[1]) if cur else {}, data, parsed)
                 v = vf.add(disk)
             self.db.update("proposals", {"id": pid}, state="approved", version=v,
                            comment=comment, decided=self.now())
@@ -592,6 +617,7 @@ class SettingsService:
                 parsed = self._parse(kind, name, new_data)
             except ConfigError as e:
                 raise ApprovalError("invalid_setting", id=approval["id"], msg=str(e))
+            self._check_busy(kind, name, cur_data, new_data, parsed)
             new_text = versions.edit(cur_text, new_data)
             vf.write(new_text)
             v = vf.add(new_text)
