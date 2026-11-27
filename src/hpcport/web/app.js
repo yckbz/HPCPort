@@ -1030,6 +1030,11 @@ function bindBudgetButtons(el) {
   });
 }
 
+// The text a limit input holds; a half-typed number such as "1e" reads as "?" (not blank).
+function rawLimit(inp) {
+  return inp.validity?.badInput ? "?" : inp.value;
+}
+
 function usedHintText(used, raw) {
   const s = String(raw ?? "").trim();
   const limit = s === "" ? null : Number(s);
@@ -1080,14 +1085,14 @@ function bindLimitInputs(container, onChange = null) {
   container.querySelectorAll("input[data-need]").forEach((inp) => {
     const hintEl = container.querySelector(`[data-need-hint="${inp.name}"]`);
     inp.addEventListener("input", () => {
-      if (hintEl) hintEl.hidden = needResolved(Number(inp.dataset.need), inp.value);
+      if (hintEl) hintEl.hidden = needResolved(Number(inp.dataset.need), rawLimit(inp));
     });
   });
   container.querySelectorAll("input[data-used]").forEach((inp) => {
     const hintEl = container.querySelector(`[data-used-hint="${inp.name}"]`);
     inp.addEventListener("input", () => {
       if (!hintEl) return;
-      const h = usedHintText(Number(inp.dataset.used), inp.value);
+      const h = usedHintText(Number(inp.dataset.used), rawLimit(inp));
       hintEl.textContent = h.text;
       hintEl.classList.toggle("warn", h.warn);
     });
@@ -1104,7 +1109,7 @@ function readLimitInputs(container, { report = true } = {}) {
   const out = {};
   for (const f of LIMIT_FIELDS) {
     const inp = container.querySelector(`input[name="${f.key}"]`);
-    const raw = (inp?.value || "").trim();
+    const raw = inp ? rawLimit(inp).trim() : "";
     if (raw === "") {
       out[f.key] = null;
       continue;
