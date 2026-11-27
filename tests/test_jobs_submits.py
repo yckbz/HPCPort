@@ -633,9 +633,15 @@ def test_submit_inline_race_wrapper_abort_cancel_wake_and_sid_write_fail(hpc_hom
     _write_script(wd_ro / "ok.sh")
 
     orig_w = d.jobs._write_wrappers
+    stems = []
 
-    def write_then_chmod(*args, **kwargs):
-        orig_w(*args, **kwargs)
+    def write_then_chmod(ex_, real, wrappers):
+        orig_w(ex_, real, wrappers)
+        stems.extend(wrappers)
+        # Pre-create the dispatch lock files so hosts with flock(1) (Linux) can still
+        # open them; only the .sid write must fail inside the read-only directory.
+        for stem in wrappers:
+            (wd_ro / ".hpcport" / (stem + ".lock")).touch()
         (wd_ro / ".hpcport").chmod(0o555)
 
     d.jobs._write_wrappers = write_then_chmod
@@ -645,6 +651,7 @@ def test_submit_inline_race_wrapper_abort_cancel_wake_and_sid_write_fail(hpc_hom
         assert res_ro["n_sent"] == 1
         jrow = d.db.one("SELECT * FROM jobs WHERE slurm_id = '5566'")
         assert jrow is not None and jrow["state"] == slurm.QUEUED
+        assert stems and not any((wd_ro / ".hpcport" / (st + ".sid")).exists() for st in stems)
     finally:
         d.jobs._write_wrappers = orig_w
         if (wd_ro / ".hpcport").exists():
