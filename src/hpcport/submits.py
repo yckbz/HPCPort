@@ -143,7 +143,6 @@ class SubmitApprovals:
         if notify:
             self.notify(project, "standing_changed", "standing",
                         {"action": action, "limits": limits})
-        self.on_change(project)
 
     @staticmethod
     def _check_limits(limits, complete: bool) -> dict:
@@ -166,8 +165,12 @@ class SubmitApprovals:
             "waiting": self._pending_ids(project, but=approval),
             "limits": limits,
         }
-        self.db.set_meta(self._meta_key(project), json.dumps(st))
-        self._record(project, "granted", limits, None, self.used(project, st), origin, approval)
+        # Lock order is always state lock, then database: notify() takes the state lock.
+        with self.lock, self.db.transaction():
+            self.db.set_meta(self._meta_key(project), json.dumps(st))
+            self._record(project, "granted", limits, None, self.used(project, st), origin,
+                         approval)
+        self.on_change(project)
         return st
 
     def _adjust(self, project: str, st: dict, limits: dict, origin: str,
@@ -177,8 +180,11 @@ class SubmitApprovals:
         if new == previous:
             return False
         st = dict(st, limits=new)
-        self.db.set_meta(self._meta_key(project), json.dumps(st))
-        self._record(project, "adjusted", new, previous, self.used(project, st), origin, approval)
+        with self.lock, self.db.transaction():
+            self.db.set_meta(self._meta_key(project), json.dumps(st))
+            self._record(project, "adjusted", new, previous, self.used(project, st), origin,
+                         approval)
+        self.on_change(project)
         return True
 
     def set_standing(self, project: str, mode: str, limits, origin: str) -> dict:
@@ -209,8 +215,10 @@ class SubmitApprovals:
         if st is None:
             return False
         used = self.used(project, st)
-        self.db.delete_meta(self._meta_key(project))
-        self._record(project, "revoked", None, st["limits"], used, origin, notify=notify)
+        with self.lock, self.db.transaction():
+            self.db.delete_meta(self._meta_key(project))
+            self._record(project, "revoked", None, st["limits"], used, origin, notify=notify)
+        self.on_change(project)
         self.recheck(project)
         return True
 

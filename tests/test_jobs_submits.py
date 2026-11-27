@@ -267,6 +267,37 @@ def test_non_finite_limits_are_refused_and_legacy_values_read_as_unlimited(hpc_h
     json.dumps(st, allow_nan=False)
 
 
+
+def test_budget_change_and_its_record_commit_together(hpc_home, tmp_path, monkeypatch):
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    limits = {"core_hours": 5.0, "gpu_hours": None, "total_jobs": 10,
+              "total_core_hours": 100.0, "total_gpu_hours": None}
+    with d.lock:
+        d.submits.set_standing("projA", "grant", limits, "web")
+    events = len(d.submits.history("projA"))
+    notices = d.db.one("SELECT COUNT(*) AS n FROM notices")["n"]
+    real_insert = d.db.insert
+
+    def failing_insert(table, **values):
+        if table == "standing_events":
+            raise OSError("disk full")
+        return real_insert(table, **values)
+
+    monkeypatch.setattr(d.db, "insert", failing_insert)
+    with d.lock, pytest.raises(OSError):
+        d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web")
+    with d.lock, pytest.raises(OSError):
+        d.submits.revoke("projA")
+    monkeypatch.undo()
+    assert d.submits.standing("projA")["limits"] == limits
+    assert len(d.submits.history("projA")) == events
+    assert d.db.one("SELECT COUNT(*) AS n FROM notices")["n"] == notices
+    # A retry after the failure goes through and is recorded
+    with d.lock:
+        out = d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web")
+    assert out["changed"] is True and d.submits.history("projA")[0]["action"] == "adjusted"
+
+
 def test_project_config_refuses_non_finite_budget_defaults():
     from hpcport.config import ConfigError, parse_project
 

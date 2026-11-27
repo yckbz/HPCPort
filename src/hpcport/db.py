@@ -300,7 +300,12 @@ class DB:
 
     @contextmanager
     def transaction(self):
+        """Run the block atomically. A nested block joins the enclosing transaction, so
+        its writes commit or roll back together with the outer ones."""
         with self._lock:
+            if self._con.in_transaction:
+                yield
+                return
             self._con.execute("BEGIN")
             with self._con:
                 yield
