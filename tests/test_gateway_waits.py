@@ -349,3 +349,40 @@ def test_transfer_protects_local_git_stored_output_fallback_and_staging_lock(hpc
     assert len(results) == 2
     assert all(r["status"] == "ended" and r["op"]["result"]["rc"] == 0 for r in results)
     assert (remote / "p1_bare2" / "c2c_out" / "payload.bin").read_text(encoding="utf-8") == "A" * 4096
+
+
+def test_background_limit_counts_starting_ops_and_precedes_approval(hpc_home, tmp_path):
+    d, _, _, _ = _setup_gateway(hpc_home, tmp_path)
+    d.settings.update_project("p1", {"gateway": {"max_background": 1, "wait_s": 0}})
+
+    # 1. A background op still inside its start-up call occupies the only slot
+    orig_run = d.gateway._run
+    started = threading.Event()
+
+    def slow_run(cluster, script, timeout):
+        started.set()
+        time.sleep(0.5)
+        return orig_run(cluster, script, timeout)
+
+    d.gateway._run = slow_run
+    first = []
+    t = threading.Thread(
+        target=lambda: first.append(d.gateway.exec("p1", "bare1", "sleep 30", background=True)))
+    t.start()
+    try:
+        assert started.wait(5)
+        with pytest.raises(GatewayError) as exc:
+            d.gateway.exec("p1", "bare1", "sleep 30", background=True)
+        assert exc.value.code == "too_many_background"
+    finally:
+        t.join(timeout=10)
+        d.gateway._run = orig_run
+    assert first and first[0]["status"] == "background"
+    d.gateway.stop("p1", first[0]["op"]["id"], by="agent")
+
+    # 2. A full background quota is reported before asking for approval
+    d.settings.update_project("p1", {"gateway": {"max_background": 0}})
+    with pytest.raises(GatewayError) as exc2:
+        d.gateway.exec("p1", "bare1", "rm -rf /opt/elsewhere", background=True)
+    assert exc2.value.code == "too_many_background"
+    assert d.approvals.pending_count() == 0

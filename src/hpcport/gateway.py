@@ -420,8 +420,15 @@ class GatewayService:
             raise NeedsApproval(answer, why)
 
     def _room(self, p) -> None:
-        rows = self.db.all("SELECT id FROM ops WHERE project = ? AND state = 'running'", (p.name,))
-        n = len([r for r in rows if r["id"] not in self._inline])
+        """Raise unless another background op fits; must be called under self.lock.
+
+        Foreground ops still inside their inline wait are exempt, but background ops
+        count even while their start-up call keeps them in `_inline`.
+        """
+        rows = self.db.all("SELECT id, spec FROM ops WHERE project = ? AND state = 'running'",
+                           (p.name,))
+        n = sum(1 for r in rows
+                if r["id"] not in self._inline or json.loads(r["spec"]).get("background"))
         if n >= p.max_background:
             raise GatewayError("too_many_background", n=n, max=p.max_background)
 
@@ -514,13 +521,14 @@ class GatewayService:
             raise GatewayError("use_submit", command=refused[0].what)
         args = dict(cluster=cluster, command=command, cwd=cwd, upload=list(upload or ()),
                     timeout_s=timeout_s, background=bool(background))
+        if background:
+            # Fail fast before asking for approval; re-checked atomically at insert time.
+            with self.lock:
+                self._room(p)
         if found:
             self._ask(project, "remote_exec", args,
                       [{"code": f.rule, "what": f.what} for f in found],
                       wait_s=min(self.permissions.wait_s, p.gateway.wait_s), on_tick=on_tick)
-        if background:
-            with self.lock:
-                self._room(p)
         if files:
             if cwd and not SAFE_PATH.match(cwd):
                 raise GatewayError("bad_path", path=cwd)
@@ -541,6 +549,8 @@ class GatewayService:
                 raise GatewayError("upload_failed", cluster=cluster,
                                    error=" ".join(err.split())[-500:])
         with self.lock:
+            if background:
+                self._room(p)
             op_id = self.db.insert(
                 "ops", project=project, kind="exec", cluster=cluster,
                 spec=json.dumps(args, ensure_ascii=False), limit_s=limit,
