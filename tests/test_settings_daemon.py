@@ -320,3 +320,32 @@ def test_busy_checks_cover_disk_edits_restores_and_preset_proposals(hpc_home, tm
     assert d.db.one("SELECT state FROM jobs WHERE project = 'projA'")["state"] == slurm.CANCELLED
     d.settings.restore_version("cluster_preset:gpu01", none_v)
     assert d.presets["gpu01"].scheduler == "none"
+
+
+def test_names_differing_only_in_case_are_rejected(hpc_home, tmp_path):
+    import pytest
+
+    from hpcport.settings import SettingError
+
+    d = Daemon(browser_opener=lambda url: True)
+    d.settings.create_preset("gpu", {"connect": "local", "scheduler": "none"})
+    d.settings.create_project("Proj", local_dir=str(tmp_path))
+    preset_before = config.preset_file("gpu").read()
+    project_before = config.project_file("Proj").read()
+
+    with pytest.raises(SettingError) as e1:
+        d.settings.create_preset("GPU", {"connect": "local", "scheduler": "slurm"})
+    assert e1.value.code == "preset_exists" and e1.value.params["cluster"] == "gpu"
+    with pytest.raises(SettingError) as e2:
+        d.settings.create_project("proj")
+    assert e2.value.code == "project_exists" and e2.value.params["project"] == "Proj"
+
+    assert set(d.presets) == {"gpu"} and set(d.projects) == {"Proj"}
+    assert config.preset_file("gpu").read() == preset_before
+    assert config.project_file("Proj").read() == project_before
+
+    # A project file left on disk but not loaded still reserves its name
+    (config.projects_dir() / "Other.yaml").write_text("project: Other\n", encoding="utf-8")
+    with pytest.raises(SettingError) as e3:
+        d.settings.create_project("other")
+    assert e3.value.params["project"] == "Other"

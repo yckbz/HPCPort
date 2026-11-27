@@ -45,6 +45,13 @@ class SettingError(Exception):
         self.params = params
 
 
+def _same_name(name: str, names) -> str | None:
+    """Existing name equal to `name` ignoring case (setting files share one path on
+    case-insensitive filesystems such as the macOS default)."""
+    key = name.casefold()
+    return next((n for n in sorted(names) if n.casefold() == key), None)
+
+
 def _fmt_val(v) -> str:
     if v is versions.MISSING:
         return "(unset)"
@@ -177,8 +184,9 @@ class SettingsService:
     # ------------------------------------------------------------------ CRUD (user via Web/CLI)
     def create_preset(self, name: str, data: dict) -> dict:
         validate_name(name, "cluster name")
-        if name in self.presets:
-            raise SettingError("preset_exists", cluster=name)
+        taken = _same_name(name, set(self.presets) | set(list_preset_names()))
+        if taken is not None:
+            raise SettingError("preset_exists", cluster=taken)
         parsed = parse_preset(name, data, "preset %s" % name)
         vf = preset_file(name)
         text = versions.dump(preset_to_dict(parsed))
@@ -233,8 +241,10 @@ class SettingsService:
     def create_project(self, name: str, local_dir: str | None = None,
                        data: dict | None = None) -> dict:
         validate_name(name, "project name")
-        if name in self.projects:
-            raise SettingError("project_exists", project=name)
+        taken = _same_name(name, set(self.projects)
+                           | set(list_project_names(self.retired_projects)))
+        if taken is not None:
+            raise SettingError("project_exists", project=taken)
         if any(name.casefold() == retired.casefold() for retired in self.retired_projects):
             raise SettingError("project_retired", project=name)
         raw = dict(data or {})
