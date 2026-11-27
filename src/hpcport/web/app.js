@@ -730,8 +730,8 @@ function captureApprovalDrafts(el) {
       if (active === inp) {
         focusInfo = {
           selector: `[data-standing-box="${id}"] input[name="${inp.name}"]`,
-          start: null,
-          end: null,
+          start: inp.selectionStart,
+          end: inp.selectionEnd,
         };
       }
     });
@@ -1030,11 +1030,6 @@ function bindBudgetButtons(el) {
   });
 }
 
-// The text a limit input holds; a half-typed number such as "1e" reads as "?" (not blank).
-function rawLimit(inp) {
-  return inp.validity?.badInput ? "?" : inp.value;
-}
-
 function usedHintText(used, raw) {
   const s = String(raw ?? "").trim();
   const limit = s === "" ? null : Number(s);
@@ -1045,6 +1040,8 @@ function usedHintText(used, raw) {
 }
 
 // Limit inputs grouped as "per submission" and "cumulative". Blank means unlimited.
+// They are text inputs so the value is always what was typed: a number input reports a
+// half-typed "1e" as "", which a live refresh would restore as a blank (unlimited) field.
 // `used` adds a live "Used N" hint under cumulative fields; `needs` marks the limits a
 // waiting submission is blocked by.
 function renderLimitInputs(values, { used = null, needs = {} } = {}) {
@@ -1063,7 +1060,7 @@ function renderLimitInputs(values, { used = null, needs = {} } = {}) {
             : "";
           return `
             <label class="field-label">${esc(i18n.t("limField_" + f.key))}
-              <input type="number" step="${f.integer ? "1" : "any"}" min="0" name="${f.key}"
+              <input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" name="${f.key}"
                 value="${esc(value)}" placeholder="${esc(i18n.t("unlimited"))}"${u === null ? "" : ` data-used="${u}"`}${need ? ` data-need="${need.need}"` : ""} />
               ${hint ? `<span class="field-hint${hint.warn ? " warn" : ""}" data-used-hint="${f.key}">${esc(hint.text)}</span>` : ""}
               ${need ? `<span class="field-hint warn" data-need-hint="${f.key}"${needResolved(need.need, value) ? " hidden" : ""}>${esc(needText)}</span>` : ""}
@@ -1085,14 +1082,14 @@ function bindLimitInputs(container, onChange = null) {
   container.querySelectorAll("input[data-need]").forEach((inp) => {
     const hintEl = container.querySelector(`[data-need-hint="${inp.name}"]`);
     inp.addEventListener("input", () => {
-      if (hintEl) hintEl.hidden = needResolved(Number(inp.dataset.need), rawLimit(inp));
+      if (hintEl) hintEl.hidden = needResolved(Number(inp.dataset.need), inp.value);
     });
   });
   container.querySelectorAll("input[data-used]").forEach((inp) => {
     const hintEl = container.querySelector(`[data-used-hint="${inp.name}"]`);
     inp.addEventListener("input", () => {
       if (!hintEl) return;
-      const h = usedHintText(Number(inp.dataset.used), rawLimit(inp));
+      const h = usedHintText(Number(inp.dataset.used), inp.value);
       hintEl.textContent = h.text;
       hintEl.classList.toggle("warn", h.warn);
     });
@@ -1109,7 +1106,7 @@ function readLimitInputs(container, { report = true } = {}) {
   const out = {};
   for (const f of LIMIT_FIELDS) {
     const inp = container.querySelector(`input[name="${f.key}"]`);
-    const raw = inp ? rawLimit(inp).trim() : "";
+    const raw = (inp?.value || "").trim();
     if (raw === "") {
       out[f.key] = null;
       continue;

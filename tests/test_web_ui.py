@@ -24,6 +24,10 @@ def test_web_js_syntax_and_contracts():
     # Strict number validation protects standing/policy/preset forms from NaN -> null
     assert "function parseStrictNumber(" in app_js
     assert "invalidNumber:" in i18n_js
+    # Budget limits are text inputs: a number input reports a half-typed "1e" as "", which
+    # drafts restored by a live refresh would turn into a blank (unlimited) limit.
+    assert '<input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" name="${f.key}"' in app_js
+    assert '<input type="number" step="${f.integer' not in app_js
 
     node = shutil.which("node")
     if node:
