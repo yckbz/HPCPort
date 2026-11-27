@@ -344,13 +344,36 @@ def test_budget_change_and_its_record_commit_together(hpc_home, tmp_path, monkey
     assert out["changed"] is True and d.submits.history("projA")[0]["action"] == "adjusted"
 
 
-def test_project_config_refuses_non_finite_budget_defaults():
+def test_project_config_reads_non_finite_budget_defaults_as_unlimited():
     from hpcport.config import ConfigError, parse_project
 
-    for bad in (float("inf"), float("nan")):
-        with pytest.raises(ConfigError, match="finite"):
-            parse_project("p", {"project": "p", "clusters": {},
-                                "submit": {"total_core_hours": bad}}, "p.yaml", presets={})
+    def parse(v):
+        return parse_project("p", {"project": "p", "clusters": {},
+                                   "submit": {"total_core_hours": v}}, "p.yaml", presets={})
+
+    # Older versions accepted .inf/.nan, which never blocked anything
+    for legacy in (float("inf"), float("nan")):
+        assert parse(legacy).submit.total_core_hours is None
+    with pytest.raises(ConfigError, match="non-negative"):
+        parse(float("-inf"))
+
+
+def test_daemon_starts_with_legacy_non_finite_budget_default(hpc_home):
+    from hpcport import config
+
+    d = Daemon(browser_opener=lambda url: True)
+    d.settings.create_project("good")
+    d.settings.create_project("legacy")
+    vf = config.project_file("legacy")
+    text = vf.read().replace("core_hours: 5000.0", "core_hours: .inf", 1)
+    assert ".inf" in text
+    with vf.lock():                         # an approved version written by an older release
+        vf.write(text)
+        vf.add(text)
+    restarted = Daemon(browser_opener=lambda url: True)
+    assert set(restarted.projects) == {"good", "legacy"}
+    assert restarted.projects["legacy"].submit.core_hours is None
+    assert restarted.submits.status("legacy")["defaults"]["core_hours"] is None
 
 
 def test_cancel_and_not_slurm_rejection(hpc_home, tmp_path):
