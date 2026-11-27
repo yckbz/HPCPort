@@ -1,6 +1,8 @@
 // HPCPort Local Web Dashboard - Zero-build Vanilla ES Module App
 
-import { createI18n } from "/static/i18n.js";
+const i18nUrl = new URL("./i18n.js", import.meta.url);
+i18nUrl.search = new URL(import.meta.url).search;
+const { createI18n } = await import(i18nUrl);
 
 const ALLOWABLE_RULES = ["scancel", "outside", "root", "startup", "crontab", "remote", "killall"];
 const VALID_TABS = new Set(["approvals", "jobs", "audit", "settings"]);

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -433,7 +434,7 @@ def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):
         exchange_path = opened[-1].split("127.0.0.1:8765")[1]
         r_ex = client.get(exchange_path, follow_redirects=False)
         assert r_ex.status_code == 302
-        assert r_ex.headers["location"] == "/#settings"
+        assert re.fullmatch(r"/\?v=[0-9a-f]{16}#settings", r_ex.headers["location"])
         assert "hpcport_session" in client.cookies
 
         # Authenticated GET succeeds
@@ -605,7 +606,13 @@ def test_web_ui_static_assets_and_rest_lifecycle(hpc_home, tmp_path):
         r_idx = client.get("/")
         assert r_idx.status_code == 200
         assert "HPCPort" in r_idx.text
+        assert r_idx.headers["cache-control"] == "no-cache"
+        assets = dict(re.findall(r'(/static/app\.(?:css|js))\?v=([0-9a-f]{16})', r_idx.text))
+        assert set(assets) == {"/static/app.css", "/static/app.js"}
+        assert len(set(assets.values())) == 1
+        revision = assets["/static/app.js"]
         for asset in ("/static/app.css", "/static/app.js", "/static/i18n.js"):
+            asset += "?v=" + revision
             ra = client.get(asset)
             assert ra.status_code == 200, asset
 
@@ -981,12 +988,12 @@ def test_server_auth_token_exchange_tab_and_audit_n_validation(hpc_home, tmp_pat
         code1 = d.issue_exchange_code(tab="settings")
         r_no_tab = client.get("/auth/exchange?code=%s" % code1, follow_redirects=False)
         assert r_no_tab.status_code == 302
-        assert r_no_tab.headers["location"] == "/#settings"
+        assert re.fullmatch(r"/\?v=[0-9a-f]{16}#settings", r_no_tab.headers["location"])
 
         code2 = d.issue_exchange_code(tab="jobs")
         r_bad_tab = client.get("/auth/exchange?code=%s&tab=evil" % code2, follow_redirects=False)
         assert r_bad_tab.status_code == 302
-        assert r_bad_tab.headers["location"] == "/#jobs"
+        assert re.fullmatch(r"/\?v=[0-9a-f]{16}#jobs", r_bad_tab.headers["location"])
 
         # 3. /api/audit?n= rejects non-int with 400 and clamps <=0 to 1 (no SQLite LIMIT -1)
         for i in range(3):

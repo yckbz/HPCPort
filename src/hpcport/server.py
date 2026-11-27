@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated
 
@@ -25,7 +26,6 @@ from mcp.types import CallToolResult, TextContent
 from pydantic import BaseModel, Field
 from starlette.applications import Starlette
 from starlette.responses import (
-    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -454,6 +454,18 @@ def _bearer(headers) -> str | None:
 
 
 def build_app(daemon, start_loop: bool = True) -> Starlette:
+    index = WEB_DIR / "index.html"
+    dashboard_html = None
+    dashboard_path = "/"
+    if index.is_file():
+        assets = ("app.css", "app.js", "i18n.js")
+        revision = sha256(b"".join((WEB_DIR / name).read_bytes() for name in assets)).hexdigest()[:16]
+        dashboard_path = f"/?v={revision}"
+        dashboard_html = index.read_text(encoding="utf-8")
+        for name in assets[:2]:
+            url = "/static/" + name
+            dashboard_html = dashboard_html.replace(f'"{url}"', f'"{url}?v={revision}"')
+
     mcp = build_mcp(daemon)
     mcp_http = mcp.streamable_http_app(
         streamable_http_path="/mcp",
@@ -535,7 +547,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         raw_tab = request.query_params.get("tab", "")
         res = daemon.redeem_exchange_code(code)
         if res is None:
-            return RedirectResponse(url="/#unlock", status_code=302)
+            return RedirectResponse(url=f"{dashboard_path}#unlock", status_code=302)
         cookie_val, stored_tab = res
         if raw_tab in VALID_TABS:
             target_tab = raw_tab
@@ -543,7 +555,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
             target_tab = stored_tab
         else:
             target_tab = "approvals"
-        resp = RedirectResponse(url="/#%s" % target_tab, status_code=302)
+        resp = RedirectResponse(url=f"{dashboard_path}#{target_tab}", status_code=302)
         resp.set_cookie(COOKIE_NAME, cookie_val, httponly=True, samesite="strict", path="/")
         return resp
 
@@ -927,9 +939,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
     # ---------------------------------------------------------------- Web UI static
     async def index_page(request):
-        idx = WEB_DIR / "index.html"
-        if idx.is_file():
-            return FileResponse(idx)
+        if dashboard_html is not None:
+            return HTMLResponse(dashboard_html, headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>HPCPort</h1><p>Web UI assets not installed.</p>")
 
     # ---------------------------------------------------------------- project MCP router
