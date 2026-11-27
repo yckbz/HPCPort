@@ -564,9 +564,15 @@ function renderApprovalCard(a) {
     const budget = budgetOf(a.project);
     const budgetActive = budgetMode(budget) === "active";
     const baseLimits = budgetActive ? budget.standing.limits : (budget?.defaults || {});
-    const sd = state.standingDrafts[a.id] || {};
+    const draft = state.standingDrafts[a.id];
+    // The budget changed while this form was being edited: keep what the user typed,
+    // refresh everything else, and say so once.
+    if (draft && budget && draft.rev !== budget.rev) {
+      draft.rev = budget.rev;
+      draft.rebased = true;
+    }
     const limValues = Object.fromEntries(LIMIT_FIELDS.map((f) => [
-      f.key, Object.prototype.hasOwnProperty.call(sd, f.key) ? sd[f.key] : baseLimits[f.key],
+      f.key, draft && Object.hasOwn(draft.values, f.key) ? draft.values[f.key] : baseLimits[f.key],
     ]));
 
     bodyHtml = `
@@ -597,7 +603,8 @@ function renderApprovalCard(a) {
         </div>
       ` : ""}
       ${standingOpen ? `
-        <div class="standing-drawer" data-standing-box="${a.id}">
+        <div class="standing-drawer" data-standing-box="${a.id}" data-budget-rev="${esc(budget?.rev ?? "")}">
+          ${draft?.rebased ? `<p class="alert-banner" role="status" style="margin:0 0 10px">${esc(i18n.t("budgetRebased"))}</p>` : ""}
           <div class="text-sm" style="font-weight:600">${esc(i18n.t(budgetActive ? "standingAdjustTitle" : "standingFormTitle"))}</div>
           <div class="muted text-xs" style="margin-top:4px">
             ${esc(i18n.t(budgetActive ? "standingAdjustNote" : "standingGrantNote"))}
@@ -719,9 +726,7 @@ function captureApprovalDrafts(el) {
   });
   el.querySelectorAll("[data-standing-box]").forEach((box) => {
     const id = box.dataset.standingBox;
-    const bag = state.standingDrafts[id] || (state.standingDrafts[id] = {});
     box.querySelectorAll("input[name]").forEach((inp) => {
-      bag[inp.name] = inp.value;
       if (active === inp) {
         focusInfo = {
           selector: `[data-standing-box="${id}"] input[name="${inp.name}"]`,
@@ -826,8 +831,9 @@ function renderApprovals() {
     bindLimitInputs(box);
     box.querySelectorAll("input[name]").forEach((inp) => {
       inp.oninput = () => {
-        const bag = state.standingDrafts[id] || (state.standingDrafts[id] = {});
-        bag[inp.name] = inp.value;
+        const rev = box.dataset.budgetRev === "" ? null : Number(box.dataset.budgetRev);
+        const bag = state.standingDrafts[id] || (state.standingDrafts[id] = { rev, values: {} });
+        bag.values[inp.name] = inp.value;
       };
     });
   });
@@ -865,8 +871,13 @@ function renderApprovals() {
   el.querySelectorAll("[data-toggle-standing]").forEach((btn) => {
     btn.onclick = () => {
       const id = Number(btn.dataset.toggleStanding);
-      if (state.openStanding.has(id)) state.openStanding.delete(id);
-      else state.openStanding.add(id);
+      if (state.openStanding.has(id)) {
+        // Closing the form discards what was typed in it.
+        state.openStanding.delete(id);
+        delete state.standingDrafts[String(id)];
+      } else {
+        state.openStanding.add(id);
+      }
       renderApprovals();
     };
   });
@@ -907,6 +918,10 @@ function renderApprovals() {
       const limits = readLimitInputs(box);
       if (!limits) return;
       const payload = { always: true, comment, ...limits };
+      // Send the revision the form was based on, so an outdated form is refused.
+      const draft = state.standingDrafts[String(id)];
+      const rev = draft ? draft.rev : (box.dataset.budgetRev === "" ? null : Number(box.dataset.budgetRev));
+      if (rev !== null && rev !== undefined) payload.budget_rev = rev;
       btn.disabled = true;
       try {
         await api(`/api/approvals/${id}/approve`, { method: "POST", body: payload });
@@ -916,8 +931,13 @@ function renderApprovals() {
         toast(i18n.t("approvedToast", { id }));
         await refreshAll();
       } catch (e) {
-        toast(e.message, true);
-        btn.disabled = false;
+        if (e.data?.code === "budget_stale") {
+          toast(i18n.t("budgetStale"), true);
+          await refreshAll(true);
+        } else {
+          toast(e.message, true);
+          btn.disabled = false;
+        }
       }
     };
   });
@@ -1339,9 +1359,9 @@ async function openBudgetModal(project) {
   openModal(title, `<p id="budget-loading" role="status">${esc(i18n.t("budgetLoading"))}</p>`);
   const loading = document.getElementById("budget-loading");
 
-  async function reload(notice = "") {
+  async function reload(notice = "", typed = {}) {
     const b = await api(url);
-    render(b, notice);
+    render(b, notice, typed);
   }
 
   function renderRevokeConfirm(b) {
@@ -1375,10 +1395,11 @@ async function openBudgetModal(project) {
     };
   }
 
-  function render(b, notice = "") {
+  // `typed` holds the fields the user changed, kept when the form is refreshed.
+  function render(b, notice = "", typed = {}) {
     const st = b.standing;
     const mode = st ? "adjust" : "grant";
-    const values = st ? st.limits : b.defaults;
+    const values = { ...(st ? st.limits : b.defaults), ...typed };
     openModal(title, `
       <form id="budget-form" novalidate>
         ${notice ? `<p class="alert-banner" role="status">${esc(notice)}</p>` : ""}
@@ -1408,6 +1429,11 @@ async function openBudgetModal(project) {
       save.disabled = now !== null && sameLimits(now, st.limits);
     };
     bindLimitInputs(form, syncSave);
+    form.querySelectorAll("input[name]").forEach((inp) => {
+      inp.addEventListener("input", () => {
+        typed[inp.name] = inp.value;
+      });
+    });
     syncSave();
     form.querySelector("input[name]")?.focus();
     form.onsubmit = async (event) => {
@@ -1416,16 +1442,17 @@ async function openBudgetModal(project) {
       if (!limits) return;
       save.disabled = true;
       try {
-        const r = await api(url, { method: "PUT", body: { mode, limits } });
+        const r = await api(url, { method: "PUT", body: { mode, limits, rev: b.rev } });
         if (showing(form)) closeModal();
         let msg = i18n.t(mode === "adjust" ? "budgetAdjustedToast" : "budgetGrantedToast", { project });
         if (r.released && r.released.length) msg += i18n.t("budgetReleasedToast", { n: r.released.length });
         toast(msg);
         await refreshAll();
       } catch (err) {
-        if (["standing_exists", "standing_missing"].includes(err.data?.code) && showing(form)) {
+        if (["budget_stale", "standing_exists", "standing_missing"].includes(err.data?.code)
+            && showing(form)) {
           try {
-            await reload(i18n.t("budgetStale"));
+            await reload(i18n.t("budgetStale"), typed);
           } catch (e) {
             toast(e.message, true);
           }

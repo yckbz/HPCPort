@@ -190,7 +190,7 @@ def test_direct_grant_adjust_and_revoke(hpc_home, tmp_path):
     limits = {"core_hours": 10.0, "gpu_hours": None, "total_jobs": 5,
               "total_core_hours": 100.0, "total_gpu_hours": None}
     with d.lock:
-        out = d.submits.set_standing("projA", "grant", limits, "web")
+        out = d.submits.set_standing("projA", "grant", limits, "web", d.submits.rev("projA"))
     # The waiting submission fits the new budget and is released right away
     assert out["changed"] is True and out["released"] == [r1["batch"]]
     assert d.approvals.get(r1["approval"])["state"] == "cancelled"
@@ -199,27 +199,28 @@ def test_direct_grant_adjust_and_revoke(hpc_home, tmp_path):
     assert d.submits.status("projB")["standing"] is None            # projects stay independent
 
     with d.lock, pytest.raises(ApprovalError) as exc:
-        d.submits.set_standing("projA", "grant", limits, "web")
+        d.submits.set_standing("projA", "grant", limits, "web", d.submits.rev("projA"))
     assert exc.value.code == "standing_exists"
     for bad, code in ((dict(limits, total_jobs=1.5), "bad_limit"),
                       (dict(limits, core_hours=-1), "bad_limit"),
                       ({"core_hours": 1}, "bad_limits"),
                       (dict(limits, extra=1), "bad_limits")):
         with d.lock, pytest.raises(ApprovalError) as exc:
-            d.submits.set_standing("projA", "adjust", bad, "web")
+            d.submits.set_standing("projA", "adjust", bad, "web", d.submits.rev("projA"))
         assert exc.value.code == code
     with d.lock, pytest.raises(ApprovalError):
-        d.submits.set_standing("projA", "replace", limits, "web")
+        d.submits.set_standing("projA", "replace", limits, "web", d.submits.rev("projA"))
     with d.lock, pytest.raises(ApprovalError) as exc:
-        d.submits.set_standing("nope", "grant", limits, "web")
+        d.submits.set_standing("nope", "grant", limits, "web", 0)
     assert exc.value.code == "unknown_project"
 
     # Saving the same limits changes nothing and records nothing
     with d.lock:
-        assert d.submits.set_standing("projA", "adjust", limits, "cli")["changed"] is False
+        assert d.submits.set_standing("projA", "adjust", limits, "cli", d.submits.rev("projA"))["changed"] is False
     # Lowering below usage keeps the counted usage and gates later submissions
     with d.lock:
-        out = d.submits.set_standing("projA", "adjust", dict(limits, total_jobs=1), "cli")
+        out = d.submits.set_standing("projA", "adjust", dict(limits, total_jobs=1), "cli",
+                                     d.submits.rev("projA"))
     assert out["changed"] is True and out["used"]["jobs"] == 1
     r2 = d.jobs.submit("projA", "gpu01", str(wd), ["b.sh"], desc="b", wait_s=0)
     assert [w["code"] for w in d.approvals.get(r2["approval"])["detail"]["why"]] == ["total"]
@@ -232,9 +233,54 @@ def test_direct_grant_adjust_and_revoke(hpc_home, tmp_path):
     assert revoked["limits"] is None and revoked["previous"]["total_jobs"] == 1
     assert revoked["used"]["jobs"] == 2
     with d.lock, pytest.raises(ApprovalError) as exc:
-        d.submits.set_standing("projA", "adjust", limits, "web")
+        d.submits.set_standing("projA", "adjust", limits, "web", d.submits.rev("projA"))
     assert exc.value.code == "standing_missing"
 
+
+
+def test_outdated_budget_forms_are_refused(hpc_home, tmp_path):
+    from hpcport.approvals import ApprovalError
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    limits = {"core_hours": 5.0, "gpu_hours": None, "total_jobs": 10,
+              "total_core_hours": 100.0, "total_gpu_hours": None}
+    with d.lock:
+        d.submits.set_standing("projA", "grant", limits, "web", d.submits.rev("projA"))
+    seen = d.submits.rev("projA")                     # both tabs load this revision
+    with d.lock:                                      # tab A tightens the per-submit cap
+        d.submits.set_standing("projA", "adjust", dict(limits, core_hours=1.0), "web", seen)
+    with d.lock, pytest.raises(ApprovalError) as exc:  # tab B saved an unrelated field
+        d.submits.set_standing("projA", "adjust", dict(limits, total_jobs=20), "web", seen)
+    assert exc.value.code == "budget_stale"
+    assert d.submits.standing("projA")["limits"] == dict(limits, core_hours=1.0)
+
+    # Revoking and granting again also invalidates forms opened before
+    before = d.submits.rev("projA")
+    with d.lock:
+        d.submits.revoke("projA")
+        d.submits.set_standing("projA", "grant", limits, "web", d.submits.rev("projA"))
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.submits.set_standing("projA", "adjust", dict(limits, total_jobs=99), "web", before)
+    assert exc.value.code == "budget_stale"
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.submits.set_standing("projA", "adjust", limits, "web", "3")
+    assert exc.value.code == "bad_option"
+
+    # An approval made from an outdated card is refused before anything is released
+    wd = remote / "projA" / "stale"
+    _write_script(wd / "big.sh", ntasks=8, gpus=0, time_s="01:00:00")
+    r = d.jobs.submit("projA", "gpu01", str(wd), ["big.sh"], desc="big", wait_s=0)
+    current = d.submits.standing("projA")["limits"]
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.approvals.decide(r["approval"], True, always=True, core_hours=50.0, budget_rev=before)
+    assert exc.value.code == "budget_stale"
+    assert d.approvals.get(r["approval"])["state"] == "pending"
+    assert d.jobs.unapproved(r["approval"])
+    assert d.submits.standing("projA")["limits"] == current
+    with d.lock:
+        d.approvals.decide(r["approval"], True, always=True, core_hours=50.0,
+                           budget_rev=d.submits.rev("projA"))
+    assert d.submits.standing("projA")["limits"]["core_hours"] == 50.0
 
 
 def test_non_finite_limits_are_refused_and_legacy_values_read_as_unlimited(hpc_home, tmp_path):
@@ -245,7 +291,8 @@ def test_non_finite_limits_are_refused_and_legacy_values_read_as_unlimited(hpc_h
               "total_core_hours": 100.0, "total_gpu_hours": None}
     for bad in (float("inf"), float("nan"), float("-inf")):
         with d.lock, pytest.raises(ApprovalError) as exc:
-            d.submits.set_standing("projA", "grant", dict(limits, total_core_hours=bad), "web")
+            d.submits.set_standing("projA", "grant", dict(limits, total_core_hours=bad), "web",
+                                   d.submits.rev("projA"))
         assert exc.value.code == "bad_limit"
     assert d.submits.standing("projA") is None and d.submits.history("projA") == []
 
@@ -267,14 +314,13 @@ def test_non_finite_limits_are_refused_and_legacy_values_read_as_unlimited(hpc_h
     json.dumps(st, allow_nan=False)
 
 
-
 def test_budget_change_and_its_record_commit_together(hpc_home, tmp_path, monkeypatch):
     d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
     limits = {"core_hours": 5.0, "gpu_hours": None, "total_jobs": 10,
               "total_core_hours": 100.0, "total_gpu_hours": None}
     with d.lock:
-        d.submits.set_standing("projA", "grant", limits, "web")
-    events = len(d.submits.history("projA"))
+        d.submits.set_standing("projA", "grant", limits, "web", d.submits.rev("projA"))
+    rev = d.submits.rev("projA")
     notices = d.db.one("SELECT COUNT(*) AS n FROM notices")["n"]
     real_insert = d.db.insert
 
@@ -285,16 +331,16 @@ def test_budget_change_and_its_record_commit_together(hpc_home, tmp_path, monkey
 
     monkeypatch.setattr(d.db, "insert", failing_insert)
     with d.lock, pytest.raises(OSError):
-        d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web")
+        d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web", rev)
     with d.lock, pytest.raises(OSError):
         d.submits.revoke("projA")
     monkeypatch.undo()
     assert d.submits.standing("projA")["limits"] == limits
-    assert len(d.submits.history("projA")) == events
+    assert d.submits.rev("projA") == rev
     assert d.db.one("SELECT COUNT(*) AS n FROM notices")["n"] == notices
     # A retry after the failure goes through and is recorded
     with d.lock:
-        out = d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web")
+        out = d.submits.set_standing("projA", "adjust", dict(limits, core_hours=50.0), "web", rev)
     assert out["changed"] is True and d.submits.history("projA")[0]["action"] == "adjusted"
 
 

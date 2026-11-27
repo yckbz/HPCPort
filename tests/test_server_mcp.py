@@ -443,33 +443,40 @@ def test_web_standing_budget_api(hpc_home, tmp_path):
         d.open_dashboard(tab="jobs")
         client.get(opened[-1].split("127.0.0.1:8765")[1], follow_redirects=False)
 
+        def put(body, c=client, headers=ui):
+            rev = c.get("/api/standing/demo", headers=headers).json()["rev"]
+            return c.put("/api/standing/demo", json=dict({"rev": rev}, **body), headers=headers)
+
         budget = client.get("/api/state").json()["budgets"]["demo"]
         assert budget["standing"] is None and budget["approval"] is True
-        assert budget["defaults"]["total_jobs"] == 500
+        assert budget["defaults"]["total_jobs"] == 500 and budget["rev"] == 0
 
-        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": limits}, headers=ui)
+        r = put({"mode": "adjust", "limits": limits})
         assert r.status_code == 400 and r.json()["code"] == "standing_missing"
-        r = client.put("/api/standing/demo", json={"mode": "grant", "limits": limits}, headers=ui)
+        r = put({"mode": "grant", "limits": limits})
         assert r.status_code == 200, r.text
-        assert r.json()["standing"]["limits"] == limits
-        r = client.put("/api/standing/demo", json={"mode": "grant", "limits": limits}, headers=ui)
+        assert r.json()["standing"]["limits"] == limits and r.json()["rev"] > 0
+        r = put({"mode": "grant", "limits": limits})
         assert r.status_code == 400 and r.json()["code"] == "standing_exists"
-        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": {"total_jobs": 3}},
-                       headers=ui)
+        r = put({"mode": "adjust", "limits": {"total_jobs": 3}})
         assert r.status_code == 400 and r.json()["code"] == "bad_limits"
+        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": limits}, headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "bad_option"     # rev is required
+        r = client.put("/api/standing/demo", json={"mode": "adjust", "limits": limits, "rev": 0},
+                       headers=ui)
+        assert r.status_code == 400 and r.json()["code"] == "budget_stale"
 
         # Out-of-range numbers are refused with 400 before anything is written
-        raw = ('{"mode":"adjust","limits":{"core_hours":1e400,"gpu_hours":null,'
-               '"total_jobs":10,"total_core_hours":NaN,"total_gpu_hours":null}}')
+        raw = ('{"mode":"adjust","rev":%d,"limits":{"core_hours":1e400,"gpu_hours":null,'
+               '"total_jobs":10,"total_core_hours":NaN,"total_gpu_hours":null}}'
+               % client.get("/api/standing/demo").json()["rev"])
         r = client.put("/api/standing/demo", content=raw,
                        headers=dict(ui, **{"Content-Type": "application/json"}))
         assert r.status_code == 400 and r.json()["code"] == "bad_limit"
         assert d.submits.standing("demo")["limits"] == limits
 
         # Web users adjust without resetting; the history says who changed what
-        r = client.put("/api/standing/demo", json={"mode": "adjust",
-                                                   "limits": dict(limits, total_jobs=20)},
-                       headers=ui)
+        r = put({"mode": "adjust", "limits": dict(limits, total_jobs=20)})
         assert r.json()["changed"] is True
         hist = client.get("/api/standing/demo").json()["history"]
         assert [(h["action"], h["origin"]) for h in hist] == [("adjusted", "web"), ("granted", "web")]
@@ -479,21 +486,20 @@ def test_web_standing_budget_api(hpc_home, tmp_path):
 
         cli = TestClient(app)
         cli_hdr = {"Authorization": "Bearer secret-cli-token"}
-        r = cli.put("/api/standing/demo", json={"mode": "adjust", "limits": limits},
-                    headers=cli_hdr)
+        r = put({"mode": "adjust", "limits": limits}, c=cli, headers=cli_hdr)
         assert r.status_code == 200 and d.submits.history("demo")[0]["origin"] == "cli"
 
         # With web_only_approval, the CLI token (reachable by local agents) cannot grant budget
         client.patch("/api/config", json={"web_only_approval": True}, headers=ui)
-        for call in (lambda: cli.put("/api/standing/demo", json={"mode": "adjust",
-                                                                 "limits": limits},
-                                     headers=cli_hdr),
-                     lambda: cli.delete("/api/standing/demo", headers=cli_hdr)):
-            assert call().status_code == 403
+        rev = d.submits.rev("demo")
+        assert cli.put("/api/standing/demo", json={"mode": "adjust", "limits": limits, "rev": rev},
+                       headers=cli_hdr).status_code == 403
+        assert cli.delete("/api/standing/demo", headers=cli_hdr).status_code == 403
         assert client.delete("/api/standing/demo", headers=ui).json() == {"revoked": True}
         assert d.submits.history("demo")[0]["action"] == "revoked"
 
-        r = client.put("/api/standing/ghost", json={"mode": "grant", "limits": limits}, headers=ui)
+        r = client.put("/api/standing/ghost", json={"mode": "grant", "limits": limits, "rev": 0},
+                       headers=ui)
         assert r.status_code == 400 and r.json()["code"] == "unknown_project"
 
 

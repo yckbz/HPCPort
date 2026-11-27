@@ -903,7 +903,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
 
         def run():
             daemon._require_active_project(proj)
-            return daemon.submits.set_standing(proj, d.get("mode"), d.get("limits"), origin)
+            return daemon.submits.set_standing(proj, d.get("mode"), d.get("limits"), origin,
+                                               d.get("rev"))
 
         return JSONResponse(await locked(run))
 

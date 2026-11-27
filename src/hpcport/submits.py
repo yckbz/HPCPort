@@ -5,7 +5,9 @@ Each project has its own standing approval (stored in meta under
 core-hours, and GPU-hours. Usage counts from the moment the budget is granted;
 adjusting the limits later (from the Web budget editor or while approving a
 submission) keeps that starting point, so usage is never silently reset. Every
-grant, adjustment, and revocation is recorded in `standing_events`.
+grant, adjustment, and revocation is recorded in `standing_events` in the same
+transaction as the budget itself; the latest event id is the budget's revision
+(`rev`), which editors send back so a change based on an outdated view is refused.
 
 When a submission needs approval, gate() registers an approval and arms an
 in-memory waiter so submit() can wait up to `submit.wait_s` (default 180s) for
@@ -70,7 +72,7 @@ class SubmitApprovals:
         self._cond = threading.Condition()
         self._waiting: dict[int, dict | None] = {}
         approvals.handlers[APPROVAL_KIND] = self.on_decision
-        approvals.options[APPROVAL_KIND] = ("always",) + SUBMIT_LIMITS
+        approvals.options[APPROVAL_KIND] = ("always", "budget_rev") + SUBMIT_LIMITS
         jobs.gate = self.gate
         jobs.abort_approval = self.abort_approval
 
@@ -85,6 +87,17 @@ class SubmitApprovals:
         st = json.loads(raw)
         st["limits"] = _readable(st["limits"])
         return st
+
+    def rev(self, project: str) -> int:
+        row = self.db.one("SELECT COALESCE(MAX(id), 0) AS rev FROM standing_events "
+                          "WHERE project = ?", (project,))
+        return row["rev"]
+
+    def _check_rev(self, project: str, rev) -> None:
+        if isinstance(rev, bool) or not isinstance(rev, int):
+            raise ApprovalError("bad_option", msg="budget revision must be an integer")
+        if rev != self.rev(project):
+            raise ApprovalError("budget_stale", project=project)
 
     def used(self, project: str, standing: dict, apart: tuple[int, ...] = ()) -> dict:
         return self.jobs.used_after(
@@ -108,6 +121,7 @@ class SubmitApprovals:
             "standing": st,
             "used": self.used(project, st) if st else None,
             "pending": len(self._pending_ids(project)),
+            "rev": self.rev(project),
         }
         if history:
             out["history"] = self.history(project)
@@ -187,14 +201,15 @@ class SubmitApprovals:
         self.on_change(project)
         return True
 
-    def set_standing(self, project: str, mode: str, limits, origin: str) -> dict:
+    def set_standing(self, project: str, mode: str, limits, origin: str, rev) -> dict:
         """Grant a new standing budget or adjust the limits of the current one.
 
-        `mode` states what the user saw: "grant" fails if a budget appeared meanwhile and
-        "adjust" fails if it was revoked, so a stale editor never overwrites a change."""
+        `rev` is the budget revision the editor was showing; any grant, adjustment, or
+        revocation since then refuses the save so an outdated form never overwrites it."""
         if project not in self.projects:
             raise ApprovalError("unknown_project", project=project)
         limits = self._check_limits(limits, complete=True)
+        self._check_rev(project, rev)
         st = self.standing(project)
         if mode == "grant":
             if st is not None:
@@ -368,6 +383,9 @@ class SubmitApprovals:
         always = bool(options.get("always"))
         if limits and not (approved and always):
             raise ApprovalError("limits_without_always", names=", ".join(limits))
+        if approved and always and project and options.get("budget_rev") is not None:
+            # Refuse before anything is released if the form showed an outdated budget.
+            self._check_rev(project, options["budget_rev"])
 
         if not approved:
             batches = self.jobs.refuse(aid, comment=comment)

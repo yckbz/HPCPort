@@ -285,6 +285,7 @@ ERRORS = {
     "bad_limits": "Budget limits must be a mapping with exactly these keys: {names}.",
     "standing_exists": "Project `{project}` already has a standing budget; adjust its limits instead.",
     "standing_missing": "Project `{project}` has no standing budget to adjust.",
+    "budget_stale": "The standing budget of `{project}` changed after it was loaded; reload it and try again.",
     "invalid_setting": "Invalid setting in approval #{id}: {msg}",
     "missing_setting": "Setting file missing for approval #{id}: {msg}",
     "stale": "Proposal in approval #{id} is stale: {msg}",
