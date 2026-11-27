@@ -15,6 +15,7 @@ leaving user code repositories completely untouched:
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -487,8 +488,9 @@ def _parse_project(name: str, d: dict, path: str,
     for key in SUBMIT_LIMITS:
         v = sub_d.get(key)
         if v is not None and (not _number(v) or v < 0
+                              or (isinstance(v, float) and not math.isfinite(v))
                               or (key == "total_jobs" and not isinstance(v, int))):
-            raise ConfigError("%s: submit.%s must be a non-negative number or null"
+            raise ConfigError("%s: submit.%s must be a finite non-negative number or null"
                               % (path, key))
     submit_kw = {k: sub_d[k] for k in ("approval",) + SUBMIT_LIMITS if k in sub_d}
     submit_kw["wait_s"] = float(swait)

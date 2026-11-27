@@ -236,6 +236,46 @@ def test_direct_grant_adjust_and_revoke(hpc_home, tmp_path):
     assert exc.value.code == "standing_missing"
 
 
+
+def test_non_finite_limits_are_refused_and_legacy_values_read_as_unlimited(hpc_home, tmp_path):
+    from hpcport.approvals import ApprovalError
+
+    d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
+    limits = {"core_hours": 5.0, "gpu_hours": None, "total_jobs": 10,
+              "total_core_hours": 100.0, "total_gpu_hours": None}
+    for bad in (float("inf"), float("nan"), float("-inf")):
+        with d.lock, pytest.raises(ApprovalError) as exc:
+            d.submits.set_standing("projA", "grant", dict(limits, total_core_hours=bad), "web")
+        assert exc.value.code == "bad_limit"
+    assert d.submits.standing("projA") is None and d.submits.history("projA") == []
+
+    wd = remote / "projA" / "inf"
+    _write_script(wd / "a.sh", ntasks=4, gpus=0, time_s="01:00:00")
+    r = d.jobs.submit("projA", "gpu01", str(wd), ["a.sh"], desc="a", wait_s=0)
+    with d.lock, pytest.raises(ApprovalError) as exc:
+        d.approvals.decide(r["approval"], True, always=True, core_hours=float("nan"))
+    assert exc.value.code == "bad_limit"
+    assert d.approvals.get(r["approval"])["state"] == "pending"
+
+    # Budgets stored by older versions may hold Infinity/NaN, which never blocked anything
+    d.db.set_meta("standing:projB", json.dumps({
+        "approval": None, "created": 1.0, "after_job": 0, "waiting": [],
+        "limits": dict(limits, core_hours=float("inf"), total_core_hours=float("nan"))}))
+    st = d.submits.status("projB", history=True)
+    assert st["standing"]["limits"]["core_hours"] is None
+    assert st["standing"]["limits"]["total_core_hours"] is None
+    json.dumps(st, allow_nan=False)
+
+
+def test_project_config_refuses_non_finite_budget_defaults():
+    from hpcport.config import ConfigError, parse_project
+
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ConfigError, match="finite"):
+            parse_project("p", {"project": "p", "clusters": {},
+                                "submit": {"total_core_hours": bad}}, "p.yaml", presets={})
+
+
 def test_cancel_and_not_slurm_rejection(hpc_home, tmp_path):
     d, ex, remote = _setup_two_projects(hpc_home, tmp_path)
     # Bare SSH server rejects submit cleanly

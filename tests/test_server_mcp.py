@@ -458,6 +458,14 @@ def test_web_standing_budget_api(hpc_home, tmp_path):
                        headers=ui)
         assert r.status_code == 400 and r.json()["code"] == "bad_limits"
 
+        # Out-of-range numbers are refused with 400 before anything is written
+        raw = ('{"mode":"adjust","limits":{"core_hours":1e400,"gpu_hours":null,'
+               '"total_jobs":10,"total_core_hours":NaN,"total_gpu_hours":null}}')
+        r = client.put("/api/standing/demo", content=raw,
+                       headers=dict(ui, **{"Content-Type": "application/json"}))
+        assert r.status_code == 400 and r.json()["code"] == "bad_limit"
+        assert d.submits.standing("demo")["limits"] == limits
+
         # Web users adjust without resetting; the history says who changed what
         r = client.put("/api/standing/demo", json={"mode": "adjust",
                                                    "limits": dict(limits, total_jobs=20)},

@@ -280,7 +280,7 @@ ERRORS = {
     "unknown_approval": "Unknown approval #{id}.",
     "already_decided": "Approval #{id} was already {state}.",
     "bad_option": "{msg}",
-    "bad_limit": "Invalid budget limit for `{name}` (must be a non-negative number or null).",
+    "bad_limit": "Invalid budget limit for `{name}` (must be a finite non-negative number or null).",
     "limits_without_always": "Budget limits ({names}) can only be supplied together with standing approval (`always=true`).",
     "bad_limits": "Budget limits must be a mapping with exactly these keys: {names}.",
     "standing_exists": "Project `{project}` already has a standing budget; adjust its limits instead.",

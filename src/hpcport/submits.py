@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 
@@ -39,7 +40,18 @@ def _limit_ok(key: str, v) -> bool:
         return True
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
         return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
     return key != "total_jobs" or isinstance(v, int)
+
+
+def _readable(limits: dict | None) -> dict | None:
+    """Read stored limits written before non-finite values were refused. Infinity and NaN
+    never blocked a submission, so they mean "unlimited"."""
+    if limits is None:
+        return None
+    return {k: None if isinstance(v, float) and not math.isfinite(v) else v
+            for k, v in limits.items()}
 
 
 class SubmitApprovals:
@@ -68,7 +80,11 @@ class SubmitApprovals:
 
     def standing(self, project: str) -> dict | None:
         raw = self.db.get_meta(self._meta_key(project))
-        return json.loads(raw) if raw else None
+        if not raw:
+            return None
+        st = json.loads(raw)
+        st["limits"] = _readable(st["limits"])
+        return st
 
     def used(self, project: str, standing: dict, apart: tuple[int, ...] = ()) -> dict:
         return self.jobs.used_after(
@@ -106,6 +122,7 @@ class SubmitApprovals:
         for r in rows:
             for k in ("limits", "previous", "used"):
                 r[k] = json.loads(r[k]) if r[k] else None
+            r["limits"], r["previous"] = _readable(r["limits"]), _readable(r["previous"])
         return rows
 
     def _record(self, project: str, action: str, limits: dict | None, previous: dict | None,
