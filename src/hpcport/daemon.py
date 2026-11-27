@@ -20,6 +20,8 @@ import subprocess
 import threading
 import time
 import webbrowser
+from collections import Counter
+from contextlib import contextmanager
 
 from . import attach, config, messages
 from .approvals import ApprovalService
@@ -29,7 +31,7 @@ from .executor import TransportError, make_executor
 from .gateway import GatewayService
 from .jobs import JobService
 from .permissions import PermissionService
-from .settings import SettingsService
+from .settings import SettingError, SettingsService
 from .submits import SubmitApprovals
 from .waits import WaitService
 
@@ -50,6 +52,7 @@ class Daemon:
         self.lock = threading.RLock()
         self.presets: dict[str, ClusterPreset] = {}
         self.projects: dict[str, Project] = {}
+        self._project_requests: Counter[str] = Counter()
         self.ex: dict = dict(executors or {})
         self.make_executor = make_executor
         self._browser_opener = browser_opener   # testable override
@@ -113,6 +116,77 @@ class Daemon:
     def _notify(self, project: str, reason: str, subject: str, body: dict) -> int:
         return self.waits.notify(project, reason, subject, body)
 
+    def _require_active_project(self, name: str) -> Project:
+        project = self.projects.get(name)
+        if project is None:
+            code = "project_retired" if name in self.settings.retired_projects else "unknown_project"
+            raise SettingError(code, project=name)
+        return project
+
+    @contextmanager
+    def project_activity(self, name: str):
+        """Keep the project registered until the request finishes, including remote I/O."""
+        with self.lock:
+            project = self._require_active_project(name)
+            self._project_requests[name] += 1
+        try:
+            yield project
+        finally:
+            with self.lock:
+                self._project_requests[name] -= 1
+                if not self._project_requests[name]:
+                    del self._project_requests[name]
+
+    def project_retirement_preview(self, name: str) -> dict:
+        with self.lock:
+            project = self._require_active_project(name)
+            local_dir = project.local_dir
+            next_project = None
+            if local_dir is not None:
+                remaining = {key: value for key, value in self.projects.items() if key != name}
+                next_project = config.resolve_project_by_cwd(local_dir, remaining)
+            blockers = self.db.all(
+                """WITH target(name) AS (VALUES (?))
+                   SELECT 'jobs' AS kind FROM target WHERE EXISTS (
+                       SELECT 1 FROM jobs WHERE project = target.name
+                       AND state IN ('unapproved', 'held', 'queued', 'running'))
+                   UNION ALL SELECT 'unregistered' FROM target WHERE EXISTS (
+                       SELECT 1 FROM unregistered WHERE project = target.name AND active = 1)
+                   UNION ALL SELECT 'operations' FROM target WHERE EXISTS (
+                       SELECT 1 FROM ops WHERE project = target.name AND state = 'running')
+                   UNION ALL SELECT 'approvals' FROM target WHERE EXISTS (
+                       SELECT 1 FROM approvals WHERE project = target.name AND state = 'pending')
+                   UNION ALL SELECT 'waits' FROM target WHERE EXISTS (
+                       SELECT 1 FROM waits WHERE project = target.name AND state = 'active'
+                       UNION ALL
+                       SELECT 1 FROM mcp_tasks WHERE project = target.name AND status = 'working')""",
+                (name,),
+            )
+            kinds = [row["kind"] for row in blockers]
+            if self._project_requests.get(name):
+                kinds.append("requests")
+            return {
+                "binding": {"local_dir": str(local_dir) if local_dir is not None else None,
+                            "next_project": next_project},
+                "blockers": kinds,
+            }
+
+    def retire_project(self, name: str, binding: dict) -> dict:
+        with self.lock:
+            if name in self.settings.retired_projects:
+                return {"retired": name}
+            preview = self.project_retirement_preview(name)
+            if binding != preview["binding"]:
+                return {"code": "binding_changed", "preview": preview}
+            if preview["blockers"]:
+                return {"code": "project_busy", "preview": preview}
+            with self.db.transaction():
+                self.db.insert("retired_projects", name=name, retired_at=self.now())
+                self.submits.revoke(name)
+                self.jobs.clear_roots(project=name)
+            self.settings.deactivate_project(name)
+            return {"retired": name}
+
     # ------------------------------------------------------------------ config callbacks
     def _on_preset_changed(self, name: str, old: ClusterPreset | None,
                            new: ClusterPreset | None) -> None:
@@ -173,23 +247,21 @@ class Daemon:
 
     def attach_cluster(self, project: str, cluster_name: str, root: str | None = None,
                        max_jobs: int | None = None) -> dict:
-        with self.lock:
-            p = self.projects.get(project)
-            if p is None:
-                raise attach.AttachError("unknown project %s" % project)
-            preset = self.presets.get(cluster_name)
-            cl, derived = attach.plan(p, cluster_name, root, max_jobs=max_jobs, preset=preset)
-            ex = self.ex.get(cluster_name) or self.make_executor(cl)
-        real = attach.make_root(ex, cl, derived)
-        with self.lock:
-            version = attach.record(p, cl, max_jobs=max_jobs)
-            self.ex[cluster_name] = ex
-            self.jobs.note_root(project, cluster_name, real)
-            self.settings.attached(project, cluster_name, cl, max_jobs, version)
-            self.waits.notify(project, "cluster_attached", "cluster:" + cluster_name,
-                              {"cluster": cluster_name, "root": cl.root,
-                               "scheduler": cl.scheduler})
-        self.broadcast("settings_changed", {"project": project})
+        with self.project_activity(project) as p:
+            with self.lock:
+                preset = self.presets.get(cluster_name)
+                cl, derived = attach.plan(p, cluster_name, root, max_jobs=max_jobs, preset=preset)
+                ex = self.ex.get(cluster_name) or self.make_executor(cl)
+            real = attach.make_root(ex, cl, derived)
+            with self.lock:
+                version = attach.record(p, cl, max_jobs=max_jobs)
+                self.ex[cluster_name] = ex
+                self.jobs.note_root(project, cluster_name, real)
+                self.settings.attached(project, cluster_name, cl, max_jobs, version)
+                self.waits.notify(project, "cluster_attached", "cluster:" + cluster_name,
+                                  {"cluster": cluster_name, "root": cl.root,
+                                   "scheduler": cl.scheduler})
+            self.broadcast("settings_changed", {"project": project})
         return {"project": project, "cluster": cluster_name, "root": cl.root, "resolved": real}
 
     def detach_cluster(self, project: str, cluster_name: str) -> dict:
@@ -211,7 +283,6 @@ class Daemon:
                 (project, "," + cluster_name + ","),
             )
             if active_jobs or active_ops:
-                from .settings import SettingError
                 raise SettingError("cluster_busy", cluster=cluster_name, project=project)
             res = self.settings.update_project(
                 project, {"clusters": {cluster_name: None}},

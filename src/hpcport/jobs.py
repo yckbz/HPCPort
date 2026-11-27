@@ -1454,7 +1454,7 @@ class JobService:
                 out["notes"].append(j["cancel_note"])
         return out
 
-    def overview(self, project: str | None = None, recent: int = 20,
+    def overview(self, project: str | None = None, recent: int | None = 20,
                  cluster: str | None = None) -> list[dict]:
         conds, args = [], []
         if project is not None:
@@ -1471,8 +1471,9 @@ class JobService:
         ]
         rows = [r for r in rows if r and r["n_jobs"]]
         open_ = [r for r in rows if not r["finished"]]
-        done = sorted((r for r in rows if r["finished"]),
-                      key=lambda r: r["changed"] or 0)[-recent:]
+        done = sorted((r for r in rows if r["finished"]), key=lambda r: r["changed"] or 0)
+        if recent is not None:
+            done = done[-recent:]
         return open_ + done[::-1]
 
     def job_rows(self, project: str, batch: str) -> list[dict]:

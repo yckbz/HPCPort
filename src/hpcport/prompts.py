@@ -270,6 +270,7 @@ ERRORS = {
     "preset_exists": "Server preset `{cluster}` already exists.",
     "preset_in_use": "Server preset `{cluster}` is still attached to project(s): {projects}. Detach it first.",
     "project_exists": "Project `{project}` already exists.",
+    "project_retired": "Project `{project}` has been retired. Its name is reserved for its history.",
     "unknown_version": "Version v{version} does not exist for `{key}`.",
     "unknown_approval": "Unknown approval #{id}.",
     "already_decided": "Approval #{id} was already {state}.",

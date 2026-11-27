@@ -61,6 +61,7 @@ class SettingsService:
         self.notify = notify
         self.lock = lock
         self.now = clock
+        self.retired_projects: set[str] = set()
         self.in_use: dict[str, int] = {}
         self._stamps: dict[str, object] = {}
         self.on_preset_changed = lambda name, old, new: None
@@ -88,7 +89,8 @@ class SettingsService:
                 self.in_use[key] = cur[0]
                 self._stamps[key] = vf.stamp() if vf.read() == cur[1] else None
 
-        for name in list_project_names():
+        self.retired_projects = {row["name"] for row in self.db.all("SELECT name FROM retired_projects")}
+        for name in list_project_names(self.retired_projects):
             vf = project_file(name)
             with vf.lock():
                 cur = vf.latest()
@@ -211,6 +213,8 @@ class SettingsService:
         validate_name(name, "project name")
         if name in self.projects:
             raise SettingError("project_exists", project=name)
+        if any(name.casefold() == retired.casefold() for retired in self.retired_projects):
+            raise SettingError("project_retired", project=name)
         raw = dict(data or {})
         raw["project"] = name
         if local_dir is not None and str(local_dir).strip():
@@ -229,6 +233,16 @@ class SettingsService:
         self.on_project_changed(name, None, parsed)
         self.on_change()
         return {"name": name, "version": v, "project": project_to_dict(parsed)}
+
+    def deactivate_project(self, name: str) -> None:
+        """Reflect a committed retirement in the running configuration."""
+        self.retired_projects.add(name)
+        old = self.projects.pop(name)
+        key = "%s:%s" % (PROJECT, name)
+        self.in_use.pop(key, None)
+        self._stamps.pop(key, None)
+        self.on_project_changed(name, old, None)
+        self.on_change()
 
     def update_project(self, name: str, patch: dict, note: str = "") -> dict:
         if name not in self.projects:
@@ -265,6 +279,8 @@ class SettingsService:
 
     def restore_version(self, key: str, version: int) -> dict:
         kind, name, vf = self._vf_and_kind(key)
+        if kind == PROJECT and name in self.retired_projects:
+            raise SettingError("project_retired", project=name)
         if version not in vf.versions():
             raise SettingError("unknown_version", key=key, version=version)
         with vf.lock():

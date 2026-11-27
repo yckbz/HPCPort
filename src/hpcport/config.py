@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import versions
+from .db import read_retired_project_names
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -253,11 +254,16 @@ def list_preset_names() -> list[str]:
     return sorted(p.stem for p in d.glob("*.yaml") if p.is_file() and NAME_RE.match(p.stem))
 
 
-def list_project_names() -> list[str]:
+def list_project_names(retired: set[str] | None = None) -> list[str]:
     d = projects_dir()
     if not d.is_dir():
         return []
-    return sorted(p.stem for p in d.glob("*.yaml") if p.is_file() and NAME_RE.match(p.stem))
+    if retired is None:
+        retired = read_retired_project_names(state_db_path())
+    return sorted(
+        p.stem for p in d.glob("*.yaml")
+        if p.stem not in retired and p.is_file() and NAME_RE.match(p.stem)
+    )
 
 
 # ------------------------------------------------------------------ parsing
@@ -517,7 +523,8 @@ def resolve_project_by_cwd(cwd: str | Path, projects: dict[str, Project]) -> str
     """Return the registered project whose local_dir best contains cwd (longest prefix)."""
     cur = Path(cwd).resolve()
     best: tuple[int, str] | None = None
-    for pname, proj in projects.items():
+    for pname in sorted(projects):
+        proj = projects[pname]
         if proj.local_dir is None:
             continue
         base = proj.local_dir.resolve()

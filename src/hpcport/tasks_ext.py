@@ -148,8 +148,10 @@ class TasksExtension(Extension):
         args = dict(params.arguments or {})
 
         def _register():
-            project = self._resolve_project(ctx)
             with self.daemon.lock:
+                project = self._resolve_project(ctx)
+                if project in self.daemon.settings.retired_projects:
+                    raise WaitError("project_retired", project=project)
                 if not project or project not in self.daemon.projects:
                     raise WaitError("unknown_project" if project else "unbound_project",
                                     project=project or "")
@@ -197,11 +199,11 @@ class TasksExtension(Extension):
         def _load():
             project = self._resolve_project(ctx)
             with self.daemon.lock:
+                if project not in self.daemon.projects:
+                    return None
                 self.daemon.waits.evaluate(
                     render_result=lambda b: messages.wait_fired(b, self.daemon)
                 )
-                if not project:
-                    return None
                 task = self.daemon.waits.get_task(params.task_id)
                 if task is None or task["project"] != project:
                     return None
@@ -240,11 +242,11 @@ class TasksExtension(Extension):
         def _load():
             project = self._resolve_project(ctx)
             with self.daemon.lock:
+                if project not in self.daemon.projects:
+                    return None
                 self.daemon.waits.evaluate(
                     render_result=lambda b: messages.wait_fired(b, self.daemon)
                 )
-                if not project:
-                    return None
                 task = self.daemon.waits.get_task(params.task_id)
                 if task is None or task["project"] != project:
                     return None
@@ -273,7 +275,7 @@ class TasksExtension(Extension):
         def _cancel():
             project = self._resolve_project(ctx)
             with self.daemon.lock:
-                if not project:
+                if project not in self.daemon.projects:
                     return None
                 existing = self.daemon.waits.get_task(params.task_id)
                 if existing is None or existing["project"] != project:

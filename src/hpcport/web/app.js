@@ -21,6 +21,9 @@ const state = {
 
   // Data caches
   snapshot: null,
+  snapshotRequest: 0,
+  snapshotApplied: 0,
+  tabRequest: 0,
   approvals: [],
   approvalsHistory: [],
   jobsData: null,
@@ -170,7 +173,9 @@ async function api(path, opts = {}) {
     throw new Error(data.error || "Authentication required");
   }
   if (!resp.ok) {
-    throw new Error(data.error || `HTTP ${resp.status}`);
+    const error = new Error(data.error || `HTTP ${resp.status}`);
+    error.data = data;
+    throw error;
   }
   return data;
 }
@@ -227,6 +232,7 @@ async function setLanguage(lang, persistServer = true) {
 // ------------------------------------------------------------------ Auth & Boot
 function showAuthGate() {
   state.authenticated = false;
+  closeModal();
   if (state.sse) {
     state.sse.close();
     state.sse = null;
@@ -330,6 +336,15 @@ function isEditingInside(el) {
   return ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName);
 }
 
+function isRetiredProject(project = state.project) {
+  return state.snapshot?.retired_projects?.includes(project) || false;
+}
+
+function resetBatchFilters() {
+  state.batchFilterStatus = "all";
+  state.batchFilterCluster = "";
+}
+
 async function refreshAll(eventsOrFlag = null) {
   if (!state.authenticated) return;
   const events = eventsOrFlag instanceof Set
@@ -339,17 +354,23 @@ async function refreshAll(eventsOrFlag = null) {
   const hasApprovals = events.has("approvals_changed");
   const hasJobs = events.has("jobs_changed") || events.has("ops_changed");
   const hasSettings = events.has("settings_changed");
+  const request = ++state.snapshotRequest;
   try {
-    const prevNames = ((state.snapshot && state.snapshot.projects) || []).map((p) => p.name).join("\0");
     const snap = await api("/api/state");
+    if (request < state.snapshotApplied) return;
+    state.snapshotApplied = request;
+    const prevNames = (state.snapshot?.projects || []).map((p) => p.name).join("\0");
+    const prevRetired = (state.snapshot?.retired_projects || []).join("\0");
+    const wasRetired = isRetiredProject();
     state.snapshot = snap;
-    // Validate selected project still exists
     const names = (snap.projects || []).map((p) => p.name);
-    if (state.project && !names.includes(state.project)) {
+    const retired = snap.retired_projects || [];
+    if (state.project && !names.includes(state.project) && !isRetiredProject()) {
       state.project = "";
       localStorage.setItem("hpcport_project", "");
     }
-    if (wantAll || names.join("\0") !== prevNames) {
+    if (!wasRetired && isRetiredProject()) resetBatchFilters();
+    if (wantAll || names.join("\0") !== prevNames || retired.join("\0") !== prevRetired) {
       renderProjectSelect();
     }
     updateApprovalsBadge(snap.pending_approvals || 0);
@@ -375,24 +396,31 @@ async function refreshAll(eventsOrFlag = null) {
 
 async function refreshActiveTab() {
   if (!state.authenticated) return;
+  const { project, tab } = state;
+  const retired = isRetiredProject();
+  const request = ++state.tabRequest;
+  const current = () => request === state.tabRequest && state.project === project
+    && state.tab === tab && isRetiredProject() === retired;
   try {
-    const qProj = state.project ? `project=${encodeURIComponent(state.project)}` : "";
-    if (state.tab === "approvals") {
-      const pending = await api(`/api/approvals${qProj ? "?" + qProj : ""}`);
-      const list = pending.approvals || [];
+    const qProj = project ? `project=${encodeURIComponent(project)}` : "";
+    if (tab === "approvals") {
+      const pending = retired ? [] : (await api(`/api/approvals${qProj ? "?" + qProj : ""}`)).approvals;
+      const all = state.showHistory || retired
+        ? await api(`/api/approvals?all=1${qProj ? "&" + qProj : ""}`) : null;
+      if (!current()) return;
+      const list = pending || [];
       state.approvals = list;
+      state.approvalsHistory = (all?.approvals || []).filter((a) => a.state !== "pending");
       updateApprovalsBadge(state.snapshot ? state.snapshot.pending_approvals : list.length);
-      if (state.showHistory) {
-        const all = await api(`/api/approvals?all=1${qProj ? "&" + qProj : ""}`);
-        state.approvalsHistory = (all.approvals || []).filter((a) => a.state !== "pending");
-      }
       renderApprovals();
     }
-    if (state.tab === "jobs") {
+    if (tab === "jobs") {
       const qs = [];
-      if (state.project) qs.push(`project=${encodeURIComponent(state.project)}`);
+      if (qProj) qs.push(qProj);
       if (state.batchFilterCluster) qs.push(`cluster=${encodeURIComponent(state.batchFilterCluster)}`);
-      state.jobsData = await api(`/api/jobs${qs.length ? "?" + qs.join("&") : ""}`);
+      const data = await api(`/api/jobs${qs.length ? "?" + qs.join("&") : ""}`);
+      if (!current()) return;
+      state.jobsData = data;
       const visibleKeys = new Set((state.jobsData.batches || []).map((b) => `${b.project}::${b.batch}`));
       for (const k of Object.keys(state.expandedBatches)) {
         if (!visibleKeys.has(k)) delete state.expandedBatches[k];
@@ -403,25 +431,26 @@ async function refreshActiveTab() {
           const [proj, batch] = k.split("::");
           try {
             const res = await api(`/api/jobs/${encodeURIComponent(proj)}/${encodeURIComponent(batch)}`);
-            state.expandedBatches[k] = res.jobs || [];
+            if (current()) state.expandedBatches[k] = res.jobs || [];
           } catch {
-            delete state.expandedBatches[k];
+            if (current()) delete state.expandedBatches[k];
           }
         }));
       }
-      renderJobs();
+      if (current()) renderJobs();
     }
-    if (state.tab === "audit") {
+    if (tab === "audit") {
       const qs = [`n=${state.auditLimit}`];
-      if (state.project) qs.push(`project=${encodeURIComponent(state.project)}`);
+      if (qProj) qs.push(qProj);
       if (state.auditTool) qs.push(`tool=${encodeURIComponent(state.auditTool)}`);
       const res = await api(`/api/audit?${qs.join("&")}`);
+      if (!current()) return;
       state.auditRows = res.audit || [];
       renderAudit();
     }
-    if (state.tab === "settings") {
+    if (tab === "settings") {
       await ensureSnippetsLoaded();
-      renderSettings();
+      if (current()) renderSettings();
     }
   } catch (e) {
     if (state.authenticated) toast(e.message, true);
@@ -457,6 +486,10 @@ function renderProjectSelect() {
   const opts = [`<option value="">${esc(i18n.t("allProjects"))}</option>`];
   for (const p of projects) {
     opts.push(`<option value="${esc(p.name)}"${p.name === state.project ? " selected" : ""}>${esc(p.name)}</option>`);
+  }
+  for (const name of state.snapshot?.retired_projects || []) {
+    const label = i18n.t("retiredProjectOption", { project: name });
+    opts.push(`<option value="${esc(name)}"${name === state.project ? " selected" : ""}>${esc(label)}</option>`);
   }
   sel.innerHTML = opts.join("");
 }
@@ -710,7 +743,8 @@ function captureApprovalDrafts(el) {
 function renderApprovals() {
   const el = document.getElementById("view-approvals");
   const focusInfo = captureApprovalDrafts(el);
-  const pending = state.approvals || [];
+  const retired = isRetiredProject();
+  const pending = retired ? [] : state.approvals;
   const liveIds = new Set(pending.map((a) => String(a.id)));
   for (const k of Object.keys(state.commentDrafts)) {
     if (!liveIds.has(k)) delete state.commentDrafts[k];
@@ -721,16 +755,16 @@ function renderApprovals() {
   let html = `
     <div class="page-header">
       <div>
-        <h1>${esc(i18n.t("approvalsTitle"))}</h1>
-        <p>${esc(i18n.t("approvalsSubtitle"))}</p>
+        <h1>${esc(i18n.t(retired ? "approvalHistory" : "approvalsTitle"))}</h1>
+        <p>${esc(i18n.t(retired ? "approvalHistoryDesc" : "approvalsSubtitle", { project: state.project }))}</p>
       </div>
-      <button type="button" class="btn btn-subtle btn-sm" id="toggle-history-btn">
+      ${retired ? "" : `<button type="button" class="btn btn-subtle btn-sm" id="toggle-history-btn">
         ${esc(state.showHistory ? i18n.t("hideHistory") : i18n.t("showHistory"))}
-      </button>
+      </button>`}
     </div>
   `;
 
-  if (!pending.length) {
+  if (!retired && !pending.length) {
     html += `
       <div class="empty-state">
         <div class="empty-icon">
@@ -746,11 +780,11 @@ function renderApprovals() {
     html += pending.map(renderApprovalCard).join("");
   }
 
-  if (state.showHistory) {
-    const hist = state.approvalsHistory || [];
+  if (retired || state.showHistory) {
+    const hist = retired ? state.approvalsHistory : state.approvalsHistory.slice(0, 30);
     html += `
       <div class="card" style="margin-top:20px">
-        <div class="card-header"><h2 class="card-title">${esc(i18n.t("recentDecisions"))}</h2></div>
+        ${retired ? "" : `<div class="card-header"><h2 class="card-title">${esc(i18n.t("recentDecisions"))}</h2></div>`}
         ${!hist.length ? `<p class="muted text-sm">${esc(i18n.t("noDecisions"))}</p>` : `
           <div class="table-wrap">
             <table>
@@ -765,7 +799,7 @@ function renderApprovals() {
                 </tr>
               </thead>
               <tbody>
-                ${hist.slice(0, 30).map((a) => `
+                ${hist.map((a) => `
                   <tr>
                     <td class="mono muted">#${a.id}</td>
                     <td>${esc(a.project || "-")}</td>
@@ -816,10 +850,13 @@ function renderApprovals() {
     }
   }
 
-  document.getElementById("toggle-history-btn").onclick = async () => {
-    state.showHistory = !state.showHistory;
-    await refreshActiveTab();
-  };
+  const toggleHistory = document.getElementById("toggle-history-btn");
+  if (toggleHistory) {
+    toggleHistory.onclick = async () => {
+      state.showHistory = !state.showHistory;
+      await refreshActiveTab();
+    };
+  }
 
   el.querySelectorAll("[data-toggle-scripts]").forEach((btn) => {
     btn.onclick = () => {
@@ -1749,6 +1786,10 @@ function renderSettings() {
     btn.onclick = () => openAttachModal(btn.dataset.attachProject);
   });
 
+  el.querySelectorAll("[data-retire-project]").forEach((btn) => {
+    btn.onclick = () => openProjectRetirementModal(btn.dataset.retireProject);
+  });
+
   el.querySelectorAll("[data-detach-cluster]").forEach((btn) => {
     btn.onclick = async () => {
       const [proj, cluster] = btn.dataset.detachCluster.split("::");
@@ -1878,7 +1919,10 @@ function renderProjectCard(p) {
             ${esc(i18n.t("localDirLabel"))}: ${esc(d.local_dir || i18n.t("noLocalDir"))}
           </div>
         </div>
-        <button type="button" class="btn btn-soft btn-sm" data-attach-project="${esc(p.name)}">+ ${esc(i18n.t("attachServer"))}</button>
+        <div class="flex-row" style="gap:8px">
+          <button type="button" class="btn btn-soft btn-sm" data-attach-project="${esc(p.name)}">+ ${esc(i18n.t("attachServer"))}</button>
+          <button type="button" class="btn btn-danger btn-sm" data-retire-project="${esc(p.name)}">${esc(i18n.t("retireProject"))}</button>
+        </div>
       </div>
 
       <div style="margin-bottom:14px">
@@ -2225,9 +2269,76 @@ function openNewProjectModal() {
       toast(i18n.t("savedToast"));
       await refreshAll();
     } catch (err) {
-      toast(err.message, true);
+      toast(err.data?.code === "project_retired" ? i18n.t("retiredNameReserved", { project: name }) : err.message, true);
     }
   };
+}
+
+async function openProjectRetirementModal(project) {
+  const url = `/api/projects/${encodeURIComponent(project)}/retirement`;
+  const title = i18n.t("retireProjectTitle", { project });
+  const backdrop = document.getElementById("modal-backdrop");
+  const showing = (element) => element.isConnected && !backdrop.classList.contains("hidden");
+  openModal(title, `<p id="retirement-loading" role="status">${esc(i18n.t("retirePreviewLoading"))}</p>`);
+  const loading = document.getElementById("retirement-loading");
+
+  function render(preview, bindingChanged = false) {
+    const { local_dir: localDir, next_project: nextProject } = preview.binding;
+    const binding = localDir
+      ? i18n.t(nextProject ? "retireBindingProject" : "retireBindingUnbound", { localDir, nextProject })
+      : i18n.t("retireNoLocalDir");
+    const blocked = preview.blockers.length > 0;
+    openModal(title, `
+      <form id="retire-project-form">
+        ${bindingChanged ? `<p class="alert-banner" role="alert">${esc(i18n.t("retireBindingChanged"))}</p>` : ""}
+        <p style="overflow-wrap:anywhere">${esc(binding)}</p>
+        <p>${esc(i18n.t("retireProjectEffects"))}</p>
+        ${blocked ? `
+          <div class="alert-banner" role="status">
+            ${esc(i18n.t("retireBlocked"))}
+            <ul>${preview.blockers.map((kind) => `<li>${esc(i18n.t("retireBlocker_" + kind))}</li>`).join("")}</ul>
+          </div>
+        ` : ""}
+        <div class="modal-footer">
+          <button type="button" id="retire-project-cancel" class="btn btn-outline btn-sm">${esc(i18n.t("cancelBtn"))}</button>
+          <button type="submit" class="btn btn-danger btn-sm"${blocked ? " disabled" : ""}>${esc(i18n.t("retireProject"))}</button>
+        </div>
+      </form>
+    `);
+    const form = document.getElementById("retire-project-form");
+    const cancel = document.getElementById("retire-project-cancel");
+    const confirm = form.querySelector('[type="submit"]');
+    cancel.onclick = closeModal;
+    cancel.focus();
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      if (confirm.disabled) return;
+      confirm.disabled = true;
+      try {
+        await api(url, { method: "POST", body: { binding: preview.binding } });
+        if (showing(form)) closeModal();
+        toast(i18n.t("retiredProjectToast", { project }));
+        await refreshAll();
+      } catch (err) {
+        if (err.data?.preview) {
+          if (showing(form)) render(err.data.preview, err.data.code === "binding_changed");
+        } else {
+          toast(err.message, true);
+          confirm.disabled = false;
+        }
+      }
+    };
+  }
+
+  try {
+    const preview = await api(url);
+    if (showing(loading)) render(preview);
+  } catch (err) {
+    if (showing(loading)) {
+      closeModal();
+      toast(err.message, true);
+    }
+  }
 }
 
 function openAttachModal(projectName) {
@@ -2302,6 +2413,7 @@ function wireEvents() {
 
   // Project switcher
   document.getElementById("project-select").onchange = (e) => {
+    if (isRetiredProject() || isRetiredProject(e.target.value)) resetBatchFilters();
     state.project = e.target.value;
     localStorage.setItem("hpcport_project", state.project);
     refreshActiveTab();

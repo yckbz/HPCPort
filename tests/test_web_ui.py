@@ -33,3 +33,21 @@ def test_web_js_syntax_and_contracts():
                 capture_output=True, text=True, timeout=10,
             )
             assert r.returncode == 0, "%s syntax error: %s" % (fname, r.stderr)
+
+
+def test_retirement_binding_translation_preserves_literal_directory():
+    node = shutil.which("node")
+    if node:
+        script = """
+import assert from "node:assert/strict";
+import { createI18n } from "./i18n.js";
+const localDir = "/work/{nextProject}/$&";
+const nextProject = "parent";
+assert.equal(
+  createI18n("en").t("retireBindingProject", { localDir, nextProject }),
+  "New sessions started from /work/{nextProject}/$& will automatically use parent. "
+  + "Subdirectories with their own bindings keep them.",
+);
+"""
+        subprocess.run([node, "--input-type=module", "-e", script],
+                       cwd=WEB_DIR, check=True, timeout=10)

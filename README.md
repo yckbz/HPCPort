@@ -151,6 +151,8 @@ hpcport cluster attach my-research gpu01
 hpcport snippets my-research
 ```
 
+In **Settings**, use **Retire Project** to end an idle project's registration. The confirmation shows how new MCP sessions will match its local directory. Retirement revokes standing approval and reserves the project name. Local and remote files are preserved, and the project selector still lists the retired project for looking up jobs and approval decisions.
+
 ---
 
 ## Connecting AI Agents (MCP)

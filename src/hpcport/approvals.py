@@ -49,12 +49,13 @@ class ApprovalService:
             row["detail"] = json.loads(row["detail"])
         return row
 
-    def list(self, pending_only: bool = True, project: str | None = None) -> list[dict]:
+    def list(self, pending_only: bool = True, project: str | None = None,
+             include_global: bool = True) -> list[dict]:
         conds, args = [], []
         if pending_only:
             conds.append("state = 'pending'")
         if project is not None:
-            conds.append("(project = ? OR project IS NULL)")
+            conds.append("(project = ? OR project IS NULL)" if include_global else "project = ?")
             args.append(project)
         where = "WHERE " + " AND ".join(conds) if conds else ""
         rows = self.db.all(

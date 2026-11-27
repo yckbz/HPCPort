@@ -41,6 +41,8 @@ export const MESSAGES = {
     noApprovalsTitle: "All Caught Up",
     noApprovalsDesc: "There are no pending approvals right now. New requests from your agents will appear here automatically.",
     recentDecisions: "Recent Decisions",
+    approvalHistory: "Approval History",
+    approvalHistoryDesc: "Decisions recorded for {project}.",
     noDecisions: "No past decisions recorded yet.",
     kindSubmit: "Slurm Submit",
     kindPermission: "Command Guard",
@@ -266,6 +268,24 @@ export const MESSAGES = {
     copyConfig: "Copy",
     copiedToast: "Copied to clipboard",
     projectModalTitle: "Create Project",
+    retireProject: "Retire Project",
+    retireProjectTitle: "Retire {project}?",
+    retirePreviewLoading: "Checking project activity and directory binding…",
+    retireBindingProject: "New sessions started from {localDir} will automatically use {nextProject}. Subdirectories with their own bindings keep them.",
+    retireBindingUnbound: "New sessions started from {localDir} will have no project binding. Subdirectories with their own bindings keep them.",
+    retireNoLocalDir: "This project has no automatic directory binding.",
+    retireProjectEffects: "Local and remote files, job records, and approval history are kept. Standing approval is revoked, MCP clients pinned to this project lose access, and the project name stays reserved.",
+    retireBindingChanged: "The directory binding changed. Review the updated binding before confirming.",
+    retireBlocked: "Finish the following work before retiring this project.",
+    retireBlocker_jobs: "Pending, queued, or running Slurm jobs",
+    retireBlocker_unregistered: "Active Slurm jobs detected outside HPCPort",
+    retireBlocker_operations: "Running remote commands or transfers",
+    retireBlocker_approvals: "Pending approval requests",
+    retireBlocker_waits: "Active waits or MCP Tasks",
+    retireBlocker_requests: "Project requests still in progress",
+    retiredProjectOption: "{project} (retired)",
+    retiredProjectToast: "Retired project {project}",
+    retiredNameReserved: "The name {project} is reserved for a retired project.",
     fieldProjectName: "Project Name",
     fieldLocalDir: "Local Workspace Directory (optional)",
     fieldLocalDirHint: "Absolute local path for auto-matching `hpcport mcp` by cwd",
@@ -325,6 +345,8 @@ export const MESSAGES = {
     noApprovalsTitle: "暂无待办审批",
     noApprovalsDesc: "当前没有等待审批的请求。Agent 发起新的审批时会在这里实时显示。",
     recentDecisions: "历史审批记录",
+    approvalHistory: "审批历史",
+    approvalHistoryDesc: "{project} 的已决审批记录。",
     noDecisions: "暂无历史审批记录。",
     kindSubmit: "作业提交",
     kindPermission: "命令守卫",
@@ -550,6 +572,24 @@ export const MESSAGES = {
     copyConfig: "复制配置",
     copiedToast: "已复制到剪贴板",
     projectModalTitle: "新建项目",
+    retireProject: "注销项目",
+    retireProjectTitle: "注销 {project}？",
+    retirePreviewLoading: "正在检查未完成任务和目录绑定…",
+    retireBindingProject: "从 {localDir} 启动的新会话将自动绑定到 {nextProject}。有独立登记的子目录仍按各自的绑定匹配。",
+    retireBindingUnbound: "从 {localDir} 启动的新会话将不再自动绑定项目。有独立登记的子目录仍按各自的绑定匹配。",
+    retireNoLocalDir: "此项目没有基于本地目录的自动绑定。",
+    retireProjectEffects: "本地和远端文件、作业记录及审批历史会保留。长期批准额度将撤销，已绑定此项目的 MCP 客户端将失去访问权限，项目名将保留且不可复用。",
+    retireBindingChanged: "目录绑定已变化，请核对更新后的绑定再确认。",
+    retireBlocked: "以下事项处理完毕后才能注销项目。",
+    retireBlocker_jobs: "待批准、排队或运行中的 Slurm 作业",
+    retireBlocker_unregistered: "检测到的未登记 Slurm 作业仍在进行",
+    retireBlocker_operations: "运行中的远端命令或文件传输",
+    retireBlocker_approvals: "待处理的审批请求",
+    retireBlocker_waits: "进行中的等待或 MCP Task",
+    retireBlocker_requests: "正在处理的项目请求",
+    retiredProjectOption: "{project}（已注销）",
+    retiredProjectToast: "已注销项目 {project}",
+    retiredNameReserved: "项目名 {project} 已由注销项目保留。",
     fieldProjectName: "项目名称",
     fieldLocalDir: "本地工作目录（可选）",
     fieldLocalDirHint: "填绝对路径后，`hpcport mcp` 可根据当前目录自动匹配该项目",
@@ -591,11 +631,10 @@ export function createI18n(initialLang = "auto") {
     },
     t(key, params = {}) {
       const dict = MESSAGES[lang] || MESSAGES.en;
-      let str = dict[key] ?? MESSAGES.en[key] ?? key;
-      for (const [k, v] of Object.entries(params)) {
-        str = str.replaceAll(`{${k}}`, String(v ?? ""));
-      }
-      return str;
+      const message = dict[key] ?? MESSAGES.en[key] ?? key;
+      return message.replace(/\{(\w+)\}/g, (placeholder, name) =>
+        Object.hasOwn(params, name) ? String(params[name] ?? "") : placeholder
+      );
     },
   };
 }

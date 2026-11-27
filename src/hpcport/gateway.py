@@ -440,7 +440,8 @@ class GatewayService:
             row["log"] = row["dir"] + "/out" if row["dir"] else None
         return row
 
-    def list(self, project: str | None = None, every: bool = False) -> list[dict]:
+    def list(self, project: str | None = None, every: bool = False,
+             limit: int | None = 100) -> list[dict]:
         conds, args = [], []
         if project is not None:
             conds.append("project = ?")
@@ -448,7 +449,8 @@ class GatewayService:
         if not every:
             conds.append("state = 'running'")
         where = "WHERE " + " AND ".join(conds) if conds else ""
-        rows = self.db.all("SELECT id FROM ops %s ORDER BY id DESC LIMIT 100" % where, tuple(args))
+        rows = self.db.all("SELECT id FROM ops %s ORDER BY id DESC LIMIT ?" % where,
+                           (*args, -1 if limit is None else limit))
         return [self.op(r["id"]) for r in rows]
 
     def running_ops(self, project: str) -> list[int]:

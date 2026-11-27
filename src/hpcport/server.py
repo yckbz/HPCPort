@@ -110,15 +110,6 @@ def build_mcp(daemon) -> MCPServer:
             result=result,
         )
 
-    def require_project(ctx: Context) -> tuple[str, str]:
-        proj, skey = _project_and_session(ctx, daemon)
-        if not proj:
-            raise JobError("unbound_project")
-        if proj not in daemon.projects:
-            raise JobError("unknown_project", project=proj)
-        daemon.waits.init_cursor(proj, skey)
-        return proj, skey
-
     def make_progress_cb(ctx: Context, loop: asyncio.AbstractEventLoop):
         def on_tick(elapsed: float, total: float, msg: str) -> None:
             try:
@@ -142,16 +133,24 @@ def build_mcp(daemon) -> MCPServer:
         proj, skey = _project_and_session(ctx, daemon)
         loop = asyncio.get_running_loop()
         on_tick = make_progress_cb(ctx, loop)
-        try:
-            if needs_project:
-                proj, skey = require_project(ctx)
+
+        def call():
             if locked:
-                def _call():
-                    with daemon.lock:
-                        return fn(proj, skey, on_tick)
-                text = await asyncio.to_thread(_call)
-            else:
-                text = await asyncio.to_thread(fn, proj, skey, on_tick)
+                with daemon.lock:
+                    return fn(proj, skey, on_tick)
+            return fn(proj, skey, on_tick)
+
+        def invoke():
+            if not needs_project:
+                return call()
+            if not proj:
+                raise JobError("unbound_project")
+            with daemon.project_activity(proj):
+                daemon.waits.init_cursor(proj, skey)
+                return call()
+
+        try:
+            text = await asyncio.to_thread(invoke)
             is_err, res_tag = False, "ok"
         except NeedsApproval as e:
             text = messages.gate_result(e)
@@ -335,6 +334,8 @@ def build_mcp(daemon) -> MCPServer:
     @tool("info", P.TOOL_INFO)
     async def info(ctx: Context) -> CallToolResult:
         def fn(p, s, tick):
+            if p in daemon.settings.retired_projects:
+                raise JobError("project_retired", project=p)
             proj = daemon.projects.get(p) if p else None
             text = messages.server_instructions(proj)
             if proj is not None:
@@ -500,6 +501,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                 return await handler(request)
             except (ApprovalError, AttachError, ConfigError) + ToolErrors as e:
                 msg = messages.error(e) if hasattr(e, "code") and e.code in P.ERRORS else str(e)
+                if isinstance(e, SettingError) and e.code == "project_retired":
+                    return JSONResponse({"error": msg, "code": e.code}, status_code=409)
                 return fail(400, msg)
             except KeyError as e:
                 return fail(404, "not found: %s" % e)
@@ -619,6 +622,7 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
                         "language": daemon.global_cfg.language,
                     },
                     "projects": projs,
+                    "retired_projects": sorted(daemon.settings.retired_projects),
                     "presets": presets,
                     "health": daemon.cluster_health(),
                     "pending_approvals": daemon.approvals.pending_count(),
@@ -651,6 +655,29 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
             return fail(400, "changes mapping is required")
         return JSONResponse(await locked(daemon.settings.update_project, name, changes,
                                          d.get("note") or ""))
+
+    async def project_retirement_preview(request):
+        name = request.path_params["name"]
+        preview = await asyncio.to_thread(daemon.project_retirement_preview, name)
+        return JSONResponse(preview, headers={"Cache-Control": "no-store"})
+
+    async def project_retire(request):
+        if auth_kind(request) != "web":
+            return fail(403, "A Web dashboard session is required to retire a project.")
+        name = request.path_params["name"]
+        binding = (await body(request)).get("binding")
+        if (not isinstance(binding, dict) or binding.keys() != {"local_dir", "next_project"}
+                or any(value is not None and not isinstance(value, str) for value in binding.values())):
+            return fail(400, "A project directory binding preview is required.")
+        result = await asyncio.to_thread(daemon.retire_project, name, binding)
+        if "code" in result:
+            result["error"] = (
+                "The directory binding changed. Review it before retiring the project."
+                if result["code"] == "binding_changed"
+                else "The project has unfinished work."
+            )
+            return JSONResponse(result, status_code=409)
+        return JSONResponse(result)
 
     async def project_attach(request):
         name = request.path_params["name"]
@@ -722,14 +749,15 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         project = request.query_params.get("project") or None
         cluster = request.query_params.get("cluster") or None
         with daemon.lock:
-            batches = daemon.jobs.overview(project=project, recent=30, cluster=cluster)
-            ops = daemon.gateway.list(project=project, every=True)
+            retired = project in daemon.settings.retired_projects
+            batches = daemon.jobs.overview(project=project, recent=None if retired else 30, cluster=cluster)
+            ops = daemon.gateway.list(project=project, every=True, limit=None if retired else 100)
             unreg = daemon.jobs.unregistered(project=project)
             usage = {}
             if project and project in daemon.projects:
                 for cname in daemon.projects[project].clusters:
                     usage[cname] = daemon.jobs.cluster_usage(project, cname)
-            standing = daemon.submits.status(project) if project else None
+            standing = daemon.submits.status(project) if project and not retired else None
         return JSONResponse({
             "text": messages.jobs_overview(batches, ops, unreg),
             "batches": batches,
@@ -819,8 +847,12 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
     async def approvals_list(request):
         project = request.query_params.get("project") or None
         every = request.query_params.get("all") == "1"
-        return JSONResponse({"approvals": daemon.approvals.list(pending_only=not every,
-                                                                project=project)})
+        with daemon.lock:
+            rows = daemon.approvals.list(
+                pending_only=not every, project=project,
+                include_global=project not in daemon.settings.retired_projects,
+            )
+        return JSONResponse({"approvals": rows})
 
     async def approval_decide(request):
         d = await body(request)
@@ -951,6 +983,8 @@ def build_app(daemon, start_loop: bool = True) -> Starlette:
         r_mut("/api/projects", projects_create, "POST", web_only_when_locked=True),
         r_get("/api/projects/{name}", project_get),
         r_mut("/api/projects/{name}", project_patch, "PATCH", web_only_when_locked=True),
+        r_get("/api/projects/{name}/retirement", project_retirement_preview),
+        r_mut("/api/projects/{name}/retirement", project_retire),
         r_mut("/api/projects/{name}/clusters", project_attach, "POST", web_only_when_locked=True),
         r_mut("/api/projects/{name}/clusters/{cluster}", project_detach, "DELETE",
               web_only_when_locked=True),

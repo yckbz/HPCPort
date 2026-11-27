@@ -151,6 +151,8 @@ hpcport cluster attach my-research gpu01
 hpcport snippets my-research
 ```
 
+在 **设置** 中点击 **注销项目** 即可结束空闲项目的登记。确认窗口会显示注销后新 MCP 会话如何匹配本地目录。注销会撤销长期批准额度并保留原项目名。本地和远端文件会保留，注销后的项目仍可从顶部选择器选中，用于查询作业和审批历史。
+
 ---
 
 ## 各大 AI Agent 接入方式

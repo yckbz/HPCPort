@@ -8,9 +8,17 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+PROJECT_RETIREMENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS retired_projects (
+  name TEXT PRIMARY KEY,
+  retired_at REAL NOT NULL
+);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
@@ -193,7 +201,18 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
-"""
+""" + PROJECT_RETIREMENTS_SCHEMA
+
+
+def read_retired_project_names(path: Path) -> set[str]:
+    """Read the registry for commands that run outside the daemon."""
+    if not path.is_file():
+        return set()
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as con:
+        if con.execute("PRAGMA user_version").fetchone()[0] < 3:
+            return set()
+        return {row[0] for row in con.execute("SELECT name FROM retired_projects")}
+
 
 def add_column(table: str, column: str):
     def step(con):
@@ -222,6 +241,7 @@ MIGRATIONS: dict[int, list] = {
         add_column("jobs", "dispatch_attempted INTEGER NOT NULL DEFAULT 0"),
         _init_done_notified,
     ],
+    2: [PROJECT_RETIREMENTS_SCHEMA],
 }
 
 
@@ -261,6 +281,13 @@ class DB:
     def close(self) -> None:
         with self._lock:
             self._con.close()
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            self._con.execute("BEGIN")
+            with self._con:
+                yield
 
     def all(self, sql: str, args: tuple = ()) -> list[dict]:
         with self._lock:

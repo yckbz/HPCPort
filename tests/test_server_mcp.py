@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
+import pytest
 from starlette.testclient import TestClient
 
+from hpcport import config
 from hpcport.daemon import Daemon
 from hpcport.server import build_app
+from hpcport.stdio_bridge import resolve_target
 from tests.fake_slurm import FakeSlurmExecutor
 
 
@@ -236,6 +241,185 @@ def test_stdio_bridge_resolve_and_headers(hpc_home, tmp_path):
     assert hdrs["MCP-Protocol-Version"] == "2026-07-28"
     assert hdrs["MCP-Method"] == "tools/call"
     assert hdrs["MCP-Name"] == "wait_for"
+
+
+def test_retire_project_preserves_history_and_reserves_name(hpc_home, tmp_path):
+    d, ex, app, _, remote, local = _make_app(hpc_home, tmp_path)
+    d.settings.create_project("parent", str(tmp_path))
+    nested = local / "nested"
+    nested.mkdir()
+    d.settings.create_project("nested", str(nested))
+    local_file = local / "data.txt"
+    local_file.write_text("local sample")
+    workdir = remote / "demo_slurm"
+    script = workdir / "train.sh"
+    script_text = "#!/bin/bash\n#SBATCH -p a100\n#SBATCH -n 2\n#SBATCH -t 00:05:00\necho sample\n"
+    script.write_text(script_text)
+    vf = config.project_file("demo")
+    saved_config = vf.read(), vf.versions()
+    header = {"X-HPCPort-UI": "1"}
+    url = "/api/projects/demo/retirement"
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.get(url).status_code == 401
+        assert client.post(url, headers={"Authorization": "Bearer secret-cli-token"}).status_code == 403
+        assert client.post("/api/auth/pin", json={"pin": d.pairing_pin}, headers=header).status_code == 200
+        assert client.post(url, json={}).status_code == 403
+        assert client.post(url, json={}, headers=header).status_code == 400
+        sid = _mcp_init_legacy(client, "/p/demo/mcp")
+        args = {"cluster": "gpu01", "workdir": str(workdir), "scripts": ["train.sh"],
+                "desc": "research job", "batch": "experiment", "wait_s": 0}
+        _mcp_call(client, "/p/demo/mcp", sid, 2, "tools/call", {"name": "submit", "arguments": args})
+        approval = d.approvals.list(project="demo")[0]
+        preview = client.get(url).json()
+        assert preview["binding"] == {"local_dir": str(local.resolve()), "next_project": "parent"}
+        assert set(preview["blockers"]) == {"jobs", "approvals"}
+        conflict = client.post(url, json={"binding": preview["binding"]}, headers=header)
+        assert conflict.status_code == 409 and conflict.json()["code"] == "project_busy"
+        assert client.post(
+            f"/api/approvals/{approval['id']}/approve",
+            json={"always": True, "comment": "approved experiment"}, headers=header,
+        ).status_code == 200
+        d.cycle(force=True)
+        job = d.jobs.job_rows("demo", "experiment")[0]
+        assert job["slurm_id"] and "jobs" in client.get(url).json()["blockers"]
+        ex.finish(job["slurm_id"], "COMPLETED", "0:0", run_s=5.0)
+        d.cycle(force=True)
+        assert d.submits.standing("demo")
+        assert d.jobs.job_rows("demo", "experiment")[0]["state"] == "done"
+
+        for index in range(31):
+            batch = f"older-{index:02d}"
+            d.db.insert("batches", project="demo", batch=batch, cluster="gpu01",
+                        workdir=str(workdir), desc=batch, created=index + 1)
+            d.db.insert("jobs", project="demo", batch=batch, cluster="gpu01",
+                        submit_no=index + 2, workdir=str(workdir), script="train.sh",
+                        state="done", t_register=index + 1, changed=index + 1)
+        shared = d.approvals.request(None, "proposal", "unrelated global edit", {})
+        assert len(client.get("/api/jobs?project=demo").json()["batches"]) == 30
+        assert resolve_target(cwd=str(local)) == "demo"
+        assert client.get(url).json()["blockers"] == []
+        binding = {"binding": preview["binding"]}
+        assert client.post(url, json=binding, headers=header).json() == {"retired": "demo"}
+        assert client.post(url, json=binding, headers=header).json() == {"retired": "demo"}
+
+        state = client.get("/api/state").json()
+        assert state["retired_projects"] == ["demo"]
+        assert {p["name"] for p in state["projects"]} == {"parent", "nested"}
+        assert d.submits.standing("demo") is None
+        assert d.approvals.get(shared)["state"] == "pending"
+        history = client.get("/api/jobs?project=demo").json()
+        assert len(history["batches"]) == 32 and history["standing"] is None
+        assert client.get("/api/jobs/demo/experiment").json()["jobs"][0]["id"] == job["id"]
+        assert "echo sample" in client.get(f"/api/job/{job['id']}/files").json()["script"]
+        decisions = client.get("/api/approvals?project=demo&all=1").json()["approvals"]
+        assert [a["id"] for a in decisions] == [approval["id"]]
+        assert decisions[0]["comment"] == "approved experiment"
+        for req_id, tool in enumerate(("info", "jobs", "submit"), start=3):
+            body = _mcp_call(client, "/p/demo/mcp", sid, req_id, "tools/call", {
+                "name": tool, "arguments": args if tool == "submit" else {},
+            })
+            assert body["result"]["isError"] is True
+            assert "has been retired" in body["result"]["content"][0]["text"]
+        assert resolve_target(cwd=str(local)) == "parent"
+        assert resolve_target(cwd=str(nested)) == "nested"
+        assert client.get("/api/projects/demo/mcp-snippets").status_code == 404
+
+    assert (vf.read(), vf.versions()) == saved_config
+    assert local_file.read_text() == "local sample"
+    assert script.read_text() == script_text
+    d.db.close()
+    restarted = Daemon(executors={"gpu01": ex})
+    with TestClient(build_app(restarted, start_loop=False), base_url="http://127.0.0.1:8765") as client:
+        assert client.post("/api/auth/pin", json={"pin": restarted.pairing_pin}, headers=header).status_code == 200
+        for name in ("demo", "Demo"):
+            recreate = client.post("/api/projects", json={"name": name}, headers=header)
+            assert recreate.status_code == 409 and recreate.json()["code"] == "project_retired"
+        assert "demo" not in restarted.projects
+        assert client.get("/api/state").json()["retired_projects"] == ["demo"]
+        assert len(client.get("/api/jobs?project=demo").json()["batches"]) == 32
+        assert restarted.submits.standing("demo") is None
+        assert resolve_target(cwd=str(local)) == "parent"
+    restarted.db.close()
+
+
+def test_retire_project_revalidates_binding_and_waits_for_in_flight_request(hpc_home, tmp_path, monkeypatch):
+    d, _, app, _, _, local = _make_app(hpc_home, tmp_path)
+    header = {"X-HPCPort-UI": "1"}
+    url = "/api/projects/demo/retirement"
+    entered, release = Event(), Event()
+    run = d.gateway.exec
+
+    def paused_exec(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(d.gateway, "exec", paused_exec)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.post("/api/auth/pin", json={"pin": d.pairing_pin}, headers=header).status_code == 200
+        before = client.get(url).json()
+        assert before["binding"]["next_project"] is None
+        assert client.post("/api/projects", json={"name": "parent", "local_dir": str(tmp_path)},
+                           headers=header).status_code == 200
+        changed = client.post(url, json={"binding": before["binding"]}, headers=header)
+        assert changed.status_code == 409 and changed.json()["code"] == "binding_changed"
+        binding = changed.json()["preview"]["binding"]
+        assert binding == {"local_dir": str(local.resolve()), "next_project": "parent"}
+
+        sid = _mcp_init_legacy(client, "/p/demo/mcp")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            task = pool.submit(_mcp_call, client, "/p/demo/mcp", sid, 2, "tools/call", {
+                "name": "remote_exec", "arguments": {"cluster": "bare1", "command": "echo completed"},
+            })
+            try:
+                assert entered.wait(5)
+                assert d.db.one("SELECT 1 FROM ops WHERE project = 'demo'") is None
+                denied = client.post(url, json={"binding": binding}, headers=header)
+                assert denied.status_code == 409
+                assert denied.json()["preview"]["blockers"] == ["requests"]
+            finally:
+                release.set()
+            assert "completed" in task.result(timeout=5)["result"]["content"][0]["text"]
+        assert client.post(url, json={"binding": binding}, headers=header).status_code == 200
+
+
+def test_retire_project_checks_durable_blockers_and_rolls_back_on_failure(hpc_home, tmp_path, monkeypatch):
+    d, _, _, _, _, _ = _make_app(hpc_home, tmp_path)
+    d.settings.create_project("plain")
+    assert d.project_retirement_preview("plain") == {
+        "binding": {"local_dir": None, "next_project": None}, "blockers": [],
+    }
+    op = d.db.insert("ops", project="demo", kind="transfer", cluster="bare1", spec="{}",
+                     limit_s=120, state="running", started=d.now())
+    detection = {"cluster": "gpu01", "slurm_id": "123456"}
+    d.db.insert("unregistered", **detection, project="demo", workdir="/work",
+                first_seen=d.now(), active=1)
+    with d.lock:
+        wait = d.waits.register("demo", "test", timeout_h=0.25)
+        task = d.waits.create_task("demo", wait["id"])
+    preview = d.project_retirement_preview("demo")
+    assert set(preview["blockers"]) == {"unregistered", "operations", "waits"}
+    d.db.update("ops", {"id": op}, state="ended")
+    d.db.update("unregistered", detection, active=0)
+    assert d.project_retirement_preview("demo")["blockers"] == ["waits"]
+    d.waits.cancel_task(task["task_id"])
+    assert d.project_retirement_preview("demo")["blockers"] == []
+    standing = {"limits": {"total_jobs": 50}, "after_job": 0}
+    d.db.set_meta("standing:demo", json.dumps(standing))
+
+    def fail_clear(*args, **kwargs):
+        raise OSError("injected failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(d.jobs, "clear_roots", fail_clear)
+        with pytest.raises(OSError, match="injected failure"):
+            d.retire_project("demo", preview["binding"])
+    assert d.submits.standing("demo") == standing
+    assert d.db.one("SELECT 1 FROM retired_projects WHERE name = 'demo'") is None
+    assert "demo" in d.projects and "demo" in config.list_project_names()
+    assert d.retire_project("demo", preview["binding"]) == {"retired": "demo"}
+    assert d.submits.standing("demo") is None
 
 
 def test_web_auth_csrf_and_web_only_approval(hpc_home, tmp_path):

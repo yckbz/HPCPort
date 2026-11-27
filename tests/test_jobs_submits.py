@@ -481,7 +481,7 @@ def test_batch_auto_numbering_renotify_and_cluster_mismatch(hpc_home, tmp_path):
     assert any(n["reason"] == "batch_done" and n["subject"] == "batch:b001" for n in n2)
 
 
-def test_db_migration_v1_to_v2(tmp_path):
+def test_db_migration_preserves_legacy_job_state(tmp_path):
     import sqlite3
     from hpcport.db import DB, SCHEMA_VERSION
 
@@ -515,6 +515,7 @@ def test_db_migration_v1_to_v2(tmp_path):
     try:
         ver = db._con.execute("PRAGMA user_version").fetchone()[0]
         assert ver == SCHEMA_VERSION
+        assert db.all("SELECT name FROM retired_projects") == []
         b_done = db.one("SELECT done_notified FROM batches WHERE batch = 'b_done'")
         b_open = db.one("SELECT done_notified FROM batches WHERE batch = 'b_open'")
         assert b_done["done_notified"] == 1
